@@ -1,0 +1,10 @@
+{
+    "sim-open_laptop-demo_clean-50": {
+        "dataset_dir": "./processed_data/sim-open_laptop/demo_clean-50",
+        "num_episodes": 50,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high"
+        ]
+    }
+}
