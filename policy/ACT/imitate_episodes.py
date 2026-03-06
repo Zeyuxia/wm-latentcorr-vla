@@ -40,6 +40,55 @@ import IPython
 e = IPython.embed
 
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("true", "1", "yes", "y"):
+        return True
+    if v.lower() in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
+
+def parse_optional_float(v):
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return v
+    if isinstance(v, str) and v.lower() == "none":
+        return None
+    try:
+        return float(v)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid float value: {v}") from exc
+
+
+def build_evac_infer_kwargs(cfg):
+    use_budget_accel = cfg.get('evac_budget_accel', False)
+    use_rank_transfer = cfg.get('evac_rank_transfer', False)
+    if use_budget_accel and use_rank_transfer:
+        raise ValueError('evac_budget_accel and evac_rank_transfer cannot be enabled together')
+
+    ddim_eta = cfg.get('evac_ddim_eta', None)
+    if ddim_eta is None:
+        ddim_eta = 0.0 if use_rank_transfer else 1.0
+
+    if use_budget_accel:
+        return {
+            'use_dual_cache': True,
+            'dc_budget': cfg.get('evac_dc_budget', 0.5),
+            'ddim_eta': ddim_eta,
+        }
+    if use_rank_transfer:
+        return {
+            'dc_rank_transfer': True,
+            'rt_full_chunks': cfg.get('evac_rt_full_chunks', 3),
+            'rt_per_channel': cfg.get('evac_rt_per_channel', True),
+            'ddim_eta': ddim_eta,
+        }
+    return {'ddim_eta': ddim_eta}
+
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -164,6 +213,7 @@ def main(args):
             'correction_weight': args['correction_weight'],
             'orient_weight': args['orient_weight'],
             'gripper_penalty': args['gripper_penalty'],
+            'evac_infer_kwargs': build_evac_infer_kwargs(args),
         }
         config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
@@ -317,201 +367,9 @@ def resample_trajectory(traj, target_len):
         result[i] = traj[lo] * (1 - frac) + traj[hi] * frac
     return result
 
-
-@torch.no_grad()
-def evac_predict(evac_model, evac_cfg, curr_image_act, fk_poses, grippers, raw_data, device,
-                debug_dir=None, debug_prefix='', ddim_steps=27, return_offset=0):
-    """EVAC prediction via DDIM sampling. ddim_steps controls denoising quality.
-    return_offset: which predicted frame to return (0 = first, chunk-1 = last)."""
-    import cv2
-    import torchvision.transforms as tvt
-    from evac.lvdm.data.get_actions import get_actions
-    from evac.lvdm.data.statistics import StatisticInfo
-    from evac.lvdm.data.domain_table import DomainTable
-
-    chunk = evac_cfg.chunk
-    n_previous = evac_cfg.n_previous
-    n_total = n_previous + chunk
-    sample_size = tuple(evac_cfg.data.params.train.params.sample_size)
-    dtype = torch.bfloat16
-
-    # --- image: (3,480,640) [0,1] -> (c,v,t,h,w) [-1,1] ---
-    # ACT stores images in BGR (from cv2.imdecode). EVAC expects RGB.
-    img = curr_image_act[0].clone()
-    img = img[[2, 1, 0], :, :]   # BGR -> RGB
-    img_resized = tvt.Resize(sample_size)(img)
-    img_normed = tvt.Normalize([0.5]*3, [0.5]*3)(img_resized)
-    cond_frames = img_normed.unsqueeze(1).repeat(1, n_previous, 1, 1)
-    pred_frames = img_normed.unsqueeze(1).repeat(1, chunk, 1, 1)
-    video = torch.cat([cond_frames, pred_frames], dim=1)  # (3, n_total, H, W)
-    video = video.unsqueeze(0).unsqueeze(2)  # (1, 3, 1, n_total, H, W)
-
-    # --- actions ---
-    n_frames = len(fk_poses)
-    all_ends_p = np.zeros((n_frames, 2, 3), dtype=np.float32)
-    all_ends_o = np.zeros((n_frames, 2, 4), dtype=np.float32)
-    gripper_arr = np.zeros((n_frames, 2), dtype=np.float32)
-    for i, ((lp, lq, rp, rq), (lg, rg)) in enumerate(zip(fk_poses, grippers)):
-        all_ends_p[i, 0], all_ends_p[i, 1] = lp, rp
-        # wxyz→xyzw, canonicalize so w>=0 (match HDF5 sign convention)
-        lq_xyzw = np.array([lq[1], lq[2], lq[3], lq[0]])
-        rq_xyzw = np.array([rq[1], rq[2], rq[3], rq[0]])
-        if lq_xyzw[3] < 0: lq_xyzw = -lq_xyzw
-        if rq_xyzw[3] < 0: rq_xyzw = -rq_xyzw
-        all_ends_o[i, 0] = lq_xyzw
-        all_ends_o[i, 1] = rq_xyzw
-        gripper_arr[i] = [lg * 120.0, rg * 120.0]
-
-    abs_act, delta_act = get_actions(
-        gripper=gripper_arr, all_ends_p=all_ends_p, all_ends_o=all_ends_o,
-        delta_act_sidx=n_previous)
-    abs_act = torch.FloatTensor(abs_act)
-    delta_act = torch.FloatTensor(delta_act)
-    mv = torch.tensor(StatisticInfo['agibotworld']['mean']).unsqueeze(0)
-    sv = torch.tensor(StatisticInfo['agibotworld']['std']).unsqueeze(0)
-    delta_act[:, :6] = (delta_act[:, :6] - mv[:, :6]) / sv[:, :6]
-    delta_act[:, 7:13] = (delta_act[:, 7:13] - mv[:, 6:]) / sv[:, 6:]
-
-    # --- camera ---
-    ext_cv = raw_data['extrinsic_cv']
-    w2c = np.eye(4, dtype=np.float32)
-    w2c[:3, :] = ext_cv
-    c2w = np.linalg.inv(w2c)
-    # Single-view: (1, 4, 4) for get_traj (dim 0 = views)
-    c2w_1v = torch.from_numpy(c2w).float().unsqueeze(0)   # (1, 4, 4)
-    w2c_1v = torch.from_numpy(w2c).float().unsqueeze(0)   # (1, 4, 4)
-    # Time-repeated: (n_total, 4, 4) for batch dict extrinsic
-    c2w_t = c2w_1v.repeat(n_total, 1, 1)
-    intrinsic_t = torch.from_numpy(raw_data['intrinsic_cv']).float().unsqueeze(0)
-
-    # --- intrinsic scaling (from native resolution to EVAC sample_size) ---
-    h_native, w_native = raw_data['native_resolution']
-    h_scale = float(sample_size[0]) / float(h_native)
-    w_scale = float(sample_size[1]) / float(w_native)
-    intrinsic_scaled = intrinsic_t.clone()
-    intrinsic_scaled[:, 0, 0] *= w_scale
-    intrinsic_scaled[:, 0, 2] *= w_scale
-    intrinsic_scaled[:, 1, 1] *= h_scale
-    intrinsic_scaled[:, 1, 2] *= h_scale
-
-    # --- trajectory maps (dim 0 of w2c/c2w = num_views, not time) ---
-    traj_maps_raw = evac_model.get_traj(sample_size, abs_act[:n_total], w2c_1v, c2w_1v, intrinsic_scaled)
-    traj_maps = rearrange(traj_maps_raw, 'c v t h w -> (v t) c h w')
-    traj_maps = tvt.Normalize([0.5]*3, [0.5]*3)(traj_maps)
-    traj_maps = rearrange(traj_maps, '(v t) c h w -> c v t h w', v=1)
-    traj_maps = traj_maps.unsqueeze(0)  # (1, 3, 1, n_total, H, W)
-
-    # --- debug: save EVAC inputs ---
-    if debug_dir is not None:
-        _dbg_evac = os.path.join(debug_dir, 'evac')
-        os.makedirs(_dbg_evac, exist_ok=True)
-        # input image (already RGB after BGR->RGB conversion above)
-        _inp = (img.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(_dbg_evac, f'{debug_prefix}input.png'), cv2.cvtColor(_inp, cv2.COLOR_RGB2BGR))
-        # traj map (first predicted frame, index n_previous)
-        _tm_idx = min(n_previous, traj_maps_raw.shape[2] - 1)
-        _tm = traj_maps_raw[:, 0, _tm_idx]  # (3, H, W)
-        _tm_np = (_tm.cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(_dbg_evac, f'{debug_prefix}traj_t{_tm_idx}.png'), cv2.cvtColor(_tm_np, cv2.COLOR_RGB2BGR))
-        # traj map overlay on input
-        _inp_r = cv2.resize(_inp, (sample_size[1], sample_size[0]))
-        _overlay = cv2.addWeighted(_inp_r, 0.5, _tm_np, 0.5, 0)
-        cv2.imwrite(os.path.join(_dbg_evac, f'{debug_prefix}traj_overlay.png'), cv2.cvtColor(_overlay, cv2.COLOR_RGB2BGR))
-        # save camera params for inspection
-        np.savez(os.path.join(_dbg_evac, f'{debug_prefix}camera.npz'),
-                 intrinsic_raw=raw_data['intrinsic_cv'], intrinsic_scaled=intrinsic_scaled[0].numpy(),
-                 extrinsic_cv=ext_cv, w2c=w2c, c2w=c2w,
-                 native_resolution=np.array([h_native, w_native]),
-                 sample_size=np.array(sample_size))
-        # save abs_act summary
-        np.savetxt(os.path.join(_dbg_evac, f'{debug_prefix}abs_act.csv'), abs_act[:n_total].numpy(), fmt='%.4f', delimiter=',')
-
-    # --- batch dict ---
-    fps = 30 * torch.ones((1,)).to(device)
-    domain_id = torch.LongTensor([DomainTable['robotwin']]).to(device)
-    c2w_batch = c2w_t.unsqueeze(0).unsqueeze(0)  # (1, 1, n_total, 4, 4)
-    delta_act_batch = delta_act[:chunk].unsqueeze(0)
-
-    batch = dict(
-        video=video.to(dtype=dtype, device=device),
-        traj=traj_maps.to(dtype=dtype, device=device),
-        delta_action=delta_act_batch.to(dtype=dtype, device=device),
-        domain_id=domain_id,
-        intrinsic=intrinsic_scaled.to(device=device),
-        extrinsic=c2w_batch.to(device=device),
-        caption=[""],
-        cond_id=torch.tensor([-n_previous - chunk], dtype=torch.int64).to(device),
-        fps=fps.to(device),
-    )
-
-    # --- get_batch_input: encode + build conditions ---
-    with torch.cuda.amp.autocast(dtype=dtype):
-        out = evac_model.get_batch_input(
-            batch, random_uncond=False,
-            return_first_stage_outputs=False,
-            return_original_cond=True,
-            return_fs=True, return_did=True,
-            return_traj=False, return_img_emb=True)
-        z, cond, _, fs, did, img_emb = out
-
-        for k in range(len(cond.get('c_crossattn', []))):
-            cond['c_crossattn'][k] = cond['c_crossattn'][k].to(dtype=dtype)
-        for k in range(len(cond.get('c_concat', []))):
-            cond['c_concat'][k] = cond['c_concat'][k].to(dtype=dtype)
-
-        # --- DDIM sampling ---
-        _prev_ddim_num_chunk = evac_model.ddim_num_chunk
-        _prev_rand_cond = evac_model.rand_cond_frame
-        evac_model.ddim_num_chunk = 1
-        evac_model.rand_cond_frame = False
-        full_z, _ = evac_model.sample_log(
-            cond=cond, batch_size=z.shape[0], ddim=True,
-            ddim_steps=ddim_steps, causal=True, eta=1.0,
-            unconditional_guidance_scale=1.0,
-            unconditional_conditioning=None,
-            x0=z.to(dtype), chunk=chunk,
-            cat_mask=evac_model.use_cat_mask,
-            sparse=evac_model.sparse_memory,
-            ddim_dtype=torch.float16,
-            fs=fs.long(), domain_id=did.long(),
-            timestep_spacing='uniform_trailing',
-            guidance_rescale=0.7,
-            return_intermediates=False,
-        )
-        evac_model.ddim_num_chunk = _prev_ddim_num_chunk
-        evac_model.rand_cond_frame = _prev_rand_cond
-
-        x_decoded = evac_model.decode_first_stage(full_z.to(z.device))
-
-    # predicted frame at requested offset (0 = first predicted frame)
-    frame_idx = n_previous + return_offset
-    pred_frame = x_decoded[0, :, frame_idx]  # (3, H, W) in [-1, 1], RGB
-    pred_frame = ((pred_frame.float() + 1) / 2).clamp(0, 1)
-    pred_np = (pred_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    pred_np = cv2.resize(pred_np, (640, 480))
-
-    # --- debug: save EVAC output ---
-    if debug_dir is not None:
-        _dbg_evac = os.path.join(debug_dir, 'evac')
-        cv2.imwrite(os.path.join(_dbg_evac, f'{debug_prefix}pred.png'), cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR))
-        # save all decoded frames as grid
-        _nf = x_decoded.shape[2]
-        _frames = []
-        for _fi in range(_nf):
-            _f = x_decoded[0, :, _fi]
-            _f = ((_f.float() + 1) / 2).clamp(0, 1)
-            _frames.append((_f.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8))
-        _grid = np.concatenate(_frames, axis=1)  # horizontal concat
-        cv2.imwrite(os.path.join(_dbg_evac, f'{debug_prefix}all_frames.png'), cv2.cvtColor(_grid, cv2.COLOR_RGB2BGR))
-
-    # convert back to BGR to match ACT image convention
-    pred_np_bgr = pred_np[:, :, ::-1].copy()
-    return torch.from_numpy(pred_np_bgr).float().permute(2, 0, 1) / 255.0
-
-
 @torch.no_grad()
 def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_data, device,
-                   save_dir=None, ddim_steps=27):
+                   save_dir=None, ddim_steps=27, infer_kwargs=None):
     """EVAC prediction via model.inference() — matches infer_all.py exactly.
 
     Args:
@@ -521,6 +379,7 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
         grippers: list of (lg, rg), same length as fk_poses.
         raw_data: dict with extrinsic_cv, intrinsic_cv, native_resolution
         save_dir: if set, save frames + traj video there
+        infer_kwargs: optional kwargs forwarded to evac_model.inference()
     Returns: last predicted frame as (3, H, W) BGR [0,1] tensor
     """
     import cv2, math, tempfile, shutil
@@ -574,7 +433,8 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
     n_act = action.shape[0]
     c2w_t = torch.from_numpy(c2w).float().unsqueeze(0).repeat(n_act, 1, 1)
     w2c_t = torch.from_numpy(w2c).float().unsqueeze(0).repeat(n_act, 1, 1)
-    intrinsic = torch.from_numpy(raw_data['intrinsic_cv']).float()
+    # clone() to prevent inference() in-place intrinsic scaling from corrupting raw_data
+    intrinsic = torch.from_numpy(raw_data['intrinsic_cv']).float().clone()
 
     # --- Run inference ---
     n_valid = N - 1  # predicted frames = number of action steps
@@ -586,6 +446,9 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
     else:
         target_dir = save_dir
     os.makedirs(target_dir, exist_ok=True)
+
+    if infer_kwargs is None:
+        infer_kwargs = {}
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         frames, traj_frames = evac_model.inference(
@@ -600,6 +463,7 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
             saving_video=(save_dir is not None),
             saving_fps=30,
             video_dir=target_dir,
+            **infer_kwargs,
         )
         torch.cuda.empty_cache()
 
@@ -682,9 +546,18 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             fk_poses.append(fk_poses[-1])
             grip_list.append(grip_list[-1])
 
-        _evac_dbg_prefix = f'rollout_s{step}_' if debug_dir else ''
-        pred = evac_predict(evac_model, evac_cfg, curr_image, fk_poses, grip_list, raw_data, device,
-                            debug_dir=debug_dir, debug_prefix=_evac_dbg_prefix)
+        evac_debug_dir = os.path.join(debug_dir, 'evac') if debug_dir else None
+        pred = evac_inference(
+            evac_model,
+            evac_cfg,
+            curr_image[0],
+            fk_poses,
+            grip_list,
+            raw_data,
+            device,
+            save_dir=evac_debug_dir,
+            infer_kwargs=cfg.get('evac_infer_kwargs'),
+        )
         new_img = curr_image.clone()
         new_img[0] = pred
         curr_image = new_img
@@ -1077,11 +950,11 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
-            loss = forward_dict["loss"]
-
-            # World-model correction
-            if enable_wm and correction_modules is not None and global_step % correction_cfg['correction_freq'] == 0:
+            apply_wm = enable_wm and correction_modules is not None and global_step % correction_cfg['correction_freq'] == 0
+            if not apply_wm:
+                forward_dict = forward_pass(data, policy)
+                loss = forward_dict["loss"]
+            else:
                 try:
                     bs = data[0].shape[0]
                     corr_images, corr_qpos, corr_actions, corr_pads = [], [], [], []
@@ -1119,27 +992,47 @@ def train_bc(train_dataloader, val_dataloader, config):
                             corr_actions.append(data[2][bi].to(accelerator.device))
                             corr_pads.append(data[3][bi].to(accelerator.device))
                             corr_mask.append(0.0)
-                    # always call policy with bs samples so DDP stays in sync
+
+                    # Build a fixed-size mixed batch: [base bs] + [correction bs].
                     ci_b = torch.stack(corr_images, dim=0)
                     cq_b = torch.stack(corr_qpos, dim=0)
                     ca_b = torch.stack(corr_actions, dim=0)
                     cp_b = torch.stack(corr_pads, dim=0)
-                    corr_dict = policy(cq_b, ci_b, ca_b, cp_b)
-                    n_corr = sum(corr_mask)
-                    if n_corr > 0:
-                        # mask out dummy samples: reweight loss
-                        mask_t = torch.tensor(corr_mask, device=accelerator.device)
-                        # corr_dict['loss'] is a mean over the batch;
-                        # we need per-sample then masked mean, but ACT returns scalar loss,
-                        # so approximate: scale by (n_valid / bs) to correct for dummy dilution
-                        corr_loss = corr_dict['loss'] * (bs / n_corr) * (n_corr / (bs + n_corr))
-                        cw = correction_cfg['correction_weight']
-                        loss = bs / (bs + n_corr) * loss + cw * corr_loss
-                    else:
-                        # no valid corrections, but forward was called so DDP is happy
-                        loss = loss + 0.0 * corr_dict['loss']
+
+                    base_images = data[0].to(accelerator.device)
+                    base_qpos = data[1].to(accelerator.device)
+                    base_actions = data[2].to(accelerator.device)
+                    base_pads = data[3].to(accelerator.device)
+
+                    mixed_images = torch.cat([base_images, ci_b], dim=0)
+                    mixed_qpos = torch.cat([base_qpos, cq_b], dim=0)
+                    mixed_actions = torch.cat([base_actions, ca_b], dim=0)
+                    mixed_pads = torch.cat([base_pads, cp_b], dim=0)
+
+                    mixed_dict = policy(
+                        mixed_qpos,
+                        mixed_images,
+                        mixed_actions,
+                        mixed_pads,
+                        return_per_sample=True,
+                    )
+
+                    per_sample_loss = mixed_dict['loss_per_sample']
+                    mask_t = torch.tensor(corr_mask, device=accelerator.device, dtype=per_sample_loss.dtype)
+                    n_corr = int(mask_t.sum().item())
+
+                    base_weight = torch.ones(bs, device=accelerator.device, dtype=per_sample_loss.dtype)
+                    corr_weight = correction_cfg['correction_weight'] * mask_t
+                    sample_weight = torch.cat([base_weight, corr_weight], dim=0)
+                    loss = (per_sample_loss * sample_weight).sum() / (bs + n_corr)
+                    forward_dict = {"loss": loss}
+
                     if accelerator.is_main_process and writer is not None:
-                        writer.add_scalar('train/correction_loss', corr_dict['loss'].item(), global_step)
+                        if n_corr > 0:
+                            corr_loss = (per_sample_loss[bs:] * mask_t).sum() / mask_t.sum()
+                        else:
+                            corr_loss = torch.tensor(0.0, device=accelerator.device, dtype=per_sample_loss.dtype)
+                        writer.add_scalar('train/correction_loss', corr_loss.item(), global_step)
                         writer.add_scalar('train/n_correction_samples', n_corr, global_step)
                 except Exception as exc:
                     _corr_stats['n_error'] += 1
@@ -1147,6 +1040,8 @@ def train_bc(train_dataloader, val_dataloader, config):
                         import traceback
                         print(f'[WM correction] step {global_step} error: {exc}')
                         traceback.print_exc()
+                    forward_dict = forward_pass(data, policy)
+                    loss = forward_dict["loss"]
 
             accelerator.backward(loss)
             optimizer.step()
@@ -1292,6 +1187,18 @@ if __name__ == "__main__":
                         help="Weight for orientation distance in nearest-point matching (0=position only)")
     parser.add_argument("--gripper_penalty", type=float,
                         help="Penalty for gripper state mismatch in nearest-point matching (0=ignore gripper)")
+    parser.add_argument("--evac_budget_accel", type=str2bool, default=False,
+                        help="Enable dual-cache budget acceleration for EVAC inference")
+    parser.add_argument("--evac_rank_transfer", type=str2bool, default=False,
+                        help="Enable cross-chunk rank-transfer acceleration for EVAC inference")
+    parser.add_argument("--evac_ddim_eta", type=parse_optional_float, default=None,
+                        help="DDIM eta for EVAC inference. Default: auto (rank-transfer: 0.0, otherwise: 1.0)")
+    parser.add_argument("--evac_dc_budget", type=float, default=0.5,
+                        help="Dual-cache budget when evac_budget_accel=true")
+    parser.add_argument("--evac_rt_full_chunks", type=int, default=3,
+                        help="Full chunks for rank-transfer when evac_rank_transfer=true")
+    parser.add_argument("--evac_rt_per_channel", type=str2bool, default=True,
+                        help="Per-channel rank-transfer when evac_rank_transfer=true")
     parser.add_argument("--debug_wm_correction", action="store_true",
                         help="Enable debug visualization for WM correction (saves images/stats to ckpt_dir/debug_wm)")
 

@@ -5,7 +5,10 @@ import sapien
 class SapienFK:
     """基于 sapien URDF 的双臂正运动学"""
     def __init__(self, urdf_path, root_pos=(0, -0.65, 0), root_quat=(0.707, 0, 0, 0.707)):
+        # FK only needs kinematics/physics, not rendering.
+        # Prefer a headless scene to avoid GPU render-device dependency..
         self.scene = sapien.Scene()
+        
         self.robot = self.scene.create_urdf_loader().load(urdf_path)
         self.robot.set_root_pose(sapien.Pose(list(root_pos), list(root_quat)))
         jnames = [j.get_name() for j in self.robot.get_active_joints()]

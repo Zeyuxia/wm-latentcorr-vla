@@ -6,12 +6,9 @@ task_config=demo_clean
 expert_data_num=50
 seed=0
 
-DEBUG=False
-save_ckpt=True
-
 # World-model correction options (set enable_wm=true to activate)
 enable_wm=true
-evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+evac_ckpt=/data/zhenyangfan/EVAC_cache/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -26,6 +23,14 @@ orient_weight=0.01
 gripper_penalty=1.0
 debug_wm=true
 
+# EVAC acceleration (same semantics as eval_evac.sh)
+evac_budget_accel=false
+evac_rank_transfer=false
+evac_ddim_eta=None
+evac_dc_budget=0.6
+evac_rt_full_chunks=3
+evac_rt_per_channel=true
+
 # Append timestamp to ckpt_dir
 timestamp=$(date +"%Y%m%d_%H%M%S")
 ckpt_dir=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/${timestamp}
@@ -34,7 +39,7 @@ mkdir -p ${ckpt_dir}
 # Save a copy of this script for reproducibility
 cp "$0" ${ckpt_dir}/train.sh
 
-gpu_ids=0,1,2,3,4,5,6,7
+gpu_ids=0,1,2,3
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')
 
 if [ ${num_gpus} -gt 1 ]; then
@@ -59,7 +64,13 @@ if [ "${enable_wm}" = "true" ]; then
     --correction_freq ${correction_freq} \
     --correction_weight ${correction_weight} \
     --orient_weight ${orient_weight} \
-    --gripper_penalty ${gripper_penalty}"
+    --gripper_penalty ${gripper_penalty} \
+    --evac_budget_accel ${evac_budget_accel} \
+    --evac_rank_transfer ${evac_rank_transfer} \
+    --evac_ddim_eta ${evac_ddim_eta} \
+    --evac_dc_budget ${evac_dc_budget} \
+    --evac_rt_full_chunks ${evac_rt_full_chunks} \
+    --evac_rt_per_channel ${evac_rt_per_channel}"
     if [ "${debug_wm}" = "true" ]; then
         wm_flags="${wm_flags} --debug_wm_correction"
     fi

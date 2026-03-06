@@ -125,6 +125,10 @@ def eval_episode(model, reset_fn, modules, ep_data, device, cfg):
         r = fk.forward(q[:6], q[7:13])
         return r['left'][0], r['left'][1], r['right'][0], r['right'][1]
 
+    # How close to expert trajectory end counts as "near end".
+    stop_end_margin = int(cfg.get('stop_end_margin', 13))
+    success_end_margin = int(cfg.get('success_end_margin', 15))
+
     while global_step < cfg['max_steps'] and not done:
         n_collect = min(query_freq, cfg['max_steps'] - global_step)
         prev_qpos = curr_qpos.copy()
@@ -158,7 +162,7 @@ def eval_episode(model, reset_fn, modules, ep_data, device, cfg):
                 gripper_penalty=cfg['gripper_penalty'])
             trajectory.append({'step': global_step + i,
                                't_star': int(t_star), 'dist': float(dist)})
-            if t_star >= expert_len - 13:
+            if t_star >= expert_len - stop_end_margin:
                 done = True
                 break
 
@@ -172,7 +176,8 @@ def eval_episode(model, reset_fn, modules, ep_data, device, cfg):
         curr_img = evac_inference(
             evac_model, evac_cfg, curr_img,
             fk_poses, grippers, ep_data, device,
-            save_dir=save_dir, ddim_steps=27)
+            save_dir=save_dir, ddim_steps=27,
+            infer_kwargs=cfg.get('evac_infer_kwargs'))
 
         global_step += len(actions)
 
@@ -186,7 +191,7 @@ def eval_episode(model, reset_fn, modules, ep_data, device, cfg):
 
     final_t = trajectory[-1]['t_star'] if trajectory else 0
     return {
-        'reached_end': final_t >= expert_len - 15,
+        'reached_end': final_t >= expert_len - success_end_margin,
         'final_t_star': final_t,
         'expert_len': expert_len,
         'avg_dist': float(np.mean([t['dist'] for t in trajectory]))
@@ -231,7 +236,6 @@ def save_eval_video(frames, path, fps=10):
 
 def main(args):
     device = torch.device(args.get('device', 'cuda:0'))
-
     # --- Load policy (policy-agnostic via dynamic import) ---
     policy_name = args['policy_name']
     policy_mod = import_module(policy_name)
@@ -257,12 +261,48 @@ def main(args):
 
     live_frames = args.get('live_frames', True)  # save frames as PNG in real-time
 
+    use_budget_accel = args.get('evac_budget_accel', False)
+    use_rank_transfer = args.get('evac_rank_transfer', False)
+    if use_budget_accel and use_rank_transfer:
+        raise ValueError('evac_budget_accel and evac_rank_transfer cannot be enabled together')
+
+    # Match infer_all.py behavior:
+    # explicit value > auto value, where auto is 0.0 for rank-transfer and 1.0 otherwise.
+    evac_ddim_eta = args.get('evac_ddim_eta', None)
+    if evac_ddim_eta is None:
+        evac_ddim_eta = 0.0 if use_rank_transfer else 1.0
+
+    evac_infer_kwargs = {}
+    if use_budget_accel:
+        evac_infer_kwargs = {
+            'use_dual_cache': True,
+            'dc_budget': args.get('evac_dc_budget', 0.5),
+            'ddim_eta': evac_ddim_eta,
+        }
+    elif use_rank_transfer:
+        evac_infer_kwargs = {
+            'dc_rank_transfer': True,
+            'rt_full_chunks': args.get('evac_rt_full_chunks', 3),
+            'rt_per_channel': args.get('evac_rt_per_channel', True),
+            'ddim_eta': evac_ddim_eta,
+        }
+    else:
+        evac_infer_kwargs = {
+            'ddim_eta': evac_ddim_eta,
+        }
+
     cfg = {
         'max_steps': args.get('max_steps', 300),
         'orient_weight': args.get('orient_weight', 0.01),
         'gripper_penalty': args.get('gripper_penalty', 1.0),
+        'stop_end_margin': args.get('stop_end_margin', 13),
+        'success_end_margin': args.get('success_end_margin', 15),
         'save_video': do_video,
+        'evac_infer_kwargs': evac_infer_kwargs,
     }
+
+    if evac_infer_kwargs:
+        print(f"EVAC accel kwargs: {evac_infer_kwargs}")
 
     save_dir = Path(f"eval_result/evac_eval/{args.get('task_name', 'unknown')}"
                     f"/{policy_name}/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
