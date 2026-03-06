@@ -1,34 +1,43 @@
+# Python cache
+__pycache__/
+
+# System files
+**/.DS_Store
+
+# Model/data artifacts
 models/
 data/*
-data_self_collect/*
-data_eval/*
 !data/process_stuck.py
-__pycache__/
-**/checkpoints/
+data_self_collect/
+data_eval/
 result/
-envs/curobo
-*.zip
-viewer_show.*
+eval_result/
 eval_video/
 task_config/
-**/.DS_Store
-data_self_collect/*
+policy/weights/
 policy/ACT/evac*
-# eval result
-eval_result/
 
-# Code Generation
+# Environment-specific generated content
+envs/curobo/
+
+# Code generation assets
 assets/*
 !assets/_download.py
-!assets/files
+!assets/files/
+!assets/files/**
 
-policy/weights/*
+# Checkpoints
+**/checkpoints/
 
-envs/curobo/*
+# Editor settings
+.vscode/
 
-.vscode
+# Root-level local config and outputs
 /config.json
 
-/*.json*
-/*.txt
-*.hdf5
+# Misc files
+*.zip
+viewer_show.*
+
+# downloaded files
+downloads/
