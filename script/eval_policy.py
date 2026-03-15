@@ -18,6 +18,7 @@ from datetime import datetime
 import importlib
 import argparse
 import pdb
+import re
 
 from generate_episode_instructions import *
 
@@ -59,6 +60,22 @@ def get_embodiment_config(robot_file):
     with open(robot_config_file, "r", encoding="utf-8") as f:
         embodiment_args = yaml.load(f.read(), Loader=yaml.FullLoader)
     return embodiment_args
+
+
+def load_seed_list(seed_file):
+    if seed_file is None:
+        return None
+    if not os.path.isfile(seed_file):
+        raise FileNotFoundError(f"seed file not found: {seed_file}")
+
+    with open(seed_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    tokens = re.findall(r"-?\d+", content)
+    if len(tokens) == 0:
+        raise ValueError(f"no valid integer seed found in: {seed_file}")
+
+    return [int(tok) for tok in tokens]
 
 
 def main(usr_args):
@@ -156,11 +173,17 @@ def main(usr_args):
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
     seed = usr_args["seed"]
+    seed_file = usr_args.get("seed_file", None)
+    seed_list = load_seed_list(seed_file)
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = len(seed_list) if seed_list is not None else 100
     topk = 1
+
+    if seed_list is not None:
+        print(f"\033[96mUsing seed file:\033[0m {seed_file}")
+        print(f"\033[96mTotal seeds for eval:\033[0m {test_num}")
 
     model = get_model(usr_args)
     st_seed, suc_num = eval_policy(task_name,
@@ -168,7 +191,8 @@ def main(usr_args):
                                    args,
                                    model,
                                    st_seed,
-                                   test_num=test_num,
+                                    test_num=test_num,
+                                   seed_list=seed_list,
                                    video_size=video_size,
                                    instruction_type=instruction_type)
     suc_nums.append(suc_num)
@@ -192,6 +216,7 @@ def eval_policy(task_name,
                 model,
                 st_seed,
                 test_num=100,
+                seed_list=None,
                 video_size=None,
                 instruction_type=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
@@ -214,8 +239,15 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    use_seed_list = seed_list is not None
+    target_eval_num = len(seed_list) if use_seed_list else test_num
+    if use_seed_list and target_eval_num > 0:
+        now_seed = seed_list[0]
 
-    while succ_seed < test_num:
+    while (now_id < target_eval_num) if use_seed_list else (succ_seed < test_num):
+        if use_seed_list:
+            now_seed = seed_list[now_id]
+
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
@@ -229,7 +261,11 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                if use_seed_list:
+                    print(f"skip unstable seed: {now_seed}")
+                    now_id += 1
+                else:
+                    now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
@@ -238,7 +274,11 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                if use_seed_list:
+                    print(f"skip seed due to exception: {now_seed}, error: {e}")
+                    now_id += 1
+                else:
+                    now_seed += 1
                 args["render_freq"] = render_freq
                 print("error occurs !")
                 continue
@@ -247,7 +287,11 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
-            now_seed += 1
+            if use_seed_list:
+                print(f"skip seed due to expert check failed: {now_seed}")
+                now_id += 1
+            else:
+                now_seed += 1
             args["render_freq"] = render_freq
             continue
 
@@ -319,7 +363,8 @@ def eval_policy(task_name,
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
-        now_seed += 1
+        if not use_seed_list:
+            now_seed += 1
 
     return now_seed, TASK_ENV.suc
 

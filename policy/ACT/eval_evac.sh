@@ -4,8 +4,8 @@
 policy_name=ACT
 task_name=open_laptop
 task_config=demo_clean_seed100k
-ckpt_dir=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260213_001933
-ckpt_name=policy_epoch_1000_seed_0.ckpt
+ckpt_dir=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260311_181243
+ckpt_name=policy_epoch_200_seed_0.ckpt
 seed=0
 gpu_id=1
 

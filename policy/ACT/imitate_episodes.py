@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import re
 
 # Set rendering backend for MuJoCo
 os.environ["MUJOCO_GL"] = "egl"
@@ -89,8 +91,593 @@ def build_evac_infer_kwargs(cfg):
     return {'ddim_eta': ddim_eta}
 
 
+def _first_threshold_cross(arr, threshold=0.5, from_high_to_low=True):
+    if arr is None or len(arr) < 2:
+        return None
+    arr = np.asarray(arr).reshape(-1)
+    prev = arr[:-1]
+    curr = arr[1:]
+    if from_high_to_low:
+        idx = np.where((prev > threshold) & (curr <= threshold))[0]
+    else:
+        idx = np.where((prev <= threshold) & (curr > threshold))[0]
+    if idx.size == 0:
+        return None
+    return int(idx[0] + 1)
+
+
+def _infer_phase_key_event_driven(t_star, left_grip_traj, right_grip_traj, traj_len):
+    """
+    Local gripper-state-driven phase split around current t_star.
+    Robust for short rollouts and episodes that start already grasping:
+    stable_open -> approach
+    closing/transition -> pregrasp
+    stable_close -> transport
+    opening -> place
+    """
+    t_star = int(max(0, t_star))
+    traj_len = int(max(1, traj_len))
+    left = np.asarray(left_grip_traj).reshape(-1)
+    right = np.asarray(right_grip_traj).reshape(-1)
+    if left.size == 0 or right.size == 0:
+        return "transport"
+
+    idx = int(np.clip(t_star, 0, min(left.size, right.size) - 1))
+    win = max(2, traj_len // 60)
+    lo = max(0, idx - win)
+    hi = min(min(left.size, right.size), idx + win + 1)
+
+    l_seg = left[lo:hi]
+    r_seg = right[lo:hi]
+    g_seg = 0.5 * (l_seg + r_seg)
+    g_now = float(g_seg[idx - lo])
+
+    # Hysteresis thresholds for robust stable-state classification.
+    th_open = 0.6
+    th_close = 0.4
+
+    if g_seg.size >= 2:
+        slope = float(np.mean(np.diff(g_seg)))
+        opening_cross = bool(np.any((g_seg[:-1] <= 0.5) & (g_seg[1:] > 0.5)))
+        closing_cross = bool(np.any((g_seg[:-1] > 0.5) & (g_seg[1:] <= 0.5)))
+    else:
+        slope = 0.0
+        opening_cross = False
+        closing_cross = False
+
+    eps_slope = 0.01
+    if opening_cross or slope > eps_slope:
+        return "place"
+    if closing_cross or slope < -eps_slope:
+        return "pregrasp"
+    if g_now >= th_open:
+        return "approach"
+    if g_now <= th_close:
+        return "transport"
+    return "pregrasp"
+
+
+def _infer_phase_key_from_gt_window(left_grip_traj, right_grip_traj, window_len):
+    """
+    Infer phase from the whole GT action window (prefix), not a single point.
+    """
+    left = np.asarray(left_grip_traj).reshape(-1)
+    right = np.asarray(right_grip_traj).reshape(-1)
+    n = int(max(1, min(len(left), len(right), int(window_len))))
+    l = left[:n]
+    r = right[:n]
+
+    def _smooth3(arr):
+        if arr.size < 3:
+            return arr
+        k = np.array([1.0, 1.0, 1.0], dtype=np.float32) / 3.0
+        return np.convolve(arr, k, mode="same")
+
+    l_s = _smooth3(l)
+    r_s = _smooth3(r)
+
+    def _first_cross(arr, open_event=True):
+        if arr.size < 2:
+            return None
+        if open_event:
+            idx = np.where((arr[:-1] <= 0.5) & (arr[1:] > 0.5))[0]
+        else:
+            idx = np.where((arr[:-1] > 0.5) & (arr[1:] <= 0.5))[0]
+        return int(idx[0]) if idx.size > 0 else None
+
+    # OR-trigger across arms: any arm with salient event drives phase.
+    open_l, open_r = _first_cross(l_s, True), _first_cross(r_s, True)
+    close_l, close_r = _first_cross(l_s, False), _first_cross(r_s, False)
+    open_events = [x for x in (open_l, open_r) if x is not None]
+    close_events = [x for x in (close_l, close_r) if x is not None]
+    first_open = min(open_events) if open_events else None
+    first_close = min(close_events) if close_events else None
+    if first_open is not None and first_close is not None:
+        return "pregrasp" if first_close < first_open else "place"
+    if first_close is not None:
+        return "pregrasp"
+    if first_open is not None:
+        return "place"
+
+    eps = 0.02
+    amp_min = 0.06
+    slope_l = float(np.mean(np.diff(l_s))) if l_s.size >= 2 else 0.0
+    slope_r = float(np.mean(np.diff(r_s))) if r_s.size >= 2 else 0.0
+    amp_l = float(np.max(l_s) - np.min(l_s)) if l_s.size > 0 else 0.0
+    amp_r = float(np.max(r_s) - np.min(r_s)) if r_s.size > 0 else 0.0
+    if ((slope_l > eps) and (amp_l >= amp_min)) or ((slope_r > eps) and (amp_r >= amp_min)):
+        return "place"
+    if ((slope_l < -eps) and (amp_l >= amp_min)) or ((slope_r < -eps) and (amp_r >= amp_min)):
+        return "pregrasp"
+
+    # No salient behavior: infer from stable states.
+    if float(np.mean(l_s)) >= 0.6 and float(np.mean(r_s)) >= 0.6:
+        return "approach"
+    if float(np.mean(l_s)) <= 0.4 and float(np.mean(r_s)) <= 0.4:
+        return "transport"
+    # Arms disagree (one open, one close) -> likely in manipulation/transport regime.
+    if (float(np.mean(l_s)) <= 0.4) or (float(np.mean(r_s)) <= 0.4):
+        return "transport"
+    return "pregrasp"
+
+
+def _extract_arm(a):
+    return a[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]]
+
+
+def _write_arm(a, arm):
+    a[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]] = arm
+    return a
+
+
+def _parse_vec12(s):
+    if s is None:
+        return None
+    txt = str(s).strip()
+    if txt == "":
+        return None
+    vals = [v.strip() for v in txt.split(",") if v.strip() != ""]
+    if len(vals) != 12:
+        raise ValueError("perturb_fail_direction must contain 12 comma-separated values")
+    arr = np.array([float(v) for v in vals], dtype=np.float32)
+    n = np.linalg.norm(arr)
+    if n < 1e-8:
+        raise ValueError("perturb_fail_direction norm is zero")
+    return arr / n
+
+
+def _parse_vec3(s):
+    if s is None:
+        return None
+    txt = str(s).strip()
+    if txt == "":
+        return None
+    vals = [v.strip() for v in txt.split(",") if v.strip() != ""]
+    if len(vals) != 3:
+        raise ValueError("3D direction must contain 3 comma-separated values")
+    arr = np.array([float(v) for v in vals], dtype=np.float32)
+    n = np.linalg.norm(arr)
+    if n < 1e-8:
+        raise ValueError("3D direction norm is zero")
+    return arr / n
+
+
+def _sample_unit_vec3():
+    v = np.random.normal(0.0, 1.0, size=(3,)).astype(np.float32)
+    n = float(np.linalg.norm(v))
+    if n < 1e-8:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return v / n
+
+
+def _link6_to_tcp_pose(link_pos_w, link_quat_wxyz, offset_x=0.085):
+    # Approximate link6 -> gripper/TCP conversion for ALOHA-Agilex.
+    from scipy.spatial.transform import Rotation as R
+    r = R.from_quat([link_quat_wxyz[1], link_quat_wxyz[2], link_quat_wxyz[3], link_quat_wxyz[0]])
+    tcp_pos = np.asarray(link_pos_w, dtype=np.float32) + r.as_matrix() @ np.array([offset_x, 0.0, 0.0], dtype=np.float32)
+    return tcp_pos.astype(np.float32), np.asarray(link_quat_wxyz, dtype=np.float32)
+
+
+def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r):
+    # EEF-space perturbation: FK joint action -> perturb EEF pose -> planner/IK back to joint action.
+    if fk is None or planner_l is None or planner_r is None:
+        return act_raw, False, "eef_missing_modules", None
+
+    import sapien
+    out = act_raw.copy()
+    eef_mode = str(cfg.get("perturb_eef_mode", "gaussian")).strip().lower()
+    pos_std = float(cfg.get("perturb_eef_pos_std", 0.01))
+    fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03))
+    tcp_offset_x = float(cfg.get("perturb_eef_tcp_offset_x", 0.085))
+    ramp_enable = bool(cfg.get("perturb_eef_ramp", True))
+    ramp_min = float(cfg.get("perturb_eef_ramp_min", 0.0))
+    ramp_power = float(cfg.get("perturb_eef_ramp_power", 1.0))
+    ramp_apply_eps = float(cfg.get("perturb_eef_ramp_apply_eps", 1e-4))
+    joint_delta_cap = float(cfg.get("perturb_eef_joint_delta_cap", 0.12))
+    rollout_exec_steps = int(cfg.get("rollout_exec_steps", 0))
+    dir_l = cfg.get("perturb_eef_fail_dir_left_vec", None)
+    dir_r = cfg.get("perturb_eef_fail_dir_right_vec", None)
+    rand_dir = bool(cfg.get("perturb_translation_random_dir", True))
+
+    if eef_mode == "directional_fail":
+        if rand_dir:
+            dir_l = _sample_unit_vec3()
+            dir_r = _sample_unit_vec3()
+        else:
+            if dir_l is None:
+                dir_l = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if dir_r is None:
+                dir_r = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+        bias_l = fail_gain * np.asarray(dir_l, dtype=np.float32)
+        bias_r = fail_gain * np.asarray(dir_r, dtype=np.float32)
+        mode_tag = "eef_directional_fail"
+    else:
+        bias_l = np.random.normal(0.0, pos_std, size=(3,)).astype(np.float32)
+        bias_r = np.random.normal(0.0, pos_std, size=(3,)).astype(np.float32)
+        mode_tag = "eef_gaussian"
+
+    solved_any = False
+    solved_cnt = 0
+    total_cnt = int(out.shape[0])
+    exec_horizon = total_cnt if rollout_exec_steps <= 0 else int(np.clip(rollout_exec_steps, 1, total_cnt))
+    for t in range(out.shape[0]):
+        if ramp_enable:
+            frac = float(min(t, exec_horizon - 1)) / float(max(1, exec_horizon - 1))
+            ramp = ramp_min + (1.0 - ramp_min) * (frac ** ramp_power)
+        else:
+            ramp = 1.0
+        if abs(ramp) <= ramp_apply_eps:
+            # Important: do not call IK when perturbation magnitude is effectively zero,
+            # otherwise IK branch switching can introduce artificial early deviation.
+            continue
+
+        ql = out[t, 0:6].astype(np.float32)
+        qr = out[t, 7:13].astype(np.float32)
+        fr = fk.forward(ql, qr)
+
+        l_link_p, l_link_q = fr["left"][0].astype(np.float32), fr["left"][1].astype(np.float32)
+        r_link_p, r_link_q = fr["right"][0].astype(np.float32), fr["right"][1].astype(np.float32)
+        lp, lq = _link6_to_tcp_pose(l_link_p, l_link_q, offset_x=tcp_offset_x)
+        rp, rq = _link6_to_tcp_pose(r_link_p, r_link_q, offset_x=tcp_offset_x)
+
+        target_lp = sapien.Pose((lp + ramp * bias_l).astype(np.float32), lq.astype(np.float32))
+        target_rp = sapien.Pose((rp + ramp * bias_r).astype(np.float32), rq.astype(np.float32))
+
+        qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
+        qpos_full[fk.fl_idx] = ql
+        qpos_full[fk.fr_idx] = qr
+
+        try:
+            res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
+            res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+        except Exception:
+            continue
+
+        if res_l.get("status") == "Success" and res_r.get("status") == "Success":
+            q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
+            q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
+            # Prevent IK branch jumps from causing abrupt first-step deviation.
+            # Apply ramp-scaled per-joint delta cap in joint space.
+            cap = max(0.0, joint_delta_cap * float(ramp))
+            if cap <= 1e-8:
+                continue
+            dq_l = np.clip(q_sol_l - ql, -cap, cap)
+            dq_r = np.clip(q_sol_r - qr, -cap, cap)
+            out[t, 0:6] = ql + dq_l
+            out[t, 7:13] = qr + dq_r
+            solved_any = True
+            solved_cnt += 1
+
+    out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
+    out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
+    info = {"eef_solved_cnt": int(solved_cnt), "eef_total_cnt": int(total_cnt)}
+    if total_cnt > 0:
+        info["eef_solved_ratio"] = float(solved_cnt) / float(total_cnt)
+    info["eef_ramp_enable"] = bool(ramp_enable)
+    info["eef_ramp_min"] = float(ramp_min)
+    info["eef_ramp_power"] = float(ramp_power)
+    info["eef_joint_delta_cap"] = float(joint_delta_cap)
+    info["eef_exec_horizon"] = int(exec_horizon)
+    return out, solved_any, mode_tag, info
+
+
+def _sample_error_mode(phase_key, cfg):
+    req = str(cfg.get("perturb_error_mode", "legacy")).strip().lower()
+    if req in {"translation", "rotation", "no_ops", "gripper_close", "gripper_open"}:
+        return req
+    if req != "auto":
+        return None
+    probs = {
+        "approach": [("translation", 0.70), ("rotation", 0.25), ("no_ops", 0.05)],
+        "pregrasp": [("gripper_close", 0.70), ("translation", 0.18), ("rotation", 0.09), ("no_ops", 0.03)],
+        "transport": [("no_ops", 0.70), ("translation", 0.18), ("rotation", 0.09), ("gripper_open", 0.03)],
+        "place": [("gripper_open", 0.70), ("translation", 0.18), ("rotation", 0.09), ("no_ops", 0.03)],
+    }
+    items = probs.get(phase_key, probs["transport"])
+    names = [x[0] for x in items]
+    p = np.array([x[1] for x in items], dtype=np.float64)
+    p = p / np.sum(p)
+    return np.random.choice(names, p=p).item()
+
+
+def _perturb_action_chunk_no_ops(act_raw, cfg, curr_left_q=None, curr_right_q=None, curr_left_g=None, curr_right_g=None):
+    out = act_raw.copy()
+    beta = float(cfg.get("perturb_noop_beta", 0.1))
+    beta = float(np.clip(beta, 0.0, 1.0))
+    beta_ramp = bool(cfg.get("perturb_noop_beta_ramp", True))
+    beta_end = float(cfg.get("perturb_noop_beta_end", min(1.0, beta * 3.0)))
+    beta_end = float(np.clip(beta_end, 0.0, 1.0))
+
+    if curr_left_q is not None and curr_right_q is not None:
+        prev_l = np.asarray(curr_left_q, dtype=np.float32).copy()
+        prev_r = np.asarray(curr_right_q, dtype=np.float32).copy()
+    else:
+        prev_l = out[0, 0:6].astype(np.float32).copy()
+        prev_r = out[0, 7:13].astype(np.float32).copy()
+
+    if curr_left_g is not None and curr_right_g is not None:
+        prev_lg = float(curr_left_g)
+        prev_rg = float(curr_right_g)
+    else:
+        prev_lg = float(out[0, 6])
+        prev_rg = float(out[0, 13])
+
+    for t in range(out.shape[0]):
+        if beta_ramp:
+            frac = float(t) / float(max(1, out.shape[0] - 1))
+            b_t = beta + (beta_end - beta) * frac
+        else:
+            b_t = beta
+        b_t = float(np.clip(b_t, 0.0, 1.0))
+
+        cmd_l = act_raw[t, 0:6].astype(np.float32)
+        cmd_r = act_raw[t, 7:13].astype(np.float32)
+        prev_l = prev_l + b_t * (cmd_l - prev_l)
+        prev_r = prev_r + b_t * (cmd_r - prev_r)
+        out[t, 0:6] = prev_l
+        out[t, 7:13] = prev_r
+
+        cmd_lg = float(act_raw[t, 6])
+        cmd_rg = float(act_raw[t, 13])
+        prev_lg = prev_lg + b_t * (cmd_lg - prev_lg)
+        prev_rg = prev_rg + b_t * (cmd_rg - prev_rg)
+        out[t, 6] = prev_lg
+        out[t, 13] = prev_rg
+    out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
+    out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
+    return out, True, "no_ops", None
+
+
+def _perturb_action_chunk_gripper(out, mode, init_left_grip, init_right_grip, cfg):
+    out = out.copy()
+    delay = int(max(0, cfg.get("perturb_gripper_delay_steps", 3)))
+    close_min = float(cfg.get("perturb_gripper_close_min", 0.35))
+    open_max = float(cfg.get("perturb_gripper_open_max", 0.75))
+    trans_steps = int(max(1, cfg.get("perturb_gripper_transition_steps", 4)))
+    for gi, init_g in [(6, init_left_grip), (13, init_right_grip)]:
+        seq = out[:, gi].copy()
+        if mode == "gripper_close":
+            closing = np.where(seq < init_g - 1e-4)[0]
+            if closing.size > 0:
+                s = int(closing[0])
+                hold_end = min(out.shape[0], s + delay)
+                out[s:hold_end, gi] = init_g
+                target = np.maximum(seq[min(hold_end, out.shape[0] - 1)], close_min)
+                trans_end = min(out.shape[0], hold_end + trans_steps)
+                if hold_end < trans_end:
+                    out[hold_end:trans_end, gi] = np.linspace(init_g, target, trans_end - hold_end, endpoint=False)
+                if trans_end < out.shape[0]:
+                    out[trans_end:, gi] = np.maximum(out[trans_end:, gi], target)
+        else:
+            opening = np.where(seq > init_g + 1e-4)[0]
+            if opening.size > 0:
+                s = int(opening[0])
+                hold_end = min(out.shape[0], s + delay)
+                out[s:hold_end, gi] = init_g
+                target = np.minimum(seq[min(hold_end, out.shape[0] - 1)], open_max)
+                trans_end = min(out.shape[0], hold_end + trans_steps)
+                if hold_end < trans_end:
+                    out[hold_end:trans_end, gi] = np.linspace(init_g, target, trans_end - hold_end, endpoint=False)
+                if trans_end < out.shape[0]:
+                    out[trans_end:, gi] = np.minimum(out[trans_end:, gi], target)
+    out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
+    out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
+    tag = "gripper_close" if mode == "gripper_close" else "gripper_open"
+    return out, True, tag, None
+
+
+def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r):
+    if fk is None or planner_l is None or planner_r is None:
+        return act_raw, False, "rot_missing_modules", None
+    import sapien
+    from scipy.spatial.transform import Rotation as R
+    out = act_raw.copy()
+    tcp_offset_x = float(cfg.get("perturb_eef_tcp_offset_x", 0.085))
+    angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0))
+    angle_max = np.deg2rad(angle_max_deg)
+    ramp_enable = bool(cfg.get("perturb_eef_ramp", True))
+    ramp_min = float(cfg.get("perturb_eef_ramp_min", 0.0))
+    ramp_power = float(cfg.get("perturb_eef_ramp_power", 1.0))
+    ramp_apply_eps = float(cfg.get("perturb_eef_ramp_apply_eps", 1e-4))
+    joint_delta_cap = float(cfg.get("perturb_eef_joint_delta_cap", 0.12))
+    rollout_exec_steps = int(cfg.get("rollout_exec_steps", 0))
+    axis_l = cfg.get("perturb_rot_axis_left_vec", np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    axis_r = cfg.get("perturb_rot_axis_right_vec", np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    rand_axis = bool(cfg.get("perturb_rotation_random_axis", True))
+    if rand_axis:
+        axis_l = _sample_unit_vec3()
+        axis_r = _sample_unit_vec3()
+
+    solved = 0
+    total = int(out.shape[0])
+    exec_horizon = total if rollout_exec_steps <= 0 else int(np.clip(rollout_exec_steps, 1, total))
+    for t in range(total):
+        frac = float(min(t, exec_horizon - 1)) / float(max(1, exec_horizon - 1))
+        ramp = (ramp_min + (1.0 - ramp_min) * (frac ** ramp_power)) if ramp_enable else 1.0
+        if abs(ramp) <= ramp_apply_eps:
+            continue
+        ql = out[t, 0:6].astype(np.float32)
+        qr = out[t, 7:13].astype(np.float32)
+        fr = fk.forward(ql, qr)
+        l_link_p, l_link_q = fr["left"][0].astype(np.float32), fr["left"][1].astype(np.float32)
+        r_link_p, r_link_q = fr["right"][0].astype(np.float32), fr["right"][1].astype(np.float32)
+        lp, lq = _link6_to_tcp_pose(l_link_p, l_link_q, offset_x=tcp_offset_x)
+        rp, rq = _link6_to_tcp_pose(r_link_p, r_link_q, offset_x=tcp_offset_x)
+        rot_l = R.from_rotvec(np.asarray(axis_l, dtype=np.float32) * (angle_max * ramp))
+        rot_r = R.from_rotvec(np.asarray(axis_r, dtype=np.float32) * (angle_max * ramp))
+        ql_xyzw = np.array([lq[1], lq[2], lq[3], lq[0]], dtype=np.float32)
+        qr_xyzw = np.array([rq[1], rq[2], rq[3], rq[0]], dtype=np.float32)
+        ql_new = (rot_l * R.from_quat(ql_xyzw)).as_quat()
+        qr_new = (rot_r * R.from_quat(qr_xyzw)).as_quat()
+        lq_new = np.array([ql_new[3], ql_new[0], ql_new[1], ql_new[2]], dtype=np.float32)
+        rq_new = np.array([qr_new[3], qr_new[0], qr_new[1], qr_new[2]], dtype=np.float32)
+        target_lp = sapien.Pose(lp.astype(np.float32), lq_new)
+        target_rp = sapien.Pose(rp.astype(np.float32), rq_new)
+        qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
+        qpos_full[fk.fl_idx] = ql
+        qpos_full[fk.fr_idx] = qr
+        try:
+            res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
+            res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+        except Exception:
+            continue
+        if res_l.get("status") == "Success" and res_r.get("status") == "Success":
+            q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
+            q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
+            cap = max(0.0, joint_delta_cap * float(ramp))
+            if cap <= 1e-8:
+                continue
+            out[t, 0:6] = ql + np.clip(q_sol_l - ql, -cap, cap)
+            out[t, 7:13] = qr + np.clip(q_sol_r - qr, -cap, cap)
+            solved += 1
+    out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
+    out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
+    info = {"eef_solved_cnt": int(solved), "eef_total_cnt": int(total), "error_mode": "rotation"}
+    if total > 0:
+        info["eef_solved_ratio"] = float(solved) / float(total)
+    return out, solved > 0, "rotation", info
+
+
+def perturb_action_chunk_online(
+    act_raw, cfg, dyn_state, fk=None, planner_l=None, planner_r=None,
+    phase_key=None, init_left_grip=0.0, init_right_grip=0.0,
+    curr_left_q=None, curr_right_q=None
+):
+    """
+    Dynamics-aware perturbation in action space:
+    low-pass execution + AR(1) colored noise + optional bias +
+    velocity/acceleration limits.
+    """
+    if not cfg.get("enable_perturb", False):
+        return act_raw, False, "disabled", dyn_state
+    prob = float(cfg.get("perturb_prob", 0.0))
+    if prob <= 0.0 or np.random.rand() >= prob:
+        return act_raw, False, "skip_prob", dyn_state
+
+    selected_mode = _sample_error_mode(phase_key, cfg)
+    if selected_mode is not None:
+        if selected_mode == "translation":
+            out, ok, tag, info = _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r)
+        elif selected_mode == "rotation":
+            out, ok, tag, info = _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r)
+        elif selected_mode == "no_ops":
+            out, ok, tag, info = _perturb_action_chunk_no_ops(
+                act_raw, cfg,
+                curr_left_q=curr_left_q, curr_right_q=curr_right_q,
+                curr_left_g=init_left_grip, curr_right_g=init_right_grip,
+            )
+        elif selected_mode == "gripper_close":
+            out, ok, tag, info = _perturb_action_chunk_gripper(
+                act_raw, "gripper_close", init_left_grip, init_right_grip, cfg
+            )
+        else:
+            out, ok, tag, info = _perturb_action_chunk_gripper(
+                act_raw, "gripper_open", init_left_grip, init_right_grip, cfg
+            )
+        if isinstance(info, dict):
+            info["error_mode"] = selected_mode
+        return out, ok, f"mode_{tag}", info
+
+    perturb_space = str(cfg.get("perturb_space", "joint")).strip().lower()
+    if perturb_space == "eef":
+        return _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r)
+
+    out = act_raw.copy()
+    alpha = float(cfg.get("perturb_lp_alpha", 0.35))
+    rho = float(cfg.get("perturb_noise_rho", 0.85))
+    noise_std = float(cfg.get("perturb_noise_std", 0.01))
+    vel_lim = float(cfg.get("perturb_vel_limit", 0.08))
+    acc_lim = float(cfg.get("perturb_acc_limit", 0.04))
+    bias_prob = float(cfg.get("perturb_bias_prob", 0.2))
+    bias_std = float(cfg.get("perturb_bias_std", 0.03))
+    q_abs_lim = float(cfg.get("perturb_joint_limit_abs", 3.14))
+    perturb_mode = str(cfg.get("perturb_mode", "dyn")).strip().lower()
+    fail_gain = float(cfg.get("perturb_fail_gain", 0.12))
+    fail_dir = cfg.get("perturb_fail_direction_vec", None)
+
+    if dyn_state is None:
+        dyn_state = {
+            "prev_exec_arm": _extract_arm(out[0]).astype(np.float32),
+            "prev_vel_arm": np.zeros((12,), dtype=np.float32),
+            "prev_noise_arm": np.zeros((12,), dtype=np.float32),
+            "bias_arm": np.zeros((12,), dtype=np.float32),
+        }
+
+    if perturb_mode == "directional_fail":
+        if fail_dir is None:
+            fail_dir = np.ones((12,), dtype=np.float32)
+            fail_dir /= np.linalg.norm(fail_dir)
+        dyn_state["bias_arm"] = (fail_gain * np.asarray(fail_dir, dtype=np.float32)).astype(np.float32)
+        mode_tag = "dyn_directional_fail"
+    else:
+        if np.random.rand() < bias_prob:
+            dyn_state["bias_arm"] = np.random.normal(0.0, bias_std, size=(12,)).astype(np.float32)
+        else:
+            dyn_state["bias_arm"] *= 0.95  # decay old bias smoothly
+        mode_tag = "dyn_lp_ar"
+
+    prev_exec = dyn_state["prev_exec_arm"].astype(np.float32)
+    prev_vel = dyn_state["prev_vel_arm"].astype(np.float32)
+    prev_noise = dyn_state["prev_noise_arm"].astype(np.float32)
+    bias = dyn_state["bias_arm"].astype(np.float32)
+
+    for t in range(out.shape[0]):
+        cmd_arm = _extract_arm(out[t]).astype(np.float32)
+        noise = rho * prev_noise + np.random.normal(0.0, noise_std, size=(12,)).astype(np.float32)
+        target = cmd_arm + bias + noise
+
+        # low-pass actuator response
+        exec_arm = prev_exec + alpha * (target - prev_exec)
+
+        # velocity limit
+        vel = np.clip(exec_arm - prev_exec, -vel_lim, vel_lim)
+        exec_arm = prev_exec + vel
+
+        # acceleration limit
+        acc = np.clip(vel - prev_vel, -acc_lim, acc_lim)
+        vel = prev_vel + acc
+        exec_arm = prev_exec + vel
+
+        # coarse joint bound
+        exec_arm = np.clip(exec_arm, -q_abs_lim, q_abs_lim)
+
+        out[t] = _write_arm(out[t], exec_arm)
+        out[t, 6] = np.clip(out[t, 6], 0.0, 1.0)
+        out[t, 13] = np.clip(out[t, 13], 0.0, 1.0)
+
+        prev_exec, prev_vel, prev_noise = exec_arm, vel, noise
+
+    dyn_state["prev_exec_arm"] = prev_exec
+    dyn_state["prev_vel_arm"] = prev_vel
+    dyn_state["prev_noise_arm"] = prev_noise
+    return out, True, mode_tag, dyn_state
+
+
 def main(args):
     set_seed(1)
+    _rank = int(os.environ.get("RANK", -1))
+    _local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    print(f"[main][rank={_rank} local_rank={_local_rank}] start")
     # command line parameters
     is_eval = args.get("eval", False)
     ckpt_dir = args["ckpt_dir"]
@@ -178,6 +765,12 @@ def main(args):
     #     exit()
 
     enable_wm = args['enable_wm_correction']
+    fail_dir_vec = _parse_vec12(args.get("perturb_fail_direction", ""))
+    eef_fail_dir_left_vec = _parse_vec3(args.get("perturb_eef_fail_dir_left", ""))
+    eef_fail_dir_right_vec = _parse_vec3(args.get("perturb_eef_fail_dir_right", ""))
+    rot_axis_left_vec = _parse_vec3(args.get("perturb_rot_axis_left", ""))
+    rot_axis_right_vec = _parse_vec3(args.get("perturb_rot_axis_right", ""))
+    start_margin = 0
     if enable_wm:
         wm_required = ['evac_ckpt', 'evac_config', 'urdf_path', 'curobo_left_yml',
                         'curobo_right_yml', 'raw_data_dir', 'act_init_ckpt',
@@ -186,10 +779,15 @@ def main(args):
         missing = [k for k in wm_required if args.get(k) is None]
         if missing:
             raise ValueError(f"--enable_wm_correction requires these args: {missing}")
+        start_margin = int(args['max_rollout_steps']) * int(args['chunk_size'])
     raw_data_dir = args['raw_data_dir'] if enable_wm else None
+    print(f"[main][rank={_rank}] before load_data | dataset_dir={dataset_dir} | num_episodes={num_episodes} | start_margin={start_margin}")
+    _t_load = time.time()
     train_dataloader, val_dataloader, stats, _, max_action_len = load_data(dataset_dir, num_episodes, camera_names,
                                                                           batch_size_train, batch_size_val,
-                                                                          raw_data_dir=raw_data_dir)
+                                                                          raw_data_dir=raw_data_dir,
+                                                                          start_margin=start_margin)
+    print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -204,19 +802,74 @@ def main(args):
         config['raw_data_dir'] = raw_data_dir
         config['norm_stats'] = stats
         config['dataset_dir'] = dataset_dir
+        rollout_exec_steps = args.get('rollout_exec_steps', None)
+        if rollout_exec_steps is None or int(rollout_exec_steps) <= 0:
+            rollout_exec_steps = int(args['chunk_size'])
         config['correction_cfg'] = {
             'threshold': args['correction_threshold'],
             'max_rollout_steps': args['max_rollout_steps'],
+            'single_rollout_correction': args.get('single_rollout_correction', False),
+            'target_mode': args.get('target_mode', 'forward'),
+            'target_lookahead_steps': args.get('target_lookahead_steps', 0),
+            'rollout_exec_steps': int(rollout_exec_steps),
             'chunk_size': args['chunk_size'],
             'max_action_len': max_action_len,
             'correction_freq': args['correction_freq'],
             'correction_weight': args['correction_weight'],
             'orient_weight': args['orient_weight'],
             'gripper_penalty': args['gripper_penalty'],
+            'always_correction': args.get('always_correction', False),
             'evac_infer_kwargs': build_evac_infer_kwargs(args),
+            'enable_perturb': args.get('enable_perturb', False),
+            'perturb_prob': args.get('perturb_prob', 1.0),
+            'perturb_error_mode': args.get('perturb_error_mode', 'legacy'),
+            'perturb_space': args.get('perturb_space', 'joint'),
+            'perturb_lp_alpha': args.get('perturb_lp_alpha', 0.35),
+            'perturb_noise_std': args.get('perturb_noise_std', 0.01),
+            'perturb_noise_rho': args.get('perturb_noise_rho', 0.85),
+            'perturb_vel_limit': args.get('perturb_vel_limit', 0.08),
+            'perturb_acc_limit': args.get('perturb_acc_limit', 0.04),
+            'perturb_bias_prob': args.get('perturb_bias_prob', 0.2),
+            'perturb_bias_std': args.get('perturb_bias_std', 0.03),
+            'perturb_joint_limit_abs': args.get('perturb_joint_limit_abs', 3.14),
+            'perturb_mode': args.get('perturb_mode', 'dyn'),
+            'perturb_fail_gain': args.get('perturb_fail_gain', 0.12),
+            'perturb_fail_direction_vec': fail_dir_vec,
+            'perturb_eef_mode': args.get('perturb_eef_mode', 'gaussian'),
+            'perturb_eef_pos_std': args.get('perturb_eef_pos_std', 0.01),
+            'perturb_eef_fail_gain': args.get('perturb_eef_fail_gain', 0.03),
+            'perturb_eef_tcp_offset_x': args.get('perturb_eef_tcp_offset_x', 0.085),
+            'perturb_eef_ramp': args.get('perturb_eef_ramp', True),
+            'perturb_eef_ramp_min': args.get('perturb_eef_ramp_min', 0.0),
+            'perturb_eef_ramp_power': args.get('perturb_eef_ramp_power', 1.0),
+            'perturb_eef_ramp_apply_eps': args.get('perturb_eef_ramp_apply_eps', 1e-4),
+            'perturb_eef_joint_delta_cap': args.get('perturb_eef_joint_delta_cap', 0.12),
+            'perturb_translation_random_dir': args.get('perturb_translation_random_dir', True),
+            'perturb_eef_fail_dir_left_vec': eef_fail_dir_left_vec,
+            'perturb_eef_fail_dir_right_vec': eef_fail_dir_right_vec,
+            'perturb_rot_max_deg': args.get('perturb_rot_max_deg', 15.0),
+            'perturb_rotation_random_axis': args.get('perturb_rotation_random_axis', True),
+            'perturb_rot_axis_left_vec': rot_axis_left_vec,
+            'perturb_rot_axis_right_vec': rot_axis_right_vec,
+            'perturb_noop_lag_steps': args.get('perturb_noop_lag_steps', 3),
+            'perturb_noop_alpha': args.get('perturb_noop_alpha', 0.85),
+            'perturb_noop_transition_steps': args.get('perturb_noop_transition_steps', 4),
+            'perturb_noop_beta': args.get('perturb_noop_beta', 0.1),
+            'perturb_noop_beta_ramp': args.get('perturb_noop_beta_ramp', True),
+            'perturb_noop_beta_end': args.get('perturb_noop_beta_end', 0.3),
+            'perturb_gripper_delay_steps': args.get('perturb_gripper_delay_steps', 3),
+            'perturb_gripper_transition_steps': args.get('perturb_gripper_transition_steps', 4),
+            'perturb_gripper_close_min': args.get('perturb_gripper_close_min', 0.35),
+            'perturb_gripper_open_max': args.get('perturb_gripper_open_max', 0.75),
+            'vla_input_noise_enable': args.get('vla_input_noise_enable', False),
+            'vla_img_noise_std': args.get('vla_img_noise_std', 0.0),
+            'vla_qpos_noise_std': args.get('vla_qpos_noise_std', 0.0),
+            'export_correction_dataset': args.get('export_correction_dataset', False),
+            'export_correction_dir': args.get('export_correction_dir', ''),
         }
         config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
+    print(f"[main][rank={_rank}] before train_bc | enable_wm={enable_wm}")
     train_bc(train_dataloader, val_dataloader, config)
     # best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
@@ -317,6 +970,56 @@ def load_raw_data(raw_data_dir, episode_id):
             'extrinsic_cv': f['observation/head_camera/extrinsic_cv'][0].astype(np.float32),
             'native_resolution': (h_native, w_native),  # intrinsic is calibrated for this
         }
+
+
+def _init_export_episode_id(export_dir):
+    if not os.path.isdir(export_dir):
+        return 0
+    max_id = -1
+    for fn in os.listdir(export_dir):
+        m = re.match(r"episode_(\d+)\.hdf5$", fn)
+        if m:
+            max_id = max(max_id, int(m.group(1)))
+    return max_id + 1
+
+
+def _export_correction_sample_as_episode(
+    export_dir,
+    episode_id,
+    cam_names,
+    corr_image,
+    corr_qpos_norm,
+    corr_action_norm,
+    corr_is_pad,
+    norm_stats,
+):
+    os.makedirs(export_dir, exist_ok=True)
+    path = os.path.join(export_dir, f"episode_{episode_id}.hdf5")
+
+    img = corr_image.detach().cpu().numpy()            # (K,C,H,W), [0,1]
+    qn = corr_qpos_norm.detach().cpu().numpy()         # (14,)
+    an = corr_action_norm.detach().cpu().numpy()       # (Tmax,14)
+    pad = corr_is_pad.detach().cpu().numpy().astype(bool)
+
+    valid_len = int(np.sum(~pad))
+    valid_len = max(1, valid_len)
+
+    qpos_raw = (qn * norm_stats["qpos_std"] + norm_stats["qpos_mean"]).astype(np.float32)
+    action_raw = (an * norm_stats["action_std"] + norm_stats["action_mean"]).astype(np.float32)
+    action_raw = action_raw[:valid_len]
+    qpos_seq = np.repeat(qpos_raw[None, :], valid_len, axis=0).astype(np.float32)
+
+    img_u8 = np.clip(np.round(img * 255.0), 0, 255).astype(np.uint8)
+    img_hwc = np.transpose(img_u8, (0, 2, 3, 1))  # (K,H,W,C)
+
+    import h5py
+    with h5py.File(path, "w") as f:
+        f.create_dataset("/action", data=action_raw, compression="gzip", compression_opts=1)
+        f.create_dataset("/observations/qpos", data=qpos_seq, compression="gzip", compression_opts=1)
+        g_img = f.create_group("/observations/images")
+        for k, cam_name in enumerate(cam_names):
+            frames = np.repeat(img_hwc[k][None, ...], valid_len, axis=0)
+            g_img.create_dataset(cam_name, data=frames, compression="gzip", compression_opts=1)
 
 
 def find_nearest_traj_point(fk_left_pos, fk_left_quat, fk_right_pos, fk_right_quat,
@@ -477,26 +1180,35 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
 
 
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
-                    norm_stats, modules, cfg, device, debug_dir=None):
+                    norm_stats, modules, cfg, device, debug_dir=None, start_ts=0):
     fk = modules['fk']
     evac_model = modules['evac_model']
     evac_cfg = modules['evac_config']
     planner_l = modules['planner_left']
     planner_r = modules['planner_right']
 
-    left_ep = raw_data['left_endpose']
-    right_ep = raw_data['right_endpose']
+    # Align correction target trajectory with sampled qpos/action timestamp origin.
+    start_ts = int(max(0, start_ts))
+    left_ep = raw_data['left_endpose'][start_ts:]
+    right_ep = raw_data['right_endpose'][start_ts:]
     threshold = cfg['threshold']
+    always_correction = bool(cfg.get('always_correction', False))
     max_steps = cfg['max_rollout_steps']
+    single_rollout_correction = bool(cfg.get('single_rollout_correction', False))
+    target_mode = str(cfg.get('target_mode', 'forward')).strip().lower()
+    target_lookahead_steps = int(cfg.get('target_lookahead_steps', 0))
     chunk_size = cfg['chunk_size']
+    rollout_exec_steps = int(cfg.get('rollout_exec_steps', chunk_size))
     max_action_len = cfg['max_action_len']
-    chunk_evac = evac_cfg.chunk
     n_previous = evac_cfg.n_previous
     orient_weight = cfg.get('orient_weight', 0.0)
     gripper_penalty = cfg.get('gripper_penalty', 0.0)
 
-    left_grip_traj = raw_data['left_gripper']
-    right_grip_traj = raw_data['right_gripper']
+    left_grip_traj = raw_data['left_gripper'][start_ts:]
+    right_grip_traj = raw_data['right_gripper'][start_ts:]
+    vla_input_noise_enable = bool(cfg.get('vla_input_noise_enable', False))
+    vla_img_noise_std = float(cfg.get('vla_img_noise_std', 0.0))
+    vla_qpos_noise_std = float(cfg.get('vla_qpos_noise_std', 0.0))
 
     qpos_raw = qpos_data_s.cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
     curr_image = image_data_s.clone()
@@ -507,6 +1219,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     t_star = 0
     min_dist = 0.0
     _dbg_rollout = []  # collect per-step debug info
+    dyn_state = None
 
     for step in range(max_steps):
         left_q, right_q = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
@@ -522,31 +1235,63 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         if min_dist >= threshold:
             break
         if t_star >= len(left_ep) - 2:
+            if debug_dir is not None:
+                import json
+                _dbg_corr = os.path.join(debug_dir, 'correction')
+                os.makedirs(_dbg_corr, exist_ok=True)
+                with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                    json.dump({'reason': 'near_end_of_trajectory',
+                               't_star': int(t_star), 'traj_len': len(left_ep),
+                               'min_dist': float(min_dist), 'step': step,
+                               'rollout': _dbg_rollout}, _f, indent=2)
             return None
 
         qn = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
         qt = torch.from_numpy(qn).float().unsqueeze(0).to(device)
         it = curr_image.unsqueeze(0).to(device)
+        input_noised = False
+        if vla_input_noise_enable:
+            if vla_qpos_noise_std > 0:
+                qt = qt + torch.randn_like(qt) * vla_qpos_noise_std
+                input_noised = True
+            if vla_img_noise_std > 0:
+                it = torch.clamp(it + torch.randn_like(it) * vla_img_noise_std, 0.0, 1.0)
+                input_noised = True
+        # Use eval mode for rollout action generation to match deployment behavior
+        # and avoid training-time dropout noise in correction targets.
+        _was_training = policy_unwrapped.training
+        policy_unwrapped.eval()
         with torch.no_grad():
             act_chunk = policy_unwrapped(qt, it)
+        if _was_training:
+            policy_unwrapped.train()
         act_np = act_chunk.squeeze(0).cpu().numpy()
+        act_raw = act_np * norm_stats['action_std'] + norm_stats['action_mean']
+        progress = float(t_star) / max(1, len(left_ep) - 1)
+        # Choose error phase from the whole GT action window (prefix) instead of a single anchor.
+        phase_key = _infer_phase_key_from_gt_window(
+            left_grip_traj=left_grip_traj,
+            right_grip_traj=right_grip_traj,
+            window_len=rollout_exec_steps,
+        )
+        act_raw, perturbed, pert_mode, dyn_state = perturb_action_chunk_online(
+            act_raw, cfg, dyn_state, fk=fk, planner_l=planner_l, planner_r=planner_r,
+            phase_key=phase_key, init_left_grip=float(left_grip), init_right_grip=float(right_grip),
+            curr_left_q=left_q, curr_right_q=right_q
+        )
 
-        n_total = n_previous + chunk_evac
-        fk_poses, grip_list = [], []
-        for _ in range(n_previous):
-            fk_poses.append((lp.copy(), lq.copy(), rp.copy(), rq.copy()))
-            grip_list.append((left_grip, right_grip))
-        for ai in range(min(chunk_evac, len(act_np))):
-            ar = act_np[ai] * norm_stats['action_std'] + norm_stats['action_mean']
+        exec_len = int(np.clip(rollout_exec_steps, 1, len(act_raw)))
+        fk_poses = [(lp.copy(), lq.copy(), rp.copy(), rq.copy())]  # current state
+        grip_list = [(left_grip, right_grip)]
+        # Feed only the first exec_len actions to EVAC for a milder, shorter rollout update.
+        for ai in range(exec_len):
+            ar = act_raw[ai]
             fr = fk.forward(ar[0:6], ar[7:13])
             fk_poses.append((fr['left'][0].copy(), fr['left'][1].copy(),
                              fr['right'][0].copy(), fr['right'][1].copy()))
             grip_list.append((ar[6], ar[13]))
-        while len(fk_poses) < n_total:
-            fk_poses.append(fk_poses[-1])
-            grip_list.append(grip_list[-1])
 
-        evac_debug_dir = os.path.join(debug_dir, 'evac') if debug_dir else None
+        evac_debug_dir = os.path.join(debug_dir, 'evac', f'rollout_step_{step:03d}') if debug_dir else None
         pred = evac_inference(
             evac_model,
             evac_cfg,
@@ -561,19 +1306,55 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         new_img = curr_image.clone()
         new_img[0] = pred
         curr_image = new_img
-        a0 = act_np[0] * norm_stats['action_std'] + norm_stats['action_mean']
-        curr_qpos_raw = a0
+        # Advance state to the end of the executed prefix.
+        a_last = act_raw[exec_len - 1]
+        curr_qpos_raw = a_last
 
         # collect debug info for this rollout step
         if debug_dir is not None:
+            eef_solved_cnt = None
+            eef_total_cnt = None
+            eef_solved_ratio = None
+            sampled_error_mode = None
+            if isinstance(dyn_state, dict):
+                eef_solved_cnt = dyn_state.get('eef_solved_cnt')
+                eef_total_cnt = dyn_state.get('eef_total_cnt')
+                eef_solved_ratio = dyn_state.get('eef_solved_ratio')
+                sampled_error_mode = dyn_state.get('error_mode')
             _dbg_rollout.append({
                 'step': step, 't_star': int(t_star), 'min_dist': float(min_dist),
+                'progress': float(progress), 'phase_key': phase_key,
                 'fk_left_pos': lp.tolist(), 'fk_right_pos': rp.tolist(),
                 'left_grip': float(left_grip), 'right_grip': float(right_grip),
-                'act_chunk_raw_first': (act_np[0] * norm_stats['action_std'] + norm_stats['action_mean']).tolist(),
+                'action_perturbed': bool(perturbed),
+                'perturb_mode': pert_mode,
+                'sampled_error_mode': sampled_error_mode,
+                'eef_ik_solved_cnt': eef_solved_cnt,
+                'eef_ik_total_cnt': eef_total_cnt,
+                'eef_ik_solved_ratio': eef_solved_ratio,
+                'input_noised': bool(input_noised),
+                'vla_img_noise_std': float(vla_img_noise_std),
+                'vla_qpos_noise_std': float(vla_qpos_noise_std),
+                'act_chunk_raw_first': act_raw[0].tolist(),
+                'act_chunk_raw_last': act_raw[-1].tolist(),
+                'rollout_exec_len': int(exec_len),
             })
+        if single_rollout_correction:
+            break
 
-    if min_dist < threshold:
+    # Recompute nearest-point metrics at the final post-rollout state.
+    left_q, right_q = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
+    left_grip, right_grip = curr_qpos_raw[6], curr_qpos_raw[13]
+    fk_r = fk.forward(left_q, right_q)
+    lp, lq = fk_r['left']
+    rp, rq = fk_r['right']
+    t_star, min_dist = find_nearest_traj_point(
+        lp, lq, rp, rq, left_ep, right_ep, orient_weight,
+        curr_left_grip=left_grip, curr_right_grip=right_grip,
+        left_gripper_traj=left_grip_traj, right_gripper_traj=right_grip_traj,
+        gripper_penalty=gripper_penalty)
+
+    if (not always_correction) and min_dist < threshold:
         # debug: save rollout info even on skip
         if debug_dir is not None:
             import json
@@ -585,8 +1366,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         return None
 
     import sapien
-    target_lp = sapien.Pose(left_ep[t_star, :3], left_ep[t_star, 3:7])
-    target_rp = sapien.Pose(right_ep[t_star, :3], right_ep[t_star, 3:7])
+    if target_mode == 'backward':
+        t_target = int(np.clip(t_star - target_lookahead_steps, 0, len(left_ep) - 1))
+    else:
+        t_target = int(np.clip(t_star + target_lookahead_steps, 0, len(left_ep) - 1))
+    target_lp = sapien.Pose(left_ep[t_target, :3], left_ep[t_target, 3:7])
+    target_rp = sapien.Pose(right_ep[t_target, :3], right_ep[t_target, 3:7])
     qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
     qpos_full[fk.fl_idx] = left_q
     qpos_full[fk.fr_idx] = right_q
@@ -594,15 +1379,40 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     try:
         res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag='left')
         res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag='right')
-    except Exception:
+    except Exception as exc:
+        if debug_dir is not None:
+            import json
+            _dbg_corr = os.path.join(debug_dir, 'correction')
+            os.makedirs(_dbg_corr, exist_ok=True)
+            with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                json.dump({
+                    'reason': 'planner_exception',
+                    'error': str(exc),
+                    't_star': int(t_star),
+                    'min_dist': float(min_dist),
+                    'rollout': _dbg_rollout,
+                }, _f, indent=2)
         return None
     if res_l.get('status') != 'Success' or res_r.get('status') != 'Success':
+        if debug_dir is not None:
+            import json
+            _dbg_corr = os.path.join(debug_dir, 'correction')
+            os.makedirs(_dbg_corr, exist_ok=True)
+            with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                json.dump({
+                    'reason': 'planner_status_fail',
+                    'planner_left_status': res_l.get('status'),
+                    'planner_right_status': res_r.get('status'),
+                    't_star': int(t_star),
+                    'min_dist': float(min_dist),
+                    'rollout': _dbg_rollout,
+                }, _f, indent=2)
         return None
 
     lt = resample_trajectory(res_l['position'], chunk_size)
     rt = resample_trajectory(res_r['position'], chunk_size)
-    tl_grip = raw_data['left_gripper'][t_star]
-    tr_grip = raw_data['right_gripper'][t_star]
+    tl_grip = left_grip_traj[t_target]
+    tr_grip = right_grip_traj[t_target]
 
     corr = np.zeros((chunk_size, 14), dtype=np.float32)
     corr[:, 0:6] = lt
@@ -648,13 +1458,104 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # save original image (image_data_s is BGR, cv2 expects BGR)
         _oimg = (image_data_s[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         cv2.imwrite(os.path.join(_dbg_corr, 'original_image.png'), _oimg)
+        # Project correction trajectory (EEF paths) onto images for quick sanity check.
+        try:
+            from evac.lvdm.data.utils import get_transformation_matrix_from_quat
+            from evac.lvdm.data.traj_vis_statistics import (
+                EndEffectorPts, Gripper2EEFCvt,
+                ColorMapLeft, ColorMapRight,
+                ColorListLeft, ColorListRight,
+            )
+            K = raw_data['intrinsic_cv'].astype(np.float32).copy()
+            E = np.eye(4, dtype=np.float32)
+            E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
+            # Intrinsics are calibrated at native resolution. Overlay images are
+            # 640x480, so scale K to the current image size before projection.
+            h_native, w_native = raw_data.get('native_resolution', (_oimg.shape[0], _oimg.shape[1]))
+            h_img, w_img = _oimg.shape[:2]
+            if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
+                sx = float(w_img) / float(w_native)
+                sy = float(h_img) / float(h_native)
+                K[0, 0] *= sx
+                K[0, 2] *= sx
+                K[1, 1] *= sy
+                K[1, 2] *= sy
+
+            # Reuse EVAC get_traj projection chain for consistency:
+            # pose -> (w2c @ pose_mat @ Gripper2EEFCvt @ EndEffectorPts[0]) -> K projection
+            w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)      # (1,1,4,4)
+            intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0) # (1,1,3,3)
+            cvt_t = torch.tensor(Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+            ee_key_pts = torch.tensor(EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+
+            def _project_eef_keypoints(pt3, quat_wxyz):
+                quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
+                pose_xyzw = np.concatenate([pt3.astype(np.float32), quat_xyzw], axis=0)[None, ...]
+                pose_mat = get_transformation_matrix_from_quat(torch.from_numpy(pose_xyzw).float()).unsqueeze(0)
+                ee2cam = torch.matmul(torch.matmul(w2c_t, pose_mat), cvt_t)
+                pts = torch.matmul(ee2cam, ee_key_pts)  # (1,1,4,4)
+                uvw = torch.matmul(intrinsic_t, pts[:, :, :3, :])
+                out_uvs = []
+                for ki in range(4):
+                    z = float(pts[0, 0, 2, ki].item())
+                    if z <= 1e-6:
+                        out_uvs.append(None)
+                        continue
+                    u = int(float((uvw[0, 0, 0, ki] / uvw[0, 0, 2, ki]).item()))
+                    v = int(float((uvw[0, 0, 1, ki] / uvw[0, 0, 2, ki]).item()))
+                    out_uvs.append((u, v))
+                return out_uvs
+
+            def _to_color_from_cmap(cmap, v01):
+                rgb = cmap(float(np.clip(v01, 0.0, 1.0)))[:3]
+                return tuple(int(c * 255) for c in rgb)
+
+            def _draw_get_traj_style(img, points4, grip_v01, lr_tag):
+                if points4[0] is None:
+                    return
+                base = np.array(points4[0], dtype=np.int32)
+                if base[0] < 0 or base[0] >= w_img or base[1] < 0 or base[1] >= h_img:
+                    return
+                if lr_tag == "left":
+                    base_color = _to_color_from_cmap(ColorMapLeft, grip_v01)
+                    line_colors = ColorListLeft
+                else:
+                    base_color = _to_color_from_cmap(ColorMapRight, grip_v01)
+                    line_colors = ColorListRight
+                # Match EVAC get_traj semantics: colored base circle + rays to keypoints.
+                cv2.circle(img, tuple(base), 50, base_color, -1)
+                for ki in range(1, 4):
+                    pt = points4[ki]
+                    if pt is None:
+                        continue
+                    p = np.array(pt, dtype=np.int32)
+                    cv2.line(img, tuple(base), tuple(p), line_colors[ki - 1], 8)
+
+            _overlay_o = _oimg.copy()
+            _overlay_c = _cimg.copy()
+            for ai in range(corr.shape[0]):
+                fr = fk.forward(corr[ai, 0:6], corr[ai, 7:13])
+                luvs = _project_eef_keypoints(fr['left'][0], fr['left'][1])
+                ruvs = _project_eef_keypoints(fr['right'][0], fr['right'][1])
+                lg = float(np.clip(corr[ai, 6], 0.0, 1.0))
+                rg = float(np.clip(corr[ai, 13], 0.0, 1.0))
+                _draw_get_traj_style(_overlay_o, luvs, lg, "left")
+                _draw_get_traj_style(_overlay_o, ruvs, rg, "right")
+                _draw_get_traj_style(_overlay_c, luvs, lg, "left")
+                _draw_get_traj_style(_overlay_c, ruvs, rg, "right")
+            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
+            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+        except Exception:
+            pass
         # save planner results summary
         _plan_info = {
             'rollout': _dbg_rollout,
             't_star': int(t_star), 'min_dist': float(min_dist),
+            'target_mode': target_mode,
+            't_target': int(t_target), 'target_lookahead_steps': int(target_lookahead_steps),
             'threshold': threshold,
-            'target_left_pose': left_ep[t_star].tolist(),
-            'target_right_pose': right_ep[t_star].tolist(),
+            'target_left_pose': left_ep[t_target].tolist(),
+            'target_right_pose': right_ep[t_target].tolist(),
             'planner_left_status': res_l.get('status'),
             'planner_right_status': res_r.get('status'),
             'planner_left_len': len(res_l.get('position', [])),
@@ -871,6 +1772,8 @@ def forward_pass(data, policy):
 
 
 def train_bc(train_dataloader, val_dataloader, config):
+    _r = int(os.environ.get("RANK", -1))
+    _lr = int(os.environ.get("LOCAL_RANK", -1))
     num_epochs = config["num_epochs"]
     ckpt_dir = config["ckpt_dir"]
     seed = config["seed"]
@@ -884,18 +1787,30 @@ def train_bc(train_dataloader, val_dataloader, config):
     # Set seed after Accelerator init so each process gets proper seed offset
     set_seed(seed)
 
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before make_policy")
+    _t_make_policy = time.time()
     policy = make_policy(policy_class, policy_config)
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after make_policy | elapsed={time.time() - _t_make_policy:.2f}s")
 
     enable_wm = config['enable_wm_correction']
     if enable_wm and config.get('act_init_ckpt'):
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before load_act_init_ckpt")
+        _t_load_act = time.time()
         ckpt = torch.load(config['act_init_ckpt'], map_location='cpu')
         policy.load_state_dict(ckpt)
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after load_act_init_ckpt | elapsed={time.time() - _t_load_act:.2f}s")
         print(f"Loaded ACT init weights from {config['act_init_ckpt']}")
 
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before make_optimizer")
+    _t_make_opt = time.time()
     optimizer = make_optimizer(policy_class, policy)
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after make_optimizer | elapsed={time.time() - _t_make_opt:.2f}s")
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before accelerator.prepare")
+    _t_prepare = time.time()
     policy, optimizer, train_dataloader = accelerator.prepare(
         policy, optimizer, train_dataloader
     )
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after accelerator.prepare | elapsed={time.time() - _t_prepare:.2f}s")
 
     correction_modules = None
     debug_wm = config.get('debug_wm_correction', False)
@@ -906,10 +1821,22 @@ def train_bc(train_dataloader, val_dataloader, config):
     _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
                    'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': []}
     if enable_wm:
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
+        _t_init_corr = time.time()
         correction_modules = init_correction(config['wm_args'], accelerator.device)
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after init_correction | elapsed={time.time() - _t_init_corr:.2f}s")
         norm_stats = config['norm_stats']
         correction_cfg = config['correction_cfg']
         raw_data_dir = config['raw_data_dir']
+        export_corr = bool(correction_cfg.get('export_correction_dataset', False))
+        export_corr_dir = str(correction_cfg.get('export_correction_dir', '')).strip()
+        if export_corr and export_corr_dir == '':
+            export_corr_dir = os.path.join(ckpt_dir, 'correction_dataset')
+        export_next_id = 0
+        if export_corr and accelerator.is_main_process:
+            os.makedirs(export_corr_dir, exist_ok=True)
+            export_next_id = _init_export_episode_id(export_corr_dir)
+            print(f"[train_bc] correction export enabled: {export_corr_dir}, next_episode_id={export_next_id}")
 
     train_history = []
     validation_history = []
@@ -967,14 +1894,15 @@ def train_bc(train_dataloader, val_dataloader, config):
                     for bi in range(bs):
                         ep_id = data[4][bi].item()
                         raw = load_raw_data(raw_data_dir, ep_id)
-                        _bi_dbg = os.path.join(_step_dbg, f'bi{bi}') if _step_dbg and bi == 0 else None
+                        _bi_dbg = os.path.join(_step_dbg, f'bi{bi}') if _step_dbg else None
                         if _bi_dbg:
                             os.makedirs(_bi_dbg, exist_ok=True)
                         corr = correction_step(
                             accelerator.unwrap_model(policy),
                             data[0][bi], data[1][bi], raw,
                             norm_stats, correction_modules, correction_cfg,
-                            accelerator.device, debug_dir=_bi_dbg)
+                            accelerator.device, debug_dir=_bi_dbg,
+                            start_ts=data[5][bi].item())
                         _corr_stats['n_triggered'] += 1
                         if corr is not None:
                             ci, cq, ca, cp = corr
@@ -984,6 +1912,18 @@ def train_bc(train_dataloader, val_dataloader, config):
                             corr_pads.append(cp)
                             corr_mask.append(1.0)
                             _corr_stats['n_success'] += 1
+                            if enable_wm and export_corr and accelerator.is_main_process:
+                                _export_correction_sample_as_episode(
+                                    export_corr_dir,
+                                    export_next_id,
+                                    config['camera_names'],
+                                    ci,
+                                    cq,
+                                    ca,
+                                    cp,
+                                    norm_stats,
+                                )
+                                export_next_id += 1
                         else:
                             _corr_stats['n_skipped'] += 1
                             # dummy data to keep batch size consistent across ranks
@@ -1157,6 +2097,94 @@ if __name__ == "__main__":
         required=False,
     )
     parser.add_argument("--temporal_agg", action="store_true")
+    parser.add_argument("--enable_perturb", type=str2bool, default=False,
+                        help="Enable online rollout action perturbation in WM correction")
+    parser.add_argument("--perturb_prob", type=float, default=1.0,
+                        help="Probability to apply online perturbation per rollout chunk")
+    parser.add_argument("--perturb_error_mode", type=str, default="legacy",
+                        help="Error mode: legacy|auto|translation|rotation|no_ops|gripper_close|gripper_open")
+    parser.add_argument("--perturb_space", type=str, default="joint",
+                        help="Perturbation space: joint or eef")
+    parser.add_argument("--perturb_lp_alpha", type=float, default=0.35,
+                        help="Low-pass blending factor for actuator response")
+    parser.add_argument("--perturb_noise_std", type=float, default=0.01,
+                        help="Std of colored noise injected in action space (rad)")
+    parser.add_argument("--perturb_noise_rho", type=float, default=0.85,
+                        help="AR(1) coefficient for colored noise")
+    parser.add_argument("--perturb_vel_limit", type=float, default=0.08,
+                        help="Per-step velocity limit on perturbed arm action (rad)")
+    parser.add_argument("--perturb_acc_limit", type=float, default=0.04,
+                        help="Per-step acceleration limit on perturbed arm action (rad)")
+    parser.add_argument("--perturb_bias_prob", type=float, default=0.2,
+                        help="Probability to refresh a chunk-level bias term")
+    parser.add_argument("--perturb_bias_std", type=float, default=0.03,
+                        help="Std of chunk-level bias term (rad)")
+    parser.add_argument("--perturb_joint_limit_abs", type=float, default=3.14,
+                        help="Absolute joint bound used by perturbation model (rad)")
+    parser.add_argument("--perturb_mode", type=str, default="dyn",
+                        help="Perturbation mode: dyn or directional_fail")
+    parser.add_argument("--perturb_fail_gain", type=float, default=0.12,
+                        help="Gain for directional_fail mode (rad)")
+    parser.add_argument("--perturb_fail_direction", type=str, default="",
+                        help="12-dim comma-separated unit direction in arm-joint space for directional_fail")
+    parser.add_argument("--perturb_eef_mode", type=str, default="gaussian",
+                        help="EEF perturbation mode: gaussian or directional_fail")
+    parser.add_argument("--perturb_eef_pos_std", type=float, default=0.01,
+                        help="Std of EEF position perturbation in meters")
+    parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.03,
+                        help="Directional EEF perturbation magnitude in meters")
+    parser.add_argument("--perturb_eef_tcp_offset_x", type=float, default=0.085,
+                        help="Approximate link6->TCP offset along local X in meters")
+    parser.add_argument("--perturb_eef_ramp", type=str2bool, default=True,
+                        help="Enable time-ramped EEF perturbation over action chunk")
+    parser.add_argument("--perturb_eef_ramp_min", type=float, default=0.0,
+                        help="Minimum ramp scale at first action step")
+    parser.add_argument("--perturb_eef_ramp_power", type=float, default=1.0,
+                        help="Ramp curve power; >1 slower start, <1 faster start")
+    parser.add_argument("--perturb_eef_ramp_apply_eps", type=float, default=1e-4,
+                        help="Skip EEF IK perturbation when ramp scale is below this threshold")
+    parser.add_argument("--perturb_eef_joint_delta_cap", type=float, default=0.12,
+                        help="Per-joint max delta (rad) at ramp=1.0 for EEF IK perturbation")
+    parser.add_argument("--perturb_translation_random_dir", type=str2bool, default=True,
+                        help="Use random direction for translation failure per rollout")
+    parser.add_argument("--perturb_rot_max_deg", type=float, default=15.0,
+                        help="Max EEF rotation perturbation angle in degrees")
+    parser.add_argument("--perturb_rotation_random_axis", type=str2bool, default=True,
+                        help="Use random rotation axis for rotation failure per rollout")
+    parser.add_argument("--perturb_rot_axis_left", type=str, default="0,0,1",
+                        help="3-dim axis for left-arm rotation failure")
+    parser.add_argument("--perturb_rot_axis_right", type=str, default="0,0,1",
+                        help="3-dim axis for right-arm rotation failure")
+    parser.add_argument("--perturb_noop_lag_steps", type=int, default=3,
+                        help="Lag steps used by no_ops failure")
+    parser.add_argument("--perturb_noop_alpha", type=float, default=0.85,
+                        help="Smoothing alpha for no_ops failure")
+    parser.add_argument("--perturb_noop_transition_steps", type=int, default=4,
+                        help="Transition steps after true no-op hold")
+    parser.add_argument("--perturb_noop_beta", type=float, default=0.1,
+                        help="Low-speed follow factor for no_ops failure")
+    parser.add_argument("--perturb_noop_beta_ramp", type=str2bool, default=True,
+                        help="Linearly ramp no_ops beta over chunk")
+    parser.add_argument("--perturb_noop_beta_end", type=float, default=0.3,
+                        help="End beta when perturb_noop_beta_ramp is enabled")
+    parser.add_argument("--perturb_gripper_delay_steps", type=int, default=3,
+                        help="Delay steps for gripper close/open failure")
+    parser.add_argument("--perturb_gripper_transition_steps", type=int, default=4,
+                        help="Transition steps for gradual gripper close/open failure")
+    parser.add_argument("--perturb_gripper_close_min", type=float, default=0.35,
+                        help="Minimum gripper value in close-failure mode (cannot fully close)")
+    parser.add_argument("--perturb_gripper_open_max", type=float, default=0.75,
+                        help="Maximum gripper value in open-failure mode (cannot fully open)")
+    parser.add_argument("--perturb_eef_fail_dir_left", type=str, default="",
+                        help="3-dim comma-separated direction for left-arm EEF directional_fail")
+    parser.add_argument("--perturb_eef_fail_dir_right", type=str, default="",
+                        help="3-dim comma-separated direction for right-arm EEF directional_fail")
+    parser.add_argument("--vla_input_noise_enable", type=str2bool, default=False,
+                        help="Enable Gaussian noise on VLA rollout inputs (qpos/image)")
+    parser.add_argument("--vla_img_noise_std", type=float, default=0.0,
+                        help="Image noise std for VLA rollout input in [0,1] space")
+    parser.add_argument("--vla_qpos_noise_std", type=float, default=0.0,
+                        help="Qpos noise std for VLA rollout input in normalized space")
 
     # World-model correction arguments
     parser.add_argument("--enable_wm_correction", action="store_true",
@@ -1179,6 +2207,14 @@ if __name__ == "__main__":
                         help="Distance threshold to trigger correction")
     parser.add_argument("--max_rollout_steps", type=int,
                         help="Max rollout steps for correction")
+    parser.add_argument("--single_rollout_correction", type=str2bool, default=False,
+                        help="If true, execute at most one rollout step before correction planning")
+    parser.add_argument("--target_mode", type=str, default="forward",
+                        help="Correction target mode: forward or backward")
+    parser.add_argument("--target_lookahead_steps", type=int, default=0,
+                        help="Correction target lookahead steps from nearest t_star on expert trajectory")
+    parser.add_argument("--rollout_exec_steps", type=int, default=None,
+                        help="Number of actions executed per rollout step (prefix of chunk)")
     parser.add_argument("--correction_freq", type=int,
                         help="Apply correction every N steps")
     parser.add_argument("--correction_weight", type=float,
@@ -1187,6 +2223,8 @@ if __name__ == "__main__":
                         help="Weight for orientation distance in nearest-point matching (0=position only)")
     parser.add_argument("--gripper_penalty", type=float,
                         help="Penalty for gripper state mismatch in nearest-point matching (0=ignore gripper)")
+    parser.add_argument("--always_correction", type=str2bool, default=False,
+                        help="Always generate correction target even when below threshold")
     parser.add_argument("--evac_budget_accel", type=str2bool, default=False,
                         help="Enable dual-cache budget acceleration for EVAC inference")
     parser.add_argument("--evac_rank_transfer", type=str2bool, default=False,
@@ -1201,5 +2239,9 @@ if __name__ == "__main__":
                         help="Per-channel rank-transfer when evac_rank_transfer=true")
     parser.add_argument("--debug_wm_correction", action="store_true",
                         help="Enable debug visualization for WM correction (saves images/stats to ckpt_dir/debug_wm)")
+    parser.add_argument("--export_correction_dataset", type=str2bool, default=False,
+                        help="Export successful correction samples as ACT-compatible hdf5 episodes")
+    parser.add_argument("--export_correction_dir", type=str, default="",
+                        help="Output directory for exported correction episodes (default: ckpt_dir/correction_dataset)")
 
     main(vars(parser.parse_args()))

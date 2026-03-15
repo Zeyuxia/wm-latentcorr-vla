@@ -12,7 +12,7 @@ e = IPython.embed
 class EpisodicDataset(torch.utils.data.Dataset):
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
-                 raw_data_dir=None):
+                 raw_data_dir=None, start_margin=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -20,6 +20,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.max_action_len = max_action_len
         self.raw_data_dir = raw_data_dir
+        self.start_margin = max(0, int(start_margin))
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
@@ -38,21 +39,21 @@ class EpisodicDataset(torch.utils.data.Dataset):
             if sample_full_episode:
                 start_ts = 0
             else:
-                start_ts = np.random.choice(episode_len)
+                # Avoid sampling too close to episode end so rollout/correction
+                # still has enough future horizon.
+                max_start = max(0, episode_len - 1 - self.start_margin)
+                start_ts = np.random.randint(0, max_start + 1)
             # get observation at start_ts only
             qpos = root["/observations/qpos"][start_ts]
             image_dict = dict()
             for cam_name in self.camera_names:
                 image_dict[cam_name] = root[f"/observations/images/{cam_name}"][start_ts]
-            # get all actions after and including start_ts
-            if is_sim:
-                action = root["/action"][start_ts:]
-                action_len = episode_len - start_ts
-            else:
-                action = root["/action"][max(0, start_ts - 1):]  # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1)  # hack, to make timesteps more aligned
+            # Keep action and qpos on the same timestamp origin.
+            action = root["/action"][start_ts:]
+            action_len = episode_len - start_ts
 
         self.is_sim = is_sim
+
         padded_action = np.zeros((self.max_action_len, action.shape[1]), dtype=np.float32)  # 根据max_action_len初始化
         padded_action[:action_len] = action
         is_pad = np.ones(self.max_action_len, dtype=bool)  # 初始化为全1（True）
@@ -142,7 +143,7 @@ def get_norm_stats(dataset_dir, num_episodes):
 
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-              raw_data_dir=None):
+              raw_data_dir=None, start_margin=0):
     print(f"\nData from: {dataset_dir}\n")
     # use all episodes for training
     train_indices = list(range(num_episodes))
@@ -152,7 +153,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
-                                    raw_data_dir=raw_data_dir)
+                                    raw_data_dir=raw_data_dir, start_margin=start_margin)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
