@@ -1458,14 +1458,13 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # save original image (image_data_s is BGR, cv2 expects BGR)
         _oimg = (image_data_s[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         cv2.imwrite(os.path.join(_dbg_corr, 'original_image.png'), _oimg)
-        # Project correction trajectory (EEF paths) onto images for quick sanity check.
+        # Project correction trajectory via EVAC original get_traj for consistency.
+        _overlay_o = _oimg.copy()
+        _overlay_c = _cimg.copy()
+        traj_u8 = np.zeros_like(_oimg, dtype=np.uint8) + 50
         try:
-            from evac.lvdm.data.utils import get_transformation_matrix_from_quat
-            from evac.lvdm.data.traj_vis_statistics import (
-                EndEffectorPts, Gripper2EEFCvt,
-                ColorMapLeft, ColorMapRight,
-                ColorListLeft, ColorListRight,
-            )
+            from evac.lvdm.models.ddpm3d import ACWMLatentDiffusion
+            import evac.lvdm.models.ddpm3d as ddpm3d_mod
             K = raw_data['intrinsic_cv'].astype(np.float32).copy()
             E = np.eye(4, dtype=np.float32)
             E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
@@ -1480,73 +1479,133 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 K[0, 2] *= sx
                 K[1, 1] *= sy
                 K[1, 2] *= sy
+            c2w = np.linalg.inv(E).astype(np.float32)
 
-            # Reuse EVAC get_traj projection chain for consistency:
-            # pose -> (w2c @ pose_mat @ Gripper2EEFCvt @ EndEffectorPts[0]) -> K projection
-            w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)      # (1,1,4,4)
-            intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0) # (1,1,3,3)
-            cvt_t = torch.tensor(Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
-            ee_key_pts = torch.tensor(EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+            fk_seq = [fk.forward(corr[i, 0:6], corr[i, 7:13]) for i in range(corr.shape[0])]
+            pose_list = []
+            left_centers, right_centers = [], []
+            for ai, fr in enumerate(fk_seq):
+                lp, lq_wxyz = fr['left']
+                rp, rq_wxyz = fr['right']
+                left_centers.append(lp.astype(np.float32))
+                right_centers.append(rp.astype(np.float32))
+                # Follow evac_inference exactly: wxyz->xyzw and canonicalize w>=0.
+                lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
+                rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
+                if lq_xyzw[3] < 0:
+                    lq_xyzw = -lq_xyzw
+                if rq_xyzw[3] < 0:
+                    rq_xyzw = -rq_xyzw
+                # Follow EVAC get_traj convention: gripper in [0,120].
+                lg = float(np.clip(corr[ai, 6], 0.0, 1.0)) * 120.0
+                rg = float(np.clip(corr[ai, 13], 0.0, 1.0)) * 120.0
+                pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
 
-            def _project_eef_keypoints(pt3, quat_wxyz):
-                quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
-                pose_xyzw = np.concatenate([pt3.astype(np.float32), quat_xyzw], axis=0)[None, ...]
-                pose_mat = get_transformation_matrix_from_quat(torch.from_numpy(pose_xyzw).float()).unsqueeze(0)
-                ee2cam = torch.matmul(torch.matmul(w2c_t, pose_mat), cvt_t)
-                pts = torch.matmul(ee2cam, ee_key_pts)  # (1,1,4,4)
-                uvw = torch.matmul(intrinsic_t, pts[:, :, :3, :])
-                out_uvs = []
-                for ki in range(4):
-                    z = float(pts[0, 0, 2, ki].item())
-                    if z <= 1e-6:
-                        out_uvs.append(None)
+            pose_np = np.stack(pose_list, axis=0)
+            left_centers = np.stack(left_centers, axis=0)
+            right_centers = np.stack(right_centers, axis=0)
+
+            def _render_endpoint_mask(pose_arr):
+                # Shorten orientation rays for endpoint markers only.
+                _orig_eef_pts = ddpm3d_mod.EndEffectorPts
+                ddpm3d_mod.EndEffectorPts = [
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.04, 0.0, 0.0, 1.0],
+                    [0.0, 0.04, 0.0, 1.0],
+                    [0.0, 0.0, 0.04, 1.0],
+                ]
+                try:
+                    traj_tensor = ACWMLatentDiffusion.get_traj(
+                        None,
+                        (h_img, w_img),
+                        pose_arr,
+                        E[None, ...],
+                        c2w[None, ...],
+                        torch.from_numpy(K).float().unsqueeze(0),
+                        radius=16,
+                    )  # (3,1,T,H,W), in [0,1]
+                finally:
+                    ddpm3d_mod.EndEffectorPts = _orig_eef_pts
+                traj_np = traj_tensor.detach().cpu().numpy()[:, 0]   # (3,T,H,W)
+                traj_np = np.transpose(traj_np, (1, 2, 3, 0))        # (T,H,W,3)
+                t_len = traj_np.shape[0]
+                idx_start, idx_end = 0, max(0, t_len - 1)
+                traj_endpoints = np.maximum(traj_np[idx_start], traj_np[idx_end])  # (H,W,3)
+                traj_u8 = np.clip(traj_endpoints * 255.0, 0.0, 255.0).astype(np.uint8)
+                mask = np.any(np.abs(traj_u8.astype(np.int16) - 50) > 2, axis=2)
+                return traj_u8, mask, idx_end
+
+            traj_u8, mask, idx_end = _render_endpoint_mask(pose_np)
+
+            # Middle trajectory as a simple center path (left/right EEF), no circles.
+            mid_overlay = np.ascontiguousarray(np.zeros((h_img, w_img, 3), dtype=np.uint8))
+            def _project_center_uv(seq_xyz):
+                uv = []
+                for p in seq_xyz:
+                    p_h = np.array([p[0], p[1], p[2], 1.0], dtype=np.float32)
+                    pc = E @ p_h
+                    if pc[2] <= 1e-6:
+                        uv.append(None)
                         continue
-                    u = int(float((uvw[0, 0, 0, ki] / uvw[0, 0, 2, ki]).item()))
-                    v = int(float((uvw[0, 0, 1, ki] / uvw[0, 0, 2, ki]).item()))
-                    out_uvs.append((u, v))
-                return out_uvs
+                    u = int((K[0, 0] * pc[0] + K[0, 2] * pc[2]) / pc[2])
+                    v = int((K[1, 1] * pc[1] + K[1, 2] * pc[2]) / pc[2])
+                    if 0 <= u < w_img and 0 <= v < h_img:
+                        uv.append((u, v))
+                    else:
+                        uv.append(None)
+                return uv
 
-            def _to_color_from_cmap(cmap, v01):
-                rgb = cmap(float(np.clip(v01, 0.0, 1.0)))[:3]
-                return tuple(int(c * 255) for c in rgb)
-
-            def _draw_get_traj_style(img, points4, grip_v01, lr_tag):
-                if points4[0] is None:
-                    return
-                base = np.array(points4[0], dtype=np.int32)
-                if base[0] < 0 or base[0] >= w_img or base[1] < 0 or base[1] >= h_img:
-                    return
-                if lr_tag == "left":
-                    base_color = _to_color_from_cmap(ColorMapLeft, grip_v01)
-                    line_colors = ColorListLeft
-                else:
-                    base_color = _to_color_from_cmap(ColorMapRight, grip_v01)
-                    line_colors = ColorListRight
-                # Match EVAC get_traj semantics: colored base circle + rays to keypoints.
-                cv2.circle(img, tuple(base), 50, base_color, -1)
-                for ki in range(1, 4):
-                    pt = points4[ki]
-                    if pt is None:
+            luv = _project_center_uv(left_centers)
+            ruv = _project_center_uv(right_centers)
+            for seq, color in ((luv, (0, 220, 0)), (ruv, (0, 0, 220))):
+                prev = None
+                for k, pt in enumerate(seq):
+                    if k == 0 or k == idx_end or pt is None:
+                        prev = pt
                         continue
-                    p = np.array(pt, dtype=np.int32)
-                    cv2.line(img, tuple(base), tuple(p), line_colors[ki - 1], 8)
+                    if prev is not None:
+                        p0 = (int(prev[0]), int(prev[1]))
+                        p1 = (int(pt[0]), int(pt[1]))
+                        cv2.line(mid_overlay, p0, p1, color, 2, cv2.LINE_AA)
+                    prev = pt
 
-            _overlay_o = _oimg.copy()
-            _overlay_c = _cimg.copy()
-            for ai in range(corr.shape[0]):
-                fr = fk.forward(corr[ai, 0:6], corr[ai, 7:13])
-                luvs = _project_eef_keypoints(fr['left'][0], fr['left'][1])
-                ruvs = _project_eef_keypoints(fr['right'][0], fr['right'][1])
-                lg = float(np.clip(corr[ai, 6], 0.0, 1.0))
-                rg = float(np.clip(corr[ai, 13], 0.0, 1.0))
-                _draw_get_traj_style(_overlay_o, luvs, lg, "left")
-                _draw_get_traj_style(_overlay_o, ruvs, rg, "right")
-                _draw_get_traj_style(_overlay_c, luvs, lg, "left")
-                _draw_get_traj_style(_overlay_c, ruvs, rg, "right")
-            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
-            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+            def _mark_start_end(img, seq, color, prefix):
+                if len(seq) == 0:
+                    return
+                s = seq[0]
+                e = seq[-1]
+                if s is not None:
+                    cv2.circle(img, (int(s[0]), int(s[1])), 4, color, -1, cv2.LINE_AA)
+                    cv2.putText(img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                if e is not None:
+                    cv2.circle(img, (int(e[0]), int(e[1])), 4, color, -1, cv2.LINE_AA)
+                    cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+            _overlay_o[mask] = (0.6 * _overlay_o[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
+            _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
+            mid_mask = np.any(mid_overlay > 0, axis=2)
+            _overlay_o[mid_mask] = (0.7 * _overlay_o[mid_mask] + 0.3 * mid_overlay[mid_mask]).astype(np.uint8)
+            _overlay_c[mid_mask] = (0.7 * _overlay_c[mid_mask] + 0.3 * mid_overlay[mid_mask]).astype(np.uint8)
+            _mark_start_end(_overlay_o, luv, (0, 255, 0), "L")
+            _mark_start_end(_overlay_o, ruv, (0, 0, 255), "R")
+            _mark_start_end(_overlay_c, luv, (0, 255, 0), "L")
+            _mark_start_end(_overlay_c, ruv, (0, 0, 255), "R")
+            with open(os.path.join(_dbg_corr, 'corr_projection_debug.json'), 'w') as _f:
+                json.dump({
+                    'projection_chain': 'evac_inference_compatible_link6',
+                    'mask_pixels': int(np.count_nonzero(mask)),
+                    'image_hw': [int(h_img), int(w_img)],
+                    'native_hw': [int(h_native), int(w_native)],
+                }, _f, indent=2)
         except Exception:
-            pass
+            import traceback
+            with open(os.path.join(_dbg_corr, 'corr_projection_error.txt'), 'w') as _f:
+                _f.write(traceback.format_exc())
+        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_traj_raw.png'), traj_u8)
+        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
+        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
         # save planner results summary
         _plan_info = {
             'rollout': _dbg_rollout,
