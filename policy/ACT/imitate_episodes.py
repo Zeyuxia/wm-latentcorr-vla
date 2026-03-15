@@ -230,6 +230,62 @@ def _write_arm(a, arm):
     return a
 
 
+def _infer_active_arms_from_gt_window(
+    gt_left_arm, gt_right_arm, gt_left_grip, gt_right_grip,
+    t_idx, window_len, joint_delta_thresh=0.02, gripper_delta_thresh=0.05
+):
+    """Infer active arm/gripper sides from GT trajectories near current index."""
+    def _bounds(n):
+        if n <= 1:
+            return 0, 1
+        s = int(np.clip(t_idx, 0, n - 1))
+        e = int(np.clip(s + max(2, int(window_len)), s + 1, n))
+        return s, e
+
+    def _arm_active(arr):
+        if arr is None:
+            return True, 0.0
+        a = np.asarray(arr, dtype=np.float32)
+        if a.ndim != 2 or a.shape[0] <= 1:
+            return True, 0.0
+        s, e = _bounds(a.shape[0])
+        seg = a[s:e]
+        if seg.shape[0] <= 1:
+            return True, 0.0
+        dq = np.diff(seg, axis=0)
+        score = float(np.max(np.linalg.norm(dq, axis=1))) if dq.shape[0] > 0 else 0.0
+        return bool(score >= float(joint_delta_thresh)), score
+
+    def _grip_active(arr):
+        if arr is None:
+            return True, 0.0
+        g = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if g.size <= 1:
+            return True, 0.0
+        s, e = _bounds(g.size)
+        seg = g[s:e]
+        if seg.size <= 1:
+            return True, 0.0
+        dg = np.diff(seg)
+        score = float(np.max(np.abs(dg))) if dg.size > 0 else 0.0
+        return bool(score >= float(gripper_delta_thresh)), score
+
+    la, la_s = _arm_active(gt_left_arm)
+    ra, ra_s = _arm_active(gt_right_arm)
+    lg, lg_s = _grip_active(gt_left_grip)
+    rg, rg_s = _grip_active(gt_right_grip)
+
+    if (not la) and (not ra):
+        la, ra = True, True
+
+    return {
+        "left_arm": bool(la), "right_arm": bool(ra),
+        "left_gripper": bool(lg), "right_gripper": bool(rg),
+        "left_arm_score": float(la_s), "right_arm_score": float(ra_s),
+        "left_gripper_score": float(lg_s), "right_gripper_score": float(rg_s),
+    }
+
+
 def _parse_vec12(s):
     if s is None:
         return None
@@ -278,13 +334,17 @@ def _link6_to_tcp_pose(link_pos_w, link_quat_wxyz, offset_x=0.085):
     return tcp_pos.astype(np.float32), np.asarray(link_quat_wxyz, dtype=np.float32)
 
 
-def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r):
+def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r, active_left_arm=True, active_right_arm=True):
     # EEF-space perturbation: FK joint action -> perturb EEF pose -> planner/IK back to joint action.
     if fk is None or planner_l is None or planner_r is None:
         return act_raw, False, "eef_missing_modules", None
 
     import sapien
     out = act_raw.copy()
+    active_left_arm = bool(active_left_arm)
+    active_right_arm = bool(active_right_arm)
+    if (not active_left_arm) and (not active_right_arm):
+        return out, False, "eef_inactive_arms", {"active_left_arm": False, "active_right_arm": False}
     eef_mode = str(cfg.get("perturb_eef_mode", "gaussian")).strip().lower()
     pos_std = float(cfg.get("perturb_eef_pos_std", 0.01))
     fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03))
@@ -347,24 +407,35 @@ def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r):
         qpos_full[fk.fl_idx] = ql
         qpos_full[fk.fr_idx] = qr
 
+        left_ok, right_ok = (not active_left_arm), (not active_right_arm)
+        q_sol_l, q_sol_r = ql.copy(), qr.copy()
         try:
-            res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
-            res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+            if active_left_arm:
+                res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
+                if res_l.get("status") == "Success":
+                    q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
+                    left_ok = True
+            if active_right_arm:
+                res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+                if res_r.get("status") == "Success":
+                    q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
+                    right_ok = True
         except Exception:
             continue
 
-        if res_l.get("status") == "Success" and res_r.get("status") == "Success":
-            q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
-            q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
-            # Prevent IK branch jumps from causing abrupt first-step deviation.
-            # Apply ramp-scaled per-joint delta cap in joint space.
-            cap = max(0.0, joint_delta_cap * float(ramp))
-            if cap <= 1e-8:
-                continue
+        cap = max(0.0, joint_delta_cap * float(ramp))
+        if cap <= 1e-8:
+            continue
+        updated = False
+        if active_left_arm and left_ok:
             dq_l = np.clip(q_sol_l - ql, -cap, cap)
-            dq_r = np.clip(q_sol_r - qr, -cap, cap)
             out[t, 0:6] = ql + dq_l
+            updated = True
+        if active_right_arm and right_ok:
+            dq_r = np.clip(q_sol_r - qr, -cap, cap)
             out[t, 7:13] = qr + dq_r
+            updated = True
+        if updated:
             solved_any = True
             solved_cnt += 1
 
@@ -378,6 +449,8 @@ def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r):
     info["eef_ramp_power"] = float(ramp_power)
     info["eef_joint_delta_cap"] = float(joint_delta_cap)
     info["eef_exec_horizon"] = int(exec_horizon)
+    info["active_left_arm"] = bool(active_left_arm)
+    info["active_right_arm"] = bool(active_right_arm)
     return out, solved_any, mode_tag, info
 
 
@@ -400,7 +473,10 @@ def _sample_error_mode(phase_key, cfg):
     return np.random.choice(names, p=p).item()
 
 
-def _perturb_action_chunk_no_ops(act_raw, cfg, curr_left_q=None, curr_right_q=None, curr_left_g=None, curr_right_g=None):
+def _perturb_action_chunk_no_ops(
+    act_raw, cfg, curr_left_q=None, curr_right_q=None, curr_left_g=None, curr_right_g=None,
+    active_left_arm=True, active_right_arm=True, active_left_gripper=True, active_right_gripper=True
+):
     out = act_raw.copy()
     beta = float(cfg.get("perturb_noop_beta", 0.1))
     beta = float(np.clip(beta, 0.0, 1.0))
@@ -434,27 +510,31 @@ def _perturb_action_chunk_no_ops(act_raw, cfg, curr_left_q=None, curr_right_q=No
         cmd_r = act_raw[t, 7:13].astype(np.float32)
         prev_l = prev_l + b_t * (cmd_l - prev_l)
         prev_r = prev_r + b_t * (cmd_r - prev_r)
-        out[t, 0:6] = prev_l
-        out[t, 7:13] = prev_r
+        out[t, 0:6] = prev_l if active_left_arm else cmd_l
+        out[t, 7:13] = prev_r if active_right_arm else cmd_r
 
         cmd_lg = float(act_raw[t, 6])
         cmd_rg = float(act_raw[t, 13])
         prev_lg = prev_lg + b_t * (cmd_lg - prev_lg)
         prev_rg = prev_rg + b_t * (cmd_rg - prev_rg)
-        out[t, 6] = prev_lg
-        out[t, 13] = prev_rg
+        out[t, 6] = prev_lg if active_left_gripper else cmd_lg
+        out[t, 13] = prev_rg if active_right_gripper else cmd_rg
     out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
     out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
     return out, True, "no_ops", None
 
 
-def _perturb_action_chunk_gripper(out, mode, init_left_grip, init_right_grip, cfg):
+def _perturb_action_chunk_gripper(
+    out, mode, init_left_grip, init_right_grip, cfg, active_left_gripper=True, active_right_gripper=True
+):
     out = out.copy()
     delay = int(max(0, cfg.get("perturb_gripper_delay_steps", 3)))
     close_min = float(cfg.get("perturb_gripper_close_min", 0.35))
     open_max = float(cfg.get("perturb_gripper_open_max", 0.75))
     trans_steps = int(max(1, cfg.get("perturb_gripper_transition_steps", 4)))
-    for gi, init_g in [(6, init_left_grip), (13, init_right_grip)]:
+    for gi, init_g, active in [(6, init_left_grip, active_left_gripper), (13, init_right_grip, active_right_gripper)]:
+        if not bool(active):
+            continue
         seq = out[:, gi].copy()
         if mode == "gripper_close":
             closing = np.where(seq < init_g - 1e-4)[0]
@@ -486,12 +566,16 @@ def _perturb_action_chunk_gripper(out, mode, init_left_grip, init_right_grip, cf
     return out, True, tag, None
 
 
-def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r):
+def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r, active_left_arm=True, active_right_arm=True):
     if fk is None or planner_l is None or planner_r is None:
         return act_raw, False, "rot_missing_modules", None
     import sapien
     from scipy.spatial.transform import Rotation as R
     out = act_raw.copy()
+    active_left_arm = bool(active_left_arm)
+    active_right_arm = bool(active_right_arm)
+    if (not active_left_arm) and (not active_right_arm):
+        return out, False, "rot_inactive_arms", {"active_left_arm": False, "active_right_arm": False}
     tcp_offset_x = float(cfg.get("perturb_eef_tcp_offset_x", 0.085))
     angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0))
     angle_max = np.deg2rad(angle_max_deg)
@@ -536,19 +620,32 @@ def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r):
         qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
         qpos_full[fk.fl_idx] = ql
         qpos_full[fk.fr_idx] = qr
+        left_ok, right_ok = (not active_left_arm), (not active_right_arm)
+        q_sol_l, q_sol_r = ql.copy(), qr.copy()
         try:
-            res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
-            res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+            if active_left_arm:
+                res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag="left")
+                if res_l.get("status") == "Success":
+                    q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
+                    left_ok = True
+            if active_right_arm:
+                res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag="right")
+                if res_r.get("status") == "Success":
+                    q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
+                    right_ok = True
         except Exception:
             continue
-        if res_l.get("status") == "Success" and res_r.get("status") == "Success":
-            q_sol_l = np.asarray(res_l["position"][-1], dtype=np.float32)
-            q_sol_r = np.asarray(res_r["position"][-1], dtype=np.float32)
-            cap = max(0.0, joint_delta_cap * float(ramp))
-            if cap <= 1e-8:
-                continue
+        cap = max(0.0, joint_delta_cap * float(ramp))
+        if cap <= 1e-8:
+            continue
+        updated = False
+        if active_left_arm and left_ok:
             out[t, 0:6] = ql + np.clip(q_sol_l - ql, -cap, cap)
+            updated = True
+        if active_right_arm and right_ok:
             out[t, 7:13] = qr + np.clip(q_sol_r - qr, -cap, cap)
+            updated = True
+        if updated:
             solved += 1
     out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
     out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
@@ -561,7 +658,9 @@ def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r):
 def perturb_action_chunk_online(
     act_raw, cfg, dyn_state, fk=None, planner_l=None, planner_r=None,
     phase_key=None, init_left_grip=0.0, init_right_grip=0.0,
-    curr_left_q=None, curr_right_q=None
+    curr_left_q=None, curr_right_q=None,
+    active_left_arm=True, active_right_arm=True,
+    active_left_gripper=True, active_right_gripper=True
 ):
     """
     Dynamics-aware perturbation in action space:
@@ -577,22 +676,32 @@ def perturb_action_chunk_online(
     selected_mode = _sample_error_mode(phase_key, cfg)
     if selected_mode is not None:
         if selected_mode == "translation":
-            out, ok, tag, info = _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r)
+            out, ok, tag, info = _perturb_action_chunk_eef(
+                act_raw, cfg, fk, planner_l, planner_r,
+                active_left_arm=active_left_arm, active_right_arm=active_right_arm
+            )
         elif selected_mode == "rotation":
-            out, ok, tag, info = _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r)
+            out, ok, tag, info = _perturb_action_chunk_rotation_eef(
+                act_raw, cfg, fk, planner_l, planner_r,
+                active_left_arm=active_left_arm, active_right_arm=active_right_arm
+            )
         elif selected_mode == "no_ops":
             out, ok, tag, info = _perturb_action_chunk_no_ops(
                 act_raw, cfg,
                 curr_left_q=curr_left_q, curr_right_q=curr_right_q,
                 curr_left_g=init_left_grip, curr_right_g=init_right_grip,
+                active_left_arm=active_left_arm, active_right_arm=active_right_arm,
+                active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper,
             )
         elif selected_mode == "gripper_close":
             out, ok, tag, info = _perturb_action_chunk_gripper(
-                act_raw, "gripper_close", init_left_grip, init_right_grip, cfg
+                act_raw, "gripper_close", init_left_grip, init_right_grip, cfg,
+                active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper
             )
         else:
             out, ok, tag, info = _perturb_action_chunk_gripper(
-                act_raw, "gripper_open", init_left_grip, init_right_grip, cfg
+                act_raw, "gripper_open", init_left_grip, init_right_grip, cfg,
+                active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper
             )
         if isinstance(info, dict):
             info["error_mode"] = selected_mode
@@ -600,7 +709,10 @@ def perturb_action_chunk_online(
 
     perturb_space = str(cfg.get("perturb_space", "joint")).strip().lower()
     if perturb_space == "eef":
-        return _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r)
+        return _perturb_action_chunk_eef(
+            act_raw, cfg, fk, planner_l, planner_r,
+            active_left_arm=active_left_arm, active_right_arm=active_right_arm
+        )
 
     out = act_raw.copy()
     alpha = float(cfg.get("perturb_lp_alpha", 0.35))
@@ -641,6 +753,14 @@ def perturb_action_chunk_online(
     prev_noise = dyn_state["prev_noise_arm"].astype(np.float32)
     bias = dyn_state["bias_arm"].astype(np.float32)
 
+    arm_mask = np.zeros((12,), dtype=np.float32)
+    if bool(active_left_arm):
+        arm_mask[0:6] = 1.0
+    if bool(active_right_arm):
+        arm_mask[6:12] = 1.0
+    if np.all(arm_mask <= 0.0):
+        return act_raw, False, "inactive_arms", dyn_state
+
     for t in range(out.shape[0]):
         cmd_arm = _extract_arm(out[t]).astype(np.float32)
         noise = rho * prev_noise + np.random.normal(0.0, noise_std, size=(12,)).astype(np.float32)
@@ -660,12 +780,15 @@ def perturb_action_chunk_online(
 
         # coarse joint bound
         exec_arm = np.clip(exec_arm, -q_abs_lim, q_abs_lim)
+        exec_arm = arm_mask * exec_arm + (1.0 - arm_mask) * cmd_arm
 
         out[t] = _write_arm(out[t], exec_arm)
         out[t, 6] = np.clip(out[t, 6], 0.0, 1.0)
         out[t, 13] = np.clip(out[t, 13], 0.0, 1.0)
 
-        prev_exec, prev_vel, prev_noise = exec_arm, vel, noise
+        prev_exec = arm_mask * exec_arm + (1.0 - arm_mask) * cmd_arm
+        prev_vel = arm_mask * vel
+        prev_noise = arm_mask * noise
 
     dyn_state["prev_exec_arm"] = prev_exec
     dyn_state["prev_vel_arm"] = prev_vel
@@ -861,6 +984,8 @@ def main(args):
             'perturb_gripper_transition_steps': args.get('perturb_gripper_transition_steps', 4),
             'perturb_gripper_close_min': args.get('perturb_gripper_close_min', 0.35),
             'perturb_gripper_open_max': args.get('perturb_gripper_open_max', 0.75),
+            'perturb_active_joint_delta_thresh': args.get('perturb_active_joint_delta_thresh', 0.02),
+            'perturb_active_gripper_delta_thresh': args.get('perturb_active_gripper_delta_thresh', 0.05),
             'vla_input_noise_enable': args.get('vla_input_noise_enable', False),
             'vla_img_noise_std': args.get('vla_img_noise_std', 0.0),
             'vla_qpos_noise_std': args.get('vla_qpos_noise_std', 0.0),
@@ -966,6 +1091,8 @@ def load_raw_data(raw_data_dir, episode_id):
             'right_endpose': f['endpose/right_endpose'][()].astype(np.float32),
             'left_gripper': f['endpose/left_gripper'][()].astype(np.float32),
             'right_gripper': f['endpose/right_gripper'][()].astype(np.float32),
+            'gt_left_arm': f['joint_action/left_arm'][()].astype(np.float32) if ('joint_action' in f and 'left_arm' in f['joint_action']) else None,
+            'gt_right_arm': f['joint_action/right_arm'][()].astype(np.float32) if ('joint_action' in f and 'right_arm' in f['joint_action']) else None,
             'intrinsic_cv': f['observation/head_camera/intrinsic_cv'][0].astype(np.float32),
             'extrinsic_cv': f['observation/head_camera/extrinsic_cv'][0].astype(np.float32),
             'native_resolution': (h_native, w_native),  # intrinsic is calibrated for this
@@ -1267,6 +1394,23 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             policy_unwrapped.train()
         act_np = act_chunk.squeeze(0).cpu().numpy()
         act_raw = act_np * norm_stats['action_std'] + norm_stats['action_mean']
+        active_info = _infer_active_arms_from_gt_window(
+            raw_data.get('gt_left_arm'),
+            raw_data.get('gt_right_arm'),
+            raw_data.get('left_gripper'),
+            raw_data.get('right_gripper'),
+            t_idx=start_ts + int(t_star),
+            window_len=rollout_exec_steps,
+            joint_delta_thresh=float(cfg.get('perturb_active_joint_delta_thresh', 0.02)),
+            gripper_delta_thresh=float(cfg.get('perturb_active_gripper_delta_thresh', 0.05)),
+        )
+        # Side-level activity: arm motion OR gripper motion.
+        left_side_active = bool(active_info['left_arm'] or active_info['left_gripper'])
+        right_side_active = bool(active_info['right_arm'] or active_info['right_gripper'])
+        active_info['left_arm'] = left_side_active
+        active_info['right_arm'] = right_side_active
+        active_info['left_gripper'] = left_side_active
+        active_info['right_gripper'] = right_side_active
         progress = float(t_star) / max(1, len(left_ep) - 1)
         # Choose error phase from the whole GT action window (prefix) instead of a single anchor.
         phase_key = _infer_phase_key_from_gt_window(
@@ -1277,7 +1421,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         act_raw, perturbed, pert_mode, dyn_state = perturb_action_chunk_online(
             act_raw, cfg, dyn_state, fk=fk, planner_l=planner_l, planner_r=planner_r,
             phase_key=phase_key, init_left_grip=float(left_grip), init_right_grip=float(right_grip),
-            curr_left_q=left_q, curr_right_q=right_q
+            curr_left_q=left_q, curr_right_q=right_q,
+            active_left_arm=active_info['left_arm'], active_right_arm=active_info['right_arm'],
+            active_left_gripper=active_info['left_gripper'], active_right_gripper=active_info['right_gripper'],
         )
 
         exec_len = int(np.clip(rollout_exec_steps, 1, len(act_raw)))
@@ -1324,6 +1470,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _dbg_rollout.append({
                 'step': step, 't_star': int(t_star), 'min_dist': float(min_dist),
                 'progress': float(progress), 'phase_key': phase_key,
+                'active_left_arm': bool(active_info.get('left_arm', True)),
+                'active_right_arm': bool(active_info.get('right_arm', True)),
+                'active_left_gripper': bool(active_info.get('left_gripper', True)),
+                'active_right_gripper': bool(active_info.get('right_gripper', True)),
+                'active_left_arm_score': float(active_info.get('left_arm_score', 0.0)),
+                'active_right_arm_score': float(active_info.get('right_arm_score', 0.0)),
                 'fk_left_pos': lp.tolist(), 'fk_right_pos': rp.tolist(),
                 'left_grip': float(left_grip), 'right_grip': float(right_grip),
                 'action_perturbed': bool(perturbed),
@@ -1483,12 +1635,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
             fk_seq = [fk.forward(corr[i, 0:6], corr[i, 7:13]) for i in range(corr.shape[0])]
             pose_list = []
-            left_centers, right_centers = [], []
             for ai, fr in enumerate(fk_seq):
                 lp, lq_wxyz = fr['left']
                 rp, rq_wxyz = fr['right']
-                left_centers.append(lp.astype(np.float32))
-                right_centers.append(rp.astype(np.float32))
                 # Follow evac_inference exactly: wxyz->xyzw and canonicalize w>=0.
                 lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
                 rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
@@ -1502,8 +1651,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
 
             pose_np = np.stack(pose_list, axis=0)
-            left_centers = np.stack(left_centers, axis=0)
-            right_centers = np.stack(right_centers, axis=0)
 
             def _render_endpoint_mask(pose_arr):
                 # Shorten orientation rays for endpoint markers only.
@@ -1537,26 +1684,42 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
             traj_u8, mask, idx_end = _render_endpoint_mask(pose_np)
 
-            # Middle trajectory as a simple center path (left/right EEF), no circles.
+            # Middle trajectory: use the exact same projection chain as get_traj
+            # and connect the projected base point (keypoint-0).
             mid_overlay = np.ascontiguousarray(np.zeros((h_img, w_img, 3), dtype=np.uint8))
-            def _project_center_uv(seq_xyz):
-                uv = []
-                for p in seq_xyz:
-                    p_h = np.array([p[0], p[1], p[2], 1.0], dtype=np.float32)
-                    pc = E @ p_h
-                    if pc[2] <= 1e-6:
-                        uv.append(None)
-                        continue
-                    u = int((K[0, 0] * pc[0] + K[0, 2] * pc[2]) / pc[2])
-                    v = int((K[1, 1] * pc[1] + K[1, 2] * pc[2]) / pc[2])
-                    if 0 <= u < w_img and 0 <= v < h_img:
-                        uv.append((u, v))
-                    else:
-                        uv.append(None)
-                return uv
+            pose_t = torch.from_numpy(pose_np).float()
+            w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)         # (1,1,4,4)
+            intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)   # (1,1,3,3)
+            cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+            ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+            pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
+            pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
+            ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
+            ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
+            pts_l = torch.matmul(ee2cam_l, ee_key_pts)
+            pts_r = torch.matmul(ee2cam_r, ee_key_pts)
+            uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
+            uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
+            uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
+            uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
 
-            luv = _project_center_uv(left_centers)
-            ruv = _project_center_uv(right_centers)
+            def _extract_base_uv(uvs, pts):
+                seq = []
+                for i in range(uvs.shape[0]):
+                    z = float(pts[0, i, 2, 0].item())
+                    u = int(uvs[i, 0, 0])
+                    v = int(uvs[i, 0, 1])
+                    if z > 1e-6 and (0 <= u < w_img) and (0 <= v < h_img):
+                        seq.append((u, v))
+                    else:
+                        seq.append(None)
+                return seq
+
+            # reshape pts to [1,T,4,4] for consistent indexing above
+            pts_l_bt = pts_l.reshape(1, pts_l.shape[1], 4, 4)
+            pts_r_bt = pts_r.reshape(1, pts_r.shape[1], 4, 4)
+            luv = _extract_base_uv(uvs_l, pts_l_bt)
+            ruv = _extract_base_uv(uvs_r, pts_r_bt)
             for seq, color in ((luv, (0, 220, 0)), (ruv, (0, 0, 220))):
                 prev = None
                 for k, pt in enumerate(seq):
@@ -2234,6 +2397,10 @@ if __name__ == "__main__":
                         help="Minimum gripper value in close-failure mode (cannot fully close)")
     parser.add_argument("--perturb_gripper_open_max", type=float, default=0.75,
                         help="Maximum gripper value in open-failure mode (cannot fully open)")
+    parser.add_argument("--perturb_active_joint_delta_thresh", type=float, default=0.02,
+                        help="GT joint delta threshold (rad) to mark an arm as active")
+    parser.add_argument("--perturb_active_gripper_delta_thresh", type=float, default=0.05,
+                        help="GT gripper delta threshold to mark gripper side active")
     parser.add_argument("--perturb_eef_fail_dir_left", type=str, default="",
                         help="3-dim comma-separated direction for left-arm EEF directional_fail")
     parser.add_argument("--perturb_eef_fail_dir_right", type=str, default="",
