@@ -348,6 +348,12 @@ def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r, active_lef
     eef_mode = str(cfg.get("perturb_eef_mode", "gaussian")).strip().lower()
     pos_std = float(cfg.get("perturb_eef_pos_std", 0.01))
     fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03))
+    mag_rand = bool(cfg.get("perturb_mag_random", False))
+    mag_min = float(cfg.get("perturb_mag_rand_min", 0.8))
+    mag_max = float(cfg.get("perturb_mag_rand_max", 1.2))
+    if mag_max < mag_min:
+        mag_min, mag_max = mag_max, mag_min
+    mag_scale = float(np.random.uniform(mag_min, mag_max)) if mag_rand else 1.0
     tcp_offset_x = float(cfg.get("perturb_eef_tcp_offset_x", 0.085))
     ramp_enable = bool(cfg.get("perturb_eef_ramp", True))
     ramp_min = float(cfg.get("perturb_eef_ramp_min", 0.0))
@@ -368,12 +374,12 @@ def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r, active_lef
                 dir_l = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             if dir_r is None:
                 dir_r = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
-        bias_l = fail_gain * np.asarray(dir_l, dtype=np.float32)
-        bias_r = fail_gain * np.asarray(dir_r, dtype=np.float32)
+        bias_l = (fail_gain * mag_scale) * np.asarray(dir_l, dtype=np.float32)
+        bias_r = (fail_gain * mag_scale) * np.asarray(dir_r, dtype=np.float32)
         mode_tag = "eef_directional_fail"
     else:
-        bias_l = np.random.normal(0.0, pos_std, size=(3,)).astype(np.float32)
-        bias_r = np.random.normal(0.0, pos_std, size=(3,)).astype(np.float32)
+        bias_l = np.random.normal(0.0, pos_std * mag_scale, size=(3,)).astype(np.float32)
+        bias_r = np.random.normal(0.0, pos_std * mag_scale, size=(3,)).astype(np.float32)
         mode_tag = "eef_gaussian"
 
     solved_any = False
@@ -449,6 +455,7 @@ def _perturb_action_chunk_eef(act_raw, cfg, fk, planner_l, planner_r, active_lef
     info["eef_ramp_power"] = float(ramp_power)
     info["eef_joint_delta_cap"] = float(joint_delta_cap)
     info["eef_exec_horizon"] = int(exec_horizon)
+    info["perturb_mag_scale"] = float(mag_scale)
     info["active_left_arm"] = bool(active_left_arm)
     info["active_right_arm"] = bool(active_right_arm)
     return out, solved_any, mode_tag, info
@@ -462,7 +469,7 @@ def _sample_error_mode(phase_key, cfg):
         return None
     probs = {
         "approach": [("translation", 0.70), ("rotation", 0.25), ("no_ops", 0.05)],
-        "pregrasp": [("gripper_close", 0.70), ("translation", 0.18), ("rotation", 0.09), ("no_ops", 0.03)],
+        "pregrasp": [("gripper_close", 0.55), ("translation", 0.20), ("rotation", 0.20), ("no_ops", 0.05)],
         "transport": [("no_ops", 0.70), ("translation", 0.18), ("rotation", 0.09), ("gripper_open", 0.03)],
         "place": [("gripper_open", 0.70), ("translation", 0.18), ("rotation", 0.09), ("no_ops", 0.03)],
     }
@@ -578,6 +585,13 @@ def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r, a
         return out, False, "rot_inactive_arms", {"active_left_arm": False, "active_right_arm": False}
     tcp_offset_x = float(cfg.get("perturb_eef_tcp_offset_x", 0.085))
     angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0))
+    mag_rand = bool(cfg.get("perturb_mag_random", False))
+    mag_min = float(cfg.get("perturb_mag_rand_min", 0.8))
+    mag_max = float(cfg.get("perturb_mag_rand_max", 1.2))
+    if mag_max < mag_min:
+        mag_min, mag_max = mag_max, mag_min
+    mag_scale = float(np.random.uniform(mag_min, mag_max)) if mag_rand else 1.0
+    angle_max_deg = angle_max_deg * mag_scale
     angle_max = np.deg2rad(angle_max_deg)
     ramp_enable = bool(cfg.get("perturb_eef_ramp", True))
     ramp_min = float(cfg.get("perturb_eef_ramp_min", 0.0))
@@ -649,7 +663,7 @@ def _perturb_action_chunk_rotation_eef(act_raw, cfg, fk, planner_l, planner_r, a
             solved += 1
     out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
     out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
-    info = {"eef_solved_cnt": int(solved), "eef_total_cnt": int(total), "error_mode": "rotation"}
+    info = {"eef_solved_cnt": int(solved), "eef_total_cnt": int(total), "error_mode": "rotation", "perturb_mag_scale": float(mag_scale)}
     if total > 0:
         info["eef_solved_ratio"] = float(solved) / float(total)
     return out, solved > 0, "rotation", info
@@ -971,6 +985,9 @@ def main(args):
             'perturb_eef_fail_dir_left_vec': eef_fail_dir_left_vec,
             'perturb_eef_fail_dir_right_vec': eef_fail_dir_right_vec,
             'perturb_rot_max_deg': args.get('perturb_rot_max_deg', 15.0),
+            'perturb_mag_random': args.get('perturb_mag_random', False),
+            'perturb_mag_rand_min': args.get('perturb_mag_rand_min', 0.8),
+            'perturb_mag_rand_max': args.get('perturb_mag_rand_max', 1.2),
             'perturb_rotation_random_axis': args.get('perturb_rotation_random_axis', True),
             'perturb_rot_axis_left_vec': rot_axis_left_vec,
             'perturb_rot_axis_right_vec': rot_axis_right_vec,
@@ -1087,6 +1104,7 @@ def load_raw_data(raw_data_dir, episode_id):
         _img0 = _cv2.imdecode(np.frombuffer(_frame0, np.uint8), _cv2.IMREAD_COLOR)
         h_native, w_native = _img0.shape[:2]
         return {
+            'episode_path': path,
             'left_endpose': f['endpose/left_endpose'][()].astype(np.float32),
             'right_endpose': f['endpose/right_endpose'][()].astype(np.float32),
             'left_gripper': f['endpose/left_gripper'][()].astype(np.float32),
@@ -1347,6 +1365,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     min_dist = 0.0
     _dbg_rollout = []  # collect per-step debug info
     dyn_state = None
+    rollout_steps_total = 0
 
     for step in range(max_steps):
         left_q, right_q = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
@@ -1455,6 +1474,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # Advance state to the end of the executed prefix.
         a_last = act_raw[exec_len - 1]
         curr_qpos_raw = a_last
+        rollout_steps_total += int(exec_len)
 
         # collect debug info for this rollout step
         if debug_dir is not None:
@@ -1607,8 +1627,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # save corrected image (curr_image is BGR, cv2 expects BGR)
         _cimg = (curr_image[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         cv2.imwrite(os.path.join(_dbg_corr, 'corrected_image.png'), _cimg)
-        # save original image (image_data_s is BGR, cv2 expects BGR)
+        # save original image as GT frame at matched time (start_ts + t_star)
+        # fallback to current sampled image if GT decode fails.
         _oimg = (image_data_s[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+        try:
+            ep_path = raw_data.get('episode_path', None)
+            if ep_path is not None and os.path.isfile(ep_path):
+                import h5py
+                with h5py.File(ep_path, 'r') as _f_gt:
+                    _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
+                _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
+                if _gt is not None and _gt.size > 0:
+                    _oimg = _gt
+        except Exception:
+            pass
+        # Keep original/corrected overlays in the same resolution.
+        if _oimg.shape[:2] != _cimg.shape[:2]:
+            _oimg = cv2.resize(_oimg, (_cimg.shape[1], _cimg.shape[0]), interpolation=cv2.INTER_LINEAR)
         cv2.imwrite(os.path.join(_dbg_corr, 'original_image.png'), _oimg)
         # Project correction trajectory via EVAC original get_traj for consistency.
         _overlay_o = _oimg.copy()
@@ -1669,7 +1705,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         E[None, ...],
                         c2w[None, ...],
                         torch.from_numpy(K).float().unsqueeze(0),
-                        radius=16,
+                        radius=20,
                     )  # (3,1,T,H,W), in [0,1]
                 finally:
                     ddpm3d_mod.EndEffectorPts = _orig_eef_pts
@@ -1687,21 +1723,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             # Middle trajectory: use the exact same projection chain as get_traj
             # and connect the projected base point (keypoint-0).
             mid_overlay = np.ascontiguousarray(np.zeros((h_img, w_img, 3), dtype=np.uint8))
-            pose_t = torch.from_numpy(pose_np).float()
             w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)         # (1,1,4,4)
             intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)   # (1,1,3,3)
             cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
             ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
-            pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
-            pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
-            ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
-            ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
-            pts_l = torch.matmul(ee2cam_l, ee_key_pts)
-            pts_r = torch.matmul(ee2cam_r, ee_key_pts)
-            uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
-            uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
-            uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
-            uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
+
+            def _project_base_uv_from_pose_np(pose_arr):
+                pose_t = torch.from_numpy(pose_arr).float()
+                pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
+                pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
+                ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
+                ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
+                pts_l = torch.matmul(ee2cam_l, ee_key_pts)
+                pts_r = torch.matmul(ee2cam_r, ee_key_pts)
+                uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
+                uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
+                uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
+                uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
+                return uvs_l, uvs_r, pts_l, pts_r
 
             def _extract_base_uv(uvs, pts):
                 seq = []
@@ -1715,6 +1754,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         seq.append(None)
                 return seq
 
+            uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
             # reshape pts to [1,T,4,4] for consistent indexing above
             pts_l_bt = pts_l.reshape(1, pts_l.shape[1], 4, 4)
             pts_r_bt = pts_r.reshape(1, pts_r.shape[1], 4, 4)
@@ -1732,6 +1772,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         cv2.line(mid_overlay, p0, p1, color, 2, cv2.LINE_AA)
                     prev = pt
 
+            C_LEFT = (0, 255, 0)
+            C_RIGHT = (0, 0, 255)
+            C_LEFT_GT = (0, 255, 255)
+            C_RIGHT_GT = (255, 255, 0)
+
             def _mark_start_end(img, seq, color, prefix):
                 if len(seq) == 0:
                     return
@@ -1746,19 +1791,80 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-            _overlay_o[mask] = (0.6 * _overlay_o[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
             _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
             mid_mask = np.any(mid_overlay > 0, axis=2)
-            _overlay_o[mid_mask] = (0.7 * _overlay_o[mid_mask] + 0.3 * mid_overlay[mid_mask]).astype(np.uint8)
             _overlay_c[mid_mask] = (0.7 * _overlay_c[mid_mask] + 0.3 * mid_overlay[mid_mask]).astype(np.uint8)
-            _mark_start_end(_overlay_o, luv, (0, 255, 0), "L")
-            _mark_start_end(_overlay_o, ruv, (0, 0, 255), "R")
-            _mark_start_end(_overlay_c, luv, (0, 255, 0), "L")
-            _mark_start_end(_overlay_c, ruv, (0, 0, 255), "R")
+            _mark_start_end(_overlay_c, luv, C_LEFT, "L")
+            _mark_start_end(_overlay_c, ruv, C_RIGHT, "R")
+
+            # On original image, show corrected-start vs GT-reference using the same get_traj circle rendering.
+            n_total = int(raw_data['left_endpose'].shape[0])
+            gt_end = int(min(n_total, gt_ref_idx + pose_np.shape[0]))
+            if gt_end > gt_ref_idx:
+                gt_pose_list = []
+                for gi in range(gt_ref_idx, gt_end):
+                    lp_gt = raw_data['left_endpose'][gi, :3].astype(np.float32)
+                    lq_gt_wxyz = raw_data['left_endpose'][gi, 3:7].astype(np.float32)
+                    rp_gt = raw_data['right_endpose'][gi, :3].astype(np.float32)
+                    rq_gt_wxyz = raw_data['right_endpose'][gi, 3:7].astype(np.float32)
+                    lq_gt_xyzw = np.array([lq_gt_wxyz[1], lq_gt_wxyz[2], lq_gt_wxyz[3], lq_gt_wxyz[0]], dtype=np.float32)
+                    rq_gt_xyzw = np.array([rq_gt_wxyz[1], rq_gt_wxyz[2], rq_gt_wxyz[3], rq_gt_wxyz[0]], dtype=np.float32)
+                    if lq_gt_xyzw[3] < 0:
+                        lq_gt_xyzw = -lq_gt_xyzw
+                    if rq_gt_xyzw[3] < 0:
+                        rq_gt_xyzw = -rq_gt_xyzw
+                    lg_gt = float(np.clip(raw_data['left_gripper'][gi], 0.0, 1.0)) * 120.0
+                    rg_gt = float(np.clip(raw_data['right_gripper'][gi], 0.0, 1.0)) * 120.0
+                    gt_pose_list.append(np.concatenate([lp_gt, lq_gt_xyzw, [lg_gt], rp_gt, rq_gt_xyzw, [rg_gt]], axis=0).astype(np.float32))
+                gt_pose_np = np.stack(gt_pose_list, axis=0)
+                gt_uvs_l, gt_uvs_r, gt_pts_l, gt_pts_r = _project_base_uv_from_pose_np(gt_pose_np)
+                gt_l_seq = _extract_base_uv(gt_uvs_l, gt_pts_l.reshape(1, gt_pts_l.shape[1], 4, 4))
+                gt_r_seq = _extract_base_uv(gt_uvs_r, gt_pts_r.reshape(1, gt_pts_r.shape[1], 4, 4))
+                corr_start_map, corr_start_mask, _ = _render_endpoint_mask(pose_np[:1])
+                gt_start_map, gt_start_mask, _ = _render_endpoint_mask(gt_pose_np[:1])
+                _overlay_o[corr_start_mask] = (0.55 * _overlay_o[corr_start_mask] + 0.45 * corr_start_map[corr_start_mask]).astype(np.uint8)
+                _overlay_o[gt_start_mask] = (0.55 * _overlay_o[gt_start_mask] + 0.45 * gt_start_map[gt_start_mask]).astype(np.uint8)
+
+                def _label_point(img, pt, text, color):
+                    if pt is None:
+                        return
+                    x, y = int(pt[0]), int(pt[1])
+                    cv2.putText(img, text, (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+                _label_point(_overlay_o, luv[0] if len(luv) > 0 else None, "L-C", C_LEFT)
+                _label_point(_overlay_o, ruv[0] if len(ruv) > 0 else None, "R-C", C_RIGHT)
+                _label_point(_overlay_o, gt_l_seq[0] if len(gt_l_seq) > 0 else None, "L-GT", C_LEFT_GT)
+                _label_point(_overlay_o, gt_r_seq[0] if len(gt_r_seq) > 0 else None, "R-GT", C_RIGHT_GT)
+
+            def _draw_legend(img, rows):
+                if len(rows) == 0:
+                    return
+                x0, y0 = 10, 10
+                row_h = 20
+                w = 170
+                h = 10 + row_h * len(rows) + 8
+                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
+                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
+                for i, (name, color) in enumerate(rows):
+                    y = y0 + 18 + i * row_h
+                    cv2.circle(img, (x0 + 12, y - 4), 4, color, -1, cv2.LINE_AA)
+                    cv2.putText(img, name, (x0 + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
+
+            _draw_legend(_overlay_c, [
+                ("L start/end", C_LEFT),
+                ("R start/end", C_RIGHT),
+            ])
+            _draw_legend(_overlay_o, [
+                ("L-C corrected", C_LEFT),
+                ("R-C corrected", C_RIGHT),
+                ("L-GT reference", C_LEFT_GT),
+                ("R-GT reference", C_RIGHT_GT),
+            ])
             with open(os.path.join(_dbg_corr, 'corr_projection_debug.json'), 'w') as _f:
                 json.dump({
                     'projection_chain': 'evac_inference_compatible_link6',
                     'mask_pixels': int(np.count_nonzero(mask)),
+                    'gt_ref_index_for_original': int(gt_ref_idx),
                     'image_hw': [int(h_img), int(w_img)],
                     'native_hw': [int(h_native), int(w_native)],
                 }, _f, indent=2)
@@ -1772,6 +1878,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # save planner results summary
         _plan_info = {
             'rollout': _dbg_rollout,
+            'rollout_steps_total': int(rollout_steps_total),
+            'gt_ref_index_for_original': int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1)),
             't_star': int(t_star), 'min_dist': float(min_dist),
             'target_mode': target_mode,
             't_target': int(t_target), 'target_lookahead_steps': int(target_lookahead_steps),
@@ -2371,6 +2479,12 @@ if __name__ == "__main__":
                         help="Use random direction for translation failure per rollout")
     parser.add_argument("--perturb_rot_max_deg", type=float, default=15.0,
                         help="Max EEF rotation perturbation angle in degrees")
+    parser.add_argument("--perturb_mag_random", type=str2bool, default=False,
+                        help="Randomize perturbation magnitude per rollout chunk")
+    parser.add_argument("--perturb_mag_rand_min", type=float, default=0.8,
+                        help="Minimum random magnitude scale")
+    parser.add_argument("--perturb_mag_rand_max", type=float, default=1.2,
+                        help="Maximum random magnitude scale")
     parser.add_argument("--perturb_rotation_random_axis", type=str2bool, default=True,
                         help="Use random rotation axis for rotation failure per rollout")
     parser.add_argument("--perturb_rot_axis_left", type=str, default="0,0,1",

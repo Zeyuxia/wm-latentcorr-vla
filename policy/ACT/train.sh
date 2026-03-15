@@ -24,7 +24,7 @@ perturb_fail_gain=0.12
 perturb_fail_direction=1,1,1,1,1,1,-1,-1,-1,-1,-1,-1
 perturb_eef_mode=directional_fail
 perturb_eef_pos_std=0.01
-perturb_eef_fail_gain=0.035
+perturb_eef_fail_gain=0.04
 perturb_eef_tcp_offset_x=0.085
 perturb_eef_ramp=true
 perturb_eef_ramp_min=0.0
@@ -32,7 +32,10 @@ perturb_eef_ramp_power=1.5
 perturb_eef_ramp_apply_eps=1e-4
 perturb_eef_joint_delta_cap=0.08
 perturb_translation_random_dir=true
-perturb_rot_max_deg=12
+perturb_rot_max_deg=14
+perturb_mag_random=true
+perturb_mag_rand_min=0.85
+perturb_mag_rand_max=1.15
 perturb_rotation_random_axis=true
 perturb_rot_axis_left=0,0,1
 perturb_rot_axis_right=0,0,1
@@ -164,6 +167,9 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_eef_joint_delta_cap ${perturb_eef_joint_delta_cap} \
 --perturb_translation_random_dir ${perturb_translation_random_dir} \
 --perturb_rot_max_deg ${perturb_rot_max_deg} \
+--perturb_mag_random ${perturb_mag_random} \
+--perturb_mag_rand_min ${perturb_mag_rand_min} \
+--perturb_mag_rand_max ${perturb_mag_rand_max} \
 --perturb_rotation_random_axis ${perturb_rotation_random_axis} \
 --perturb_rot_axis_left ${perturb_rot_axis_left} \
 --perturb_rot_axis_right ${perturb_rot_axis_right} \
