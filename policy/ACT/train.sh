@@ -38,6 +38,15 @@ perturb_mag_random=true
 perturb_mag_rand_min=0.85
 perturb_mag_rand_max=1.15
 perturb_rotation_random_axis=true
+perturb_anti_gt_cos_thresh=1.0
+perturb_reject_sampling_enable=true
+perturb_reject_max_trials=4
+perturb_reject_min_delta=0.0005
+perturb_reject_min_score=0.15
+perturb_reject_prefilter_pool=8
+perturb_reject_orient_weight=0.01
+perturb_reject_gripper_penalty=1.0
+nearest_window_radius=32
 perturb_rot_axis_left=0,0,1
 perturb_rot_axis_right=0,0,1
 perturb_noop_lag_steps=3
@@ -70,7 +79,7 @@ correction_threshold=0.05
 max_rollout_steps=2
 single_rollout_correction=true
 target_mode=backward
-target_lookahead_steps=4
+target_lookahead_steps=6
 rollout_exec_steps=16
 correction_freq=1
 correction_weight=1.0
@@ -174,6 +183,15 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_mag_rand_min ${perturb_mag_rand_min} \
 --perturb_mag_rand_max ${perturb_mag_rand_max} \
 --perturb_rotation_random_axis ${perturb_rotation_random_axis} \
+--perturb_anti_gt_cos_thresh ${perturb_anti_gt_cos_thresh} \
+--perturb_reject_sampling_enable ${perturb_reject_sampling_enable} \
+--perturb_reject_max_trials ${perturb_reject_max_trials} \
+--perturb_reject_min_delta ${perturb_reject_min_delta} \
+--perturb_reject_min_score ${perturb_reject_min_score} \
+--perturb_reject_prefilter_pool ${perturb_reject_prefilter_pool} \
+--perturb_reject_orient_weight ${perturb_reject_orient_weight} \
+--perturb_reject_gripper_penalty ${perturb_reject_gripper_penalty} \
+--nearest_window_radius ${nearest_window_radius} \
 --perturb_rot_axis_left ${perturb_rot_axis_left} \
 --perturb_rot_axis_right ${perturb_rot_axis_right} \
 --perturb_noop_lag_steps ${perturb_noop_lag_steps} \

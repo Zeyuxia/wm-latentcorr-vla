@@ -332,6 +332,29 @@ def _sample_unit_vec3():
     return v / n
 
 
+def _unit_vec3(v):
+    arr = np.asarray(v, dtype=np.float32).reshape(3,)
+    n = float(np.linalg.norm(arr))
+    if n < 1e-8:
+        return None
+    return arr / n
+
+
+def _anti_align_with_gt(v_noise, v_gt, cos_thresh):
+    """
+    If sampled perturb direction is strongly aligned with GT trend, flip it.
+    cos_thresh in [0,1], larger => looser (flip less often).
+    """
+    u_n = _unit_vec3(v_noise)
+    u_g = _unit_vec3(v_gt)
+    if u_n is None or u_g is None:
+        return np.asarray(v_noise, dtype=np.float32), None, False
+    cos = float(np.dot(u_n, u_g))
+    if cos > float(cos_thresh):
+        return (-u_n).astype(np.float32), cos, True
+    return u_n.astype(np.float32), cos, False
+
+
 def _link6_to_tcp_pose(link_pos_w, link_quat_wxyz, offset_x=0.085):
     # Approximate link6 -> gripper/TCP conversion for ALOHA-Agilex.
     from scipy.spatial.transform import Rotation as R
@@ -682,6 +705,8 @@ def _perturb_action_chunk_target_pose(
     error_mode="translation",
     active_left_arm=True, active_right_arm=True,
     active_left_gripper=True, active_right_gripper=True,
+    forced_dir_left=None, forced_dir_right=None,
+    forced_axis_left=None, forced_axis_right=None,
 ):
     """Two-point perturbation: p0=current, p1=GT@exec_step, perturb p1, then plan p0->p1'."""
     if fk is None or planner_l is None or planner_r is None:
@@ -715,17 +740,48 @@ def _perturb_action_chunk_target_pose(
     mode = str(error_mode).lower()
     curr_left_q = np.asarray(curr_left_q, dtype=np.float32)
     curr_right_q = np.asarray(curr_right_q, dtype=np.float32)
+    anti_gt_cos_thresh = float(np.clip(cfg.get("perturb_anti_gt_cos_thresh", 0.6), 0.0, 1.0))
+    anti_dbg = {
+        "anti_gt_cos_thresh": float(anti_gt_cos_thresh),
+        "anti_gt_left_cos": None,
+        "anti_gt_right_cos": None,
+        "anti_gt_left_flipped": False,
+        "anti_gt_right_flipped": False,
+    }
     if (not active_left_arm) and (not active_right_arm) and mode not in {"gripper_close", "gripper_open"}:
         return out, False, "target_pose_inactive_arms", None
 
     if mode == "rotation":
         angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0)) * mag_scale
         angle = np.deg2rad(angle_max_deg)
+        fr_curr = fk.forward(curr_left_q, curr_right_q)
+        lq_curr_wxyz = np.asarray(fr_curr["left"][1], dtype=np.float32)
+        rq_curr_wxyz = np.asarray(fr_curr["right"][1], dtype=np.float32)
         axis_l = cfg.get("perturb_rot_axis_left_vec", np.array([0.0, 0.0, 1.0], dtype=np.float32))
         axis_r = cfg.get("perturb_rot_axis_right_vec", np.array([0.0, 0.0, 1.0], dtype=np.float32))
-        if bool(cfg.get("perturb_rotation_random_axis", True)):
+        if forced_axis_left is not None:
+            axis_l = np.asarray(forced_axis_left, dtype=np.float32)
+        if forced_axis_right is not None:
+            axis_r = np.asarray(forced_axis_right, dtype=np.float32)
+        if forced_axis_left is None and forced_axis_right is None and bool(cfg.get("perturb_rotation_random_axis", True)):
             axis_l = _sample_unit_vec3()
             axis_r = _sample_unit_vec3()
+        axis_l = _unit_vec3(axis_l) if axis_l is not None else _sample_unit_vec3()
+        axis_r = _unit_vec3(axis_r) if axis_r is not None else _sample_unit_vec3()
+        if active_left_arm:
+            q_curr_xyzw = np.array([lq_curr_wxyz[1], lq_curr_wxyz[2], lq_curr_wxyz[3], lq_curr_wxyz[0]], dtype=np.float32)
+            q_gt_xyzw = np.array([l_pose[4], l_pose[5], l_pose[6], l_pose[3]], dtype=np.float32)
+            gt_rotvec_l = (R.from_quat(q_gt_xyzw) * R.from_quat(q_curr_xyzw).inv()).as_rotvec().astype(np.float32)
+            axis_l, cos_l, flip_l = _anti_align_with_gt(axis_l, gt_rotvec_l, anti_gt_cos_thresh)
+            anti_dbg["anti_gt_left_cos"] = None if cos_l is None else float(cos_l)
+            anti_dbg["anti_gt_left_flipped"] = bool(flip_l)
+        if active_right_arm:
+            q_curr_xyzw = np.array([rq_curr_wxyz[1], rq_curr_wxyz[2], rq_curr_wxyz[3], rq_curr_wxyz[0]], dtype=np.float32)
+            q_gt_xyzw = np.array([r_pose[4], r_pose[5], r_pose[6], r_pose[3]], dtype=np.float32)
+            gt_rotvec_r = (R.from_quat(q_gt_xyzw) * R.from_quat(q_curr_xyzw).inv()).as_rotvec().astype(np.float32)
+            axis_r, cos_r, flip_r = _anti_align_with_gt(axis_r, gt_rotvec_r, anti_gt_cos_thresh)
+            anti_dbg["anti_gt_right_cos"] = None if cos_r is None else float(cos_r)
+            anti_dbg["anti_gt_right_flipped"] = bool(flip_r)
         if active_left_arm:
             ql_xyzw = np.array([l_pose[4], l_pose[5], l_pose[6], l_pose[3]], dtype=np.float32)
             ql_new = (R.from_rotvec(np.asarray(axis_l, dtype=np.float32) * angle) * R.from_quat(ql_xyzw)).as_quat()
@@ -737,9 +793,16 @@ def _perturb_action_chunk_target_pose(
         mode_tag = "target_pose_rotation"
     elif mode == "translation":
         fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03)) * mag_scale
+        fr_curr = fk.forward(curr_left_q, curr_right_q)
+        lp_curr = np.asarray(fr_curr["left"][0], dtype=np.float32)
+        rp_curr = np.asarray(fr_curr["right"][0], dtype=np.float32)
         dir_l = cfg.get("perturb_eef_fail_dir_left_vec", None)
         dir_r = cfg.get("perturb_eef_fail_dir_right_vec", None)
-        if bool(cfg.get("perturb_translation_random_dir", True)):
+        if forced_dir_left is not None:
+            dir_l = np.asarray(forced_dir_left, dtype=np.float32)
+        if forced_dir_right is not None:
+            dir_r = np.asarray(forced_dir_right, dtype=np.float32)
+        if forced_dir_left is None and forced_dir_right is None and bool(cfg.get("perturb_translation_random_dir", True)):
             dir_l = _sample_unit_vec3()
             dir_r = _sample_unit_vec3()
         else:
@@ -747,6 +810,16 @@ def _perturb_action_chunk_target_pose(
                 dir_l = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             if dir_r is None:
                 dir_r = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+        if active_left_arm:
+            gt_vec_l = l_pose[:3] - lp_curr
+            dir_l, cos_l, flip_l = _anti_align_with_gt(dir_l, gt_vec_l, anti_gt_cos_thresh)
+            anti_dbg["anti_gt_left_cos"] = None if cos_l is None else float(cos_l)
+            anti_dbg["anti_gt_left_flipped"] = bool(flip_l)
+        if active_right_arm:
+            gt_vec_r = r_pose[:3] - rp_curr
+            dir_r, cos_r, flip_r = _anti_align_with_gt(dir_r, gt_vec_r, anti_gt_cos_thresh)
+            anti_dbg["anti_gt_right_cos"] = None if cos_r is None else float(cos_r)
+            anti_dbg["anti_gt_right_flipped"] = bool(flip_r)
         if active_left_arm:
             l_pose[:3] = l_pose[:3] + fail_gain * np.asarray(dir_l, dtype=np.float32)
         if active_right_arm:
@@ -870,6 +943,7 @@ def _perturb_action_chunk_target_pose(
         "active_right_arm": bool(active_right_arm),
         "error_mode": mode,
     }
+    info.update(anti_dbg)
     return out, True, mode_tag, info
 
 
@@ -898,14 +972,113 @@ def perturb_action_chunk_online(
         use_target_pose = bool(cfg.get("perturb_use_target_pose_planner", True))
         if use_target_pose and (t_star is not None) and (left_ep is not None) and (right_ep is not None):
             if selected_mode in {"translation", "rotation", "no_ops", "gripper_close", "gripper_open"}:
-                out, ok, tag, info = _perturb_action_chunk_target_pose(
-                    act_raw, cfg, fk, planner_l, planner_r,
-                    curr_left_q, curr_right_q, init_left_grip, init_right_grip,
-                    left_ep, right_ep, left_grip_traj, right_grip_traj, t_star, rollout_exec_steps,
-                    error_mode=selected_mode,
-                    active_left_arm=active_left_arm, active_right_arm=active_right_arm,
-                    active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper,
-                )
+                reject_enable = bool(cfg.get("perturb_reject_sampling_enable", True))
+                reject_trials = int(max(1, cfg.get("perturb_reject_max_trials", 4)))
+                reject_min_score = float(cfg.get("perturb_reject_min_score", 0.15))
+                do_reject = reject_enable and selected_mode in {"translation", "rotation"} and (fk is not None)
+                if do_reject:
+                    target_h = int(rollout_exec_steps) if rollout_exec_steps is not None else int(act_raw.shape[0])
+                    target_h = int(max(1, target_h))
+                    gt_idx = int(np.clip(int(t_star) + target_h - 1, 0, len(left_ep) - 1))
+                    prefilter_pool = int(max(reject_trials, cfg.get("perturb_reject_prefilter_pool", reject_trials * 2)))
+                    pre_candidates = []  # (score, spec, aux_debug)
+                    fr_curr = fk.forward(curr_left_q, curr_right_q)
+                    lp_curr = np.asarray(fr_curr["left"][0], dtype=np.float32)
+                    rp_curr = np.asarray(fr_curr["right"][0], dtype=np.float32)
+                    lq_curr = np.asarray(fr_curr["left"][1], dtype=np.float32)
+                    rq_curr = np.asarray(fr_curr["right"][1], dtype=np.float32)
+                    gt_lp = np.asarray(left_ep[gt_idx, :3], dtype=np.float32)
+                    gt_rp = np.asarray(right_ep[gt_idx, :3], dtype=np.float32)
+                    if selected_mode == "translation":
+                        gt_v_l = _unit_vec3(gt_lp - lp_curr) if active_left_arm else None
+                        gt_v_r = _unit_vec3(gt_rp - rp_curr) if active_right_arm else None
+                        for _ in range(prefilter_pool):
+                            dl = _sample_unit_vec3()
+                            dr = _sample_unit_vec3()
+                            s, c = 0.0, 0
+                            cos_l, cos_r = None, None
+                            if gt_v_l is not None:
+                                cos_l = float(np.dot(dl, gt_v_l))
+                                s += -cos_l; c += 1
+                            if gt_v_r is not None:
+                                cos_r = float(np.dot(dr, gt_v_r))
+                                s += -cos_r; c += 1
+                            pre_candidates.append((s / max(1, c), {"forced_dir_left": dl, "forced_dir_right": dr}, {"cos_l": cos_l, "cos_r": cos_r}))
+                    else:
+                        from scipy.spatial.transform import Rotation as R
+                        ql_gt = np.asarray(left_ep[gt_idx, 3:7], dtype=np.float32)
+                        qr_gt = np.asarray(right_ep[gt_idx, 3:7], dtype=np.float32)
+                        gt_rv_l = None
+                        gt_rv_r = None
+                        if active_left_arm:
+                            q_curr_xyzw = np.array([lq_curr[1], lq_curr[2], lq_curr[3], lq_curr[0]], dtype=np.float32)
+                            q_gt_xyzw = np.array([ql_gt[1], ql_gt[2], ql_gt[3], ql_gt[0]], dtype=np.float32)
+                            gt_rv_l = _unit_vec3((R.from_quat(q_gt_xyzw) * R.from_quat(q_curr_xyzw).inv()).as_rotvec())
+                        if active_right_arm:
+                            q_curr_xyzw = np.array([rq_curr[1], rq_curr[2], rq_curr[3], rq_curr[0]], dtype=np.float32)
+                            q_gt_xyzw = np.array([qr_gt[1], qr_gt[2], qr_gt[3], qr_gt[0]], dtype=np.float32)
+                            gt_rv_r = _unit_vec3((R.from_quat(q_gt_xyzw) * R.from_quat(q_curr_xyzw).inv()).as_rotvec())
+                        for _ in range(prefilter_pool):
+                            al = _sample_unit_vec3()
+                            ar = _sample_unit_vec3()
+                            s, c = 0.0, 0
+                            cos_l, cos_r = None, None
+                            if gt_rv_l is not None:
+                                cos_l = float(np.dot(al, gt_rv_l))
+                                s += -cos_l; c += 1
+                            if gt_rv_r is not None:
+                                cos_r = float(np.dot(ar, gt_rv_r))
+                                s += -cos_r; c += 1
+                            pre_candidates.append((s / max(1, c), {"forced_axis_left": al, "forced_axis_right": ar}, {"cos_l": cos_l, "cos_r": cos_r}))
+                    pre_candidates.sort(key=lambda x: x[0], reverse=True)
+                    rank_accept = None
+                    for ridx, (s, _, _) in enumerate(pre_candidates[:reject_trials]):
+                        if float(s) >= float(reject_min_score):
+                            rank_accept = ridx
+                            break
+                    if rank_accept is None:
+                        rank_accept = 0 if len(pre_candidates) > 0 else None
+                    if rank_accept is None:
+                        out, ok, tag, info = act_raw, False, "target_pose_reject_no_candidate", {"error_mode": selected_mode}
+                    else:
+                        s_sel, t_spec, aux = pre_candidates[rank_accept]
+                        out, ok, tag, info = _perturb_action_chunk_target_pose(
+                            act_raw, cfg, fk, planner_l, planner_r,
+                            curr_left_q, curr_right_q, init_left_grip, init_right_grip,
+                            left_ep, right_ep, left_grip_traj, right_grip_traj, t_star, rollout_exec_steps,
+                            error_mode=selected_mode,
+                            active_left_arm=active_left_arm, active_right_arm=active_right_arm,
+                            active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper,
+                            forced_dir_left=t_spec.get("forced_dir_left"),
+                            forced_dir_right=t_spec.get("forced_dir_right"),
+                            forced_axis_left=t_spec.get("forced_axis_left"),
+                            forced_axis_right=t_spec.get("forced_axis_right"),
+                        )
+                        info = {} if not isinstance(info, dict) else info
+                        info.update({
+                            "reject_sampling_enabled": True,
+                            "reject_sampling_trial": int(rank_accept + 1),
+                            "reject_sampling_trials_max": int(reject_trials),
+                            "reject_sampling_prefilter_pool": int(prefilter_pool),
+                            "reject_sampling_base_err": None,
+                            "reject_sampling_cand_err": None,
+                            "reject_sampling_min_delta": None,
+                            "reject_sampling_min_score": float(reject_min_score),
+                            "reject_sampling_pose_score": float(s_sel),
+                            "reject_sampling_accepted": bool(float(s_sel) >= float(reject_min_score)),
+                            "reject_sampling_fallback_best": bool(float(s_sel) < float(reject_min_score)),
+                            "reject_sampling_cos_left": aux.get("cos_l", None),
+                            "reject_sampling_cos_right": aux.get("cos_r", None),
+                        })
+                else:
+                    out, ok, tag, info = _perturb_action_chunk_target_pose(
+                        act_raw, cfg, fk, planner_l, planner_r,
+                        curr_left_q, curr_right_q, init_left_grip, init_right_grip,
+                        left_ep, right_ep, left_grip_traj, right_grip_traj, t_star, rollout_exec_steps,
+                        error_mode=selected_mode,
+                        active_left_arm=active_left_arm, active_right_arm=active_right_arm,
+                        active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper,
+                    )
             else:
                 out, ok, tag, info = act_raw, False, "unsupported_mode", {"error_mode": selected_mode}
         elif selected_mode == "translation":
@@ -1209,6 +1382,15 @@ def main(args):
             'perturb_mag_rand_min': args.get('perturb_mag_rand_min', 0.8),
             'perturb_mag_rand_max': args.get('perturb_mag_rand_max', 1.2),
             'perturb_rotation_random_axis': args.get('perturb_rotation_random_axis', True),
+            'perturb_anti_gt_cos_thresh': args.get('perturb_anti_gt_cos_thresh', 0.6),
+            'perturb_reject_sampling_enable': args.get('perturb_reject_sampling_enable', True),
+            'perturb_reject_max_trials': args.get('perturb_reject_max_trials', 4),
+            'perturb_reject_min_delta': args.get('perturb_reject_min_delta', 5e-4),
+            'perturb_reject_min_score': args.get('perturb_reject_min_score', 0.15),
+            'perturb_reject_prefilter_pool': args.get('perturb_reject_prefilter_pool', 8),
+            'perturb_reject_orient_weight': args.get('perturb_reject_orient_weight', args.get('orient_weight', 0.0)),
+            'perturb_reject_gripper_penalty': args.get('perturb_reject_gripper_penalty', args.get('gripper_penalty', 0.0)),
+            'nearest_window_radius': args.get('nearest_window_radius', 32),
             'perturb_rot_axis_left_vec': rot_axis_left_vec,
             'perturb_rot_axis_right_vec': rot_axis_right_vec,
             'perturb_noop_lag_steps': args.get('perturb_noop_lag_steps', 3),
@@ -1392,7 +1574,8 @@ def find_nearest_traj_point(fk_left_pos, fk_left_quat, fk_right_pos, fk_right_qu
                             left_endpose, right_endpose, orient_weight=0.0,
                             curr_left_grip=None, curr_right_grip=None,
                             left_gripper_traj=None, right_gripper_traj=None,
-                            gripper_penalty=0.0):
+                            gripper_penalty=0.0,
+                            window_start=None, window_end=None):
     """Find nearest trajectory point using position + orientation + gripper distance.
     Quaternions are in wxyz format. orient_weight scales the geodesic
     orientation distance (radians) relative to position distance (meters).
@@ -1417,6 +1600,13 @@ def find_nearest_traj_point(fk_left_pos, fk_left_quat, fk_right_pos, fk_right_qu
         lg_mismatch = np.abs(traj_lg - curr_lg)
         rg_mismatch = np.abs(traj_rg - curr_rg)
         dists += gripper_penalty * (lg_mismatch + rg_mismatch) / 2
+    if window_start is not None or window_end is not None:
+        ws = 0 if window_start is None else int(np.clip(window_start, 0, len(dists) - 1))
+        we = len(dists) if window_end is None else int(np.clip(window_end, ws + 1, len(dists)))
+        d_win = np.full_like(dists, np.inf, dtype=np.float32)
+        d_win[ws:we] = dists[ws:we]
+        if np.any(np.isfinite(d_win)):
+            dists = d_win
     t_star = np.argmin(dists)
     return t_star, dists[t_star]
 
@@ -1598,11 +1788,15 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             # Strictly align the first rollout step with start_ts slice origin.
             t_star, min_dist = 0, 0.0
         else:
+            near_w = int(max(1, cfg.get('nearest_window_radius', 32)))
+            expected_idx = int(np.clip(rollout_steps_total, 0, len(left_ep) - 1))
             t_star, min_dist = find_nearest_traj_point(
                 lp, lq, rp, rq, left_ep, right_ep, orient_weight,
                 curr_left_grip=left_grip, curr_right_grip=right_grip,
                 left_gripper_traj=left_grip_traj, right_gripper_traj=right_grip_traj,
-                gripper_penalty=gripper_penalty)
+                gripper_penalty=gripper_penalty,
+                window_start=max(0, expected_idx - near_w),
+                window_end=min(len(left_ep), expected_idx + near_w + 1))
         if min_dist >= threshold:
             break
         if t_star >= len(left_ep) - 2:
@@ -1731,6 +1925,19 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'action_perturbed': bool(perturbed),
                 'perturb_mode': pert_mode,
                 'sampled_error_mode': sampled_error_mode,
+                'anti_gt_cos_thresh': (None if not isinstance(dyn_state, dict) else dyn_state.get('anti_gt_cos_thresh')),
+                'anti_gt_left_cos': (None if not isinstance(dyn_state, dict) else dyn_state.get('anti_gt_left_cos')),
+                'anti_gt_right_cos': (None if not isinstance(dyn_state, dict) else dyn_state.get('anti_gt_right_cos')),
+                'anti_gt_left_flipped': (False if not isinstance(dyn_state, dict) else bool(dyn_state.get('anti_gt_left_flipped', False))),
+                'anti_gt_right_flipped': (False if not isinstance(dyn_state, dict) else bool(dyn_state.get('anti_gt_right_flipped', False))),
+                'reject_sampling_enabled': (False if not isinstance(dyn_state, dict) else bool(dyn_state.get('reject_sampling_enabled', False))),
+                'reject_sampling_trial': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_trial')),
+                'reject_sampling_trials_max': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_trials_max')),
+                'reject_sampling_base_err': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_base_err')),
+                'reject_sampling_cand_err': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_cand_err')),
+                'reject_sampling_min_delta': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_min_delta')),
+                'reject_sampling_accepted': (None if not isinstance(dyn_state, dict) else dyn_state.get('reject_sampling_accepted')),
+                'reject_sampling_fallback_best': (False if not isinstance(dyn_state, dict) else bool(dyn_state.get('reject_sampling_fallback_best', False))),
                 'eef_ik_solved_cnt': eef_solved_cnt,
                 'eef_ik_total_cnt': eef_total_cnt,
                 'eef_ik_solved_ratio': eef_solved_ratio,
@@ -1745,6 +1952,15 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             break
 
     # Recompute nearest-point metrics at the final post-rollout state.
+    # For pure gripper error modes, disable gripper penalty during nearest-point
+    # matching to avoid being pulled to distant segments with similar gripper state.
+    nearest_gripper_penalty = float(gripper_penalty)
+    nearest_mode = ""
+    if isinstance(dyn_state, dict):
+        nearest_mode = str(dyn_state.get("error_mode", "")).strip().lower()
+        if nearest_mode in {"gripper_close", "gripper_open"}:
+            nearest_gripper_penalty = 0.0
+
     left_q, right_q = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
     left_grip, right_grip = curr_qpos_raw[6], curr_qpos_raw[13]
     fk_r = fk.forward(left_q, right_q)
@@ -1754,7 +1970,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         lp, lq, rp, rq, left_ep, right_ep, orient_weight,
         curr_left_grip=left_grip, curr_right_grip=right_grip,
         left_gripper_traj=left_grip_traj, right_gripper_traj=right_grip_traj,
-        gripper_penalty=gripper_penalty)
+        gripper_penalty=nearest_gripper_penalty,
+        window_start=max(0, int(rollout_steps_total) - int(max(1, cfg.get('nearest_window_radius', 32)))),
+        window_end=min(len(left_ep), int(rollout_steps_total) + int(max(1, cfg.get('nearest_window_radius', 32))) + 1))
 
     corr_active_info = _infer_active_arms_from_gt_window(
         raw_data.get('gt_left_arm'),
@@ -2196,6 +2414,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             'target_mode': target_mode,
             't_target': int(t_target), 'target_lookahead_steps': int(target_lookahead_steps),
             'threshold': threshold,
+            'nearest_mode': nearest_mode,
+            'nearest_gripper_penalty_used': float(nearest_gripper_penalty),
             'target_left_pose': left_ep[t_target].tolist(),
             'target_right_pose': right_ep[t_target].tolist(),
             'planner_left_status': res_l.get('status'),
@@ -2804,6 +3024,24 @@ if __name__ == "__main__":
                         help="Maximum random magnitude scale")
     parser.add_argument("--perturb_rotation_random_axis", type=str2bool, default=True,
                         help="Use random rotation axis for rotation failure per rollout")
+    parser.add_argument("--perturb_anti_gt_cos_thresh", type=float, default=0.6,
+                        help="Flip perturb dir only when cosine with GT trend exceeds this threshold (larger is looser)")
+    parser.add_argument("--perturb_reject_sampling_enable", type=str2bool, default=True,
+                        help="Enable rejection sampling for translation/rotation perturbation")
+    parser.add_argument("--perturb_reject_max_trials", type=int, default=4,
+                        help="Maximum rejection-sampling trials per rollout chunk")
+    parser.add_argument("--perturb_reject_min_delta", type=float, default=5e-4,
+                        help="Required minimum increase of terminal GT error to accept perturbation")
+    parser.add_argument("--perturb_reject_min_score", type=float, default=0.15,
+                        help="Minimum pose-level anti-GT score to accept a sampled direction before planner")
+    parser.add_argument("--perturb_reject_prefilter_pool", type=int, default=8,
+                        help="Number of cheap direction candidates before planner calls in reject sampling")
+    parser.add_argument("--perturb_reject_orient_weight", type=float, default=0.01,
+                        help="Orientation weight used by reject-sampling acceptance metric")
+    parser.add_argument("--perturb_reject_gripper_penalty", type=float, default=1.0,
+                        help="Gripper mismatch penalty used by reject-sampling acceptance metric")
+    parser.add_argument("--nearest_window_radius", type=int, default=32,
+                        help="Nearest-point matching window radius around expected progress index")
     parser.add_argument("--perturb_rot_axis_left", type=str, default="0,0,1",
                         help="3-dim axis for left-arm rotation failure")
     parser.add_argument("--perturb_rot_axis_right", type=str, default="0,0,1",
