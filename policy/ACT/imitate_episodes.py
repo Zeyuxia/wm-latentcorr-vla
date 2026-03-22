@@ -1412,7 +1412,7 @@ def main(args):
             'export_correction_dataset': args.get('export_correction_dataset', False),
             'export_correction_dir': args.get('export_correction_dir', ''),
         }
-        config['act_init_ckpt'] = args.get('act_init_ckpt')
+    config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
     print(f"[main][rank={_rank}] before train_bc | enable_wm={enable_wm}")
     train_bc(train_dataloader, val_dataloader, config)
@@ -2658,7 +2658,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     print(f"[train_bc][rank={_r} local_rank={_lr}] after make_policy | elapsed={time.time() - _t_make_policy:.2f}s")
 
     enable_wm = config['enable_wm_correction']
-    if enable_wm and config.get('act_init_ckpt'):
+    if config.get('act_init_ckpt'):
         print(f"[train_bc][rank={_r} local_rank={_lr}] before load_act_init_ckpt")
         _t_load_act = time.time()
         ckpt = torch.load(config['act_init_ckpt'], map_location='cpu')

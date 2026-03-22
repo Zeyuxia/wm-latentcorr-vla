@@ -67,7 +67,7 @@ vla_img_noise_std=0.0
 vla_qpos_noise_std=0.0
 
 # World-model correction options (set enable_wm=true to activate)
-enable_wm=true
+enable_wm=false
 evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
@@ -106,7 +106,7 @@ mkdir -p ${ckpt_dir}
 # Save a copy of this script for reproducibility
 cp "$0" ${ckpt_dir}/train.sh
 
-gpu_ids=0
+gpu_ids=4,5,6,7
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')
 
 if [ ${num_gpus} -gt 1 ]; then
@@ -150,6 +150,11 @@ if [ "${enable_wm}" = "true" ]; then
     if [ "${debug_wm}" = "true" ]; then
         wm_flags="${wm_flags} --debug_wm_correction"
     fi
+fi
+
+init_ckpt_flags=""
+if [ -n "${act_init_ckpt}" ]; then
+    init_ckpt_flags="--act_init_ckpt ${act_init_ckpt}"
 fi
 
 perturb_flags="--enable_perturb ${enable_perturb} \
@@ -214,7 +219,7 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     ${multi_gpu_flag} \
     --num_processes ${num_gpus} \
-    --main_process_port 29600 \
+    --main_process_port 29700 \
     imitate_episodes.py \
     --task_name sim-${task_name}-${task_config}-${expert_data_num} \
     --ckpt_dir ${ckpt_dir} \
@@ -229,5 +234,6 @@ CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     --save_freq 10 \
     --state_dim 14 \
     --seed ${seed} \
+    ${init_ckpt_flags} \
     ${perturb_flags} \
     ${wm_flags}
