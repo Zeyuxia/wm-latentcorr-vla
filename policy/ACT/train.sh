@@ -67,8 +67,9 @@ vla_img_noise_std=0.0
 vla_qpos_noise_std=0.0
 
 # World-model correction options (set enable_wm=true to activate)
-enable_wm=false
-evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+enable_wm=true
+# evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=5624-step=22500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -80,9 +81,14 @@ max_rollout_steps=2
 single_rollout_correction=true
 target_mode=backward
 target_lookahead_steps=6
+correction_interp_nearest_enable=true
+correction_interp_prefix_ratio=0.4
+correction_interp_smooth_enable=true
+correction_interp_smooth_steps=6
+correction_interp_smooth_passes=2
 rollout_exec_steps=16
 correction_freq=1
-correction_weight=1.0
+correction_weight=2.0
 orient_weight=0.01
 gripper_penalty=1.0
 always_correction=true
@@ -131,6 +137,11 @@ if [ "${enable_wm}" = "true" ]; then
     --single_rollout_correction ${single_rollout_correction} \
     --target_mode ${target_mode} \
     --target_lookahead_steps ${target_lookahead_steps} \
+    --correction_interp_nearest_enable ${correction_interp_nearest_enable} \
+    --correction_interp_prefix_ratio ${correction_interp_prefix_ratio} \
+    --correction_interp_smooth_enable ${correction_interp_smooth_enable} \
+    --correction_interp_smooth_steps ${correction_interp_smooth_steps} \
+    --correction_interp_smooth_passes ${correction_interp_smooth_passes} \
     --rollout_exec_steps ${rollout_exec_steps} \
     --correction_freq ${correction_freq} \
     --correction_weight ${correction_weight} \

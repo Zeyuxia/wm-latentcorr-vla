@@ -1340,6 +1340,11 @@ def main(args):
             'single_rollout_correction': args.get('single_rollout_correction', False),
             'target_mode': args.get('target_mode', 'forward'),
             'target_lookahead_steps': args.get('target_lookahead_steps', 0),
+            'correction_interp_nearest_enable': args.get('correction_interp_nearest_enable', False),
+            'correction_interp_prefix_ratio': args.get('correction_interp_prefix_ratio', 0.4),
+            'correction_interp_smooth_enable': args.get('correction_interp_smooth_enable', True),
+            'correction_interp_smooth_steps': args.get('correction_interp_smooth_steps', 3),
+            'correction_interp_smooth_passes': args.get('correction_interp_smooth_passes', 2),
             'rollout_exec_steps': int(rollout_exec_steps),
             'chunk_size': args['chunk_size'],
             'max_action_len': max_action_len,
@@ -1753,6 +1758,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     single_rollout_correction = bool(cfg.get('single_rollout_correction', False))
     target_mode = str(cfg.get('target_mode', 'forward')).strip().lower()
     target_lookahead_steps = int(cfg.get('target_lookahead_steps', 0))
+    correction_interp_nearest_enable = bool(cfg.get('correction_interp_nearest_enable', False))
+    correction_interp_prefix_ratio = float(np.clip(cfg.get('correction_interp_prefix_ratio', 0.4), 0.0, 1.0))
+    correction_interp_smooth_enable = bool(cfg.get('correction_interp_smooth_enable', True))
+    correction_interp_smooth_steps = int(max(0, cfg.get('correction_interp_smooth_steps', 3)))
+    correction_interp_smooth_passes = int(max(1, cfg.get('correction_interp_smooth_passes', 2)))
     chunk_size = cfg['chunk_size']
     rollout_exec_steps = int(cfg.get('rollout_exec_steps', chunk_size))
     max_action_len = cfg['max_action_len']
@@ -1998,74 +2008,170 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                            'threshold': threshold, 'rollout': _dbg_rollout}, _f, indent=2)
         return None
 
-    import sapien
-    if target_mode == 'backward':
-        t_target = int(np.clip(t_star - target_lookahead_steps, 0, len(left_ep) - 1))
+    if correction_interp_nearest_enable:
+        t_target = int(np.clip(t_star, 0, len(left_ep) - 1))
     else:
-        t_target = int(np.clip(t_star + target_lookahead_steps, 0, len(left_ep) - 1))
-    target_lp = sapien.Pose(left_ep[t_target, :3], left_ep[t_target, 3:7])
-    target_rp = sapien.Pose(right_ep[t_target, :3], right_ep[t_target, 3:7])
-    qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
-    qpos_full[fk.fl_idx] = left_q
-    qpos_full[fk.fr_idx] = right_q
+        if target_mode == 'backward':
+            t_target = int(np.clip(t_star - target_lookahead_steps, 0, len(left_ep) - 1))
+        else:
+            t_target = int(np.clip(t_star + target_lookahead_steps, 0, len(left_ep) - 1))
+
+    gt_left_arm = raw_data.get('gt_left_arm', None)
+    gt_right_arm = raw_data.get('gt_right_arm', None)
 
     res_l = {'status': 'SkippedInactive', 'position': np.repeat(np.asarray(left_q, dtype=np.float32)[None, :], 1, axis=0)}
     res_r = {'status': 'SkippedInactive', 'position': np.repeat(np.asarray(right_q, dtype=np.float32)[None, :], 1, axis=0)}
-    if corr_left_active:
-        try:
-            res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag='left')
-        except Exception as exc:
-            if debug_dir is not None:
-                import json
-                _dbg_corr = os.path.join(debug_dir, 'correction')
-                os.makedirs(_dbg_corr, exist_ok=True)
-                with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
-                    json.dump({
-                        'reason': 'planner_exception_left',
-                        'error': str(exc),
-                        't_star': int(t_star),
-                        'min_dist': float(min_dist),
-                        'rollout': _dbg_rollout,
-                    }, _f, indent=2)
-            return None
-    if corr_right_active:
-        try:
-            res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag='right')
-        except Exception as exc:
-            if debug_dir is not None:
-                import json
-                _dbg_corr = os.path.join(debug_dir, 'correction')
-                os.makedirs(_dbg_corr, exist_ok=True)
-                with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
-                    json.dump({
-                        'reason': 'planner_exception_right',
-                        'error': str(exc),
-                        't_star': int(t_star),
-                        'min_dist': float(min_dist),
-                        'rollout': _dbg_rollout,
-                    }, _f, indent=2)
-            return None
-    if (corr_left_active and res_l.get('status') != 'Success') or (corr_right_active and res_r.get('status') != 'Success'):
-        if debug_dir is not None:
-            import json
-            _dbg_corr = os.path.join(debug_dir, 'correction')
-            os.makedirs(_dbg_corr, exist_ok=True)
-            with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
-                json.dump({
-                    'reason': 'planner_status_fail',
-                    'planner_left_status': res_l.get('status'),
-                    'planner_right_status': res_r.get('status'),
-                    't_star': int(t_star),
-                    'min_dist': float(min_dist),
-                    'rollout': _dbg_rollout,
-                }, _f, indent=2)
-        return None
+    if correction_interp_nearest_enable:
+        prefix_len = int(np.clip(np.floor(chunk_size * correction_interp_prefix_ratio), 1, max(1, chunk_size - 1)))
 
-    l_path = np.asarray(res_l['position'], dtype=np.float32)
-    r_path = np.asarray(res_r['position'], dtype=np.float32)
-    l_future = l_path[1:] if l_path.shape[0] > 1 else l_path
-    r_future = r_path[1:] if r_path.shape[0] > 1 else r_path
-    prefix_len = int(max(1, l_future.shape[0], r_future.shape[0]))
+        def _interp_prefix(curr, target, n):
+            curr = np.asarray(curr, dtype=np.float32)
+            target = np.asarray(target, dtype=np.float32)
+            if n <= 1:
+                return target[None, :].astype(np.float32)
+            alpha = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+            return ((1.0 - alpha) * curr[None, :] + alpha * target[None, :]).astype(np.float32)
+
+        def _take_tail(gt_seq, start_idx, n, fallback):
+            if n <= 0:
+                return np.zeros((0,) + np.asarray(fallback).shape, dtype=np.float32)
+            if gt_seq is None:
+                return np.repeat(np.asarray(fallback, dtype=np.float32)[None, ...], n, axis=0)
+            g = np.asarray(gt_seq, dtype=np.float32)
+            if g.ndim == 1:
+                g = g[:, None]
+            s = int(np.clip(start_idx, 0, max(0, g.shape[0])))
+            tail = g[s:s + n]
+            if tail.shape[0] >= n:
+                return tail.astype(np.float32)
+            last = np.asarray(fallback, dtype=np.float32)
+            if tail.shape[0] > 0:
+                last = tail[-1]
+            pad = np.repeat(last[None, ...], n - tail.shape[0], axis=0).astype(np.float32)
+            if tail.shape[0] == 0:
+                return pad
+            return np.concatenate([tail.astype(np.float32), pad], axis=0).astype(np.float32)
+
+        suffix_len = int(max(0, chunk_size - prefix_len))
+        tgt_abs = int(start_ts + t_target)
+        l_tgt_q = np.asarray(left_q, dtype=np.float32) if gt_left_arm is None else np.asarray(gt_left_arm[tgt_abs], dtype=np.float32)
+        r_tgt_q = np.asarray(right_q, dtype=np.float32) if gt_right_arm is None else np.asarray(gt_right_arm[tgt_abs], dtype=np.float32)
+        l_prefix = _interp_prefix(left_q, l_tgt_q, prefix_len)
+        r_prefix = _interp_prefix(right_q, r_tgt_q, prefix_len)
+        l_tail = _take_tail(gt_left_arm, tgt_abs + 1, suffix_len, l_tgt_q)
+        r_tail = _take_tail(gt_right_arm, tgt_abs + 1, suffix_len, r_tgt_q)
+        lt = np.concatenate([l_prefix, l_tail], axis=0).astype(np.float32)
+        rt = np.concatenate([r_prefix, r_tail], axis=0).astype(np.float32)
+
+        tl_grip = float(np.clip(left_grip_traj[t_target], 0.0, 1.0))
+        tr_grip = float(np.clip(right_grip_traj[t_target], 0.0, 1.0))
+        if prefix_len <= 1:
+            l_grip_prefix = np.array([tl_grip], dtype=np.float32)
+            r_grip_prefix = np.array([tr_grip], dtype=np.float32)
+        else:
+            l_grip_prefix = np.linspace(float(left_grip), tl_grip, prefix_len, dtype=np.float32)
+            r_grip_prefix = np.linspace(float(right_grip), tr_grip, prefix_len, dtype=np.float32)
+        l_grip_tail = _take_tail(left_grip_traj, t_target + 1, suffix_len, np.array([tl_grip], dtype=np.float32))[:, 0]
+        r_grip_tail = _take_tail(right_grip_traj, t_target + 1, suffix_len, np.array([tr_grip], dtype=np.float32))[:, 0]
+        lg = np.concatenate([l_grip_prefix, l_grip_tail], axis=0).astype(np.float32)
+        rg = np.concatenate([r_grip_prefix, r_grip_tail], axis=0).astype(np.float32)
+
+        if correction_interp_smooth_enable and correction_interp_smooth_steps > 0 and prefix_len < chunk_size:
+            def _smooth_splice(seq, split_idx, k):
+                x = np.asarray(seq, dtype=np.float32).copy()
+                n = x.shape[0]
+                if split_idx <= 0 or split_idx >= n or k <= 0:
+                    return x
+                if x.ndim == 1:
+                    x = x[:, None]
+                    squeeze_back = True
+                else:
+                    squeeze_back = False
+                # Stronger local smoothing around splice: low-pass in a local window.
+                i_start = int(max(0, split_idx - k))
+                i_end_ex = int(min(n, split_idx + k))
+                if i_end_ex - i_start < 3:
+                    return x[:, 0] if squeeze_back else x
+                for _ in range(correction_interp_smooth_passes):
+                    seg = x[i_start:i_end_ex]
+                    seg_pad = np.concatenate([seg[:1], seg, seg[-1:]], axis=0)
+                    seg_s = (seg_pad[:-2] + 2.0 * seg_pad[1:-1] + seg_pad[2:]) * 0.25
+                    x[i_start:i_end_ex] = seg_s
+
+                if squeeze_back:
+                    return x[:, 0]
+                return x
+
+            lt = _smooth_splice(lt, prefix_len, correction_interp_smooth_steps)
+            rt = _smooth_splice(rt, prefix_len, correction_interp_smooth_steps)
+            lg = _smooth_splice(lg, prefix_len, correction_interp_smooth_steps)
+            rg = _smooth_splice(rg, prefix_len, correction_interp_smooth_steps)
+
+        res_l = {'status': 'BypassInterpNearest', 'position': np.stack([np.asarray(left_q, dtype=np.float32), l_tgt_q], axis=0)}
+        res_r = {'status': 'BypassInterpNearest', 'position': np.stack([np.asarray(right_q, dtype=np.float32), r_tgt_q], axis=0)}
+    else:
+        import sapien
+        target_lp = sapien.Pose(left_ep[t_target, :3], left_ep[t_target, 3:7])
+        target_rp = sapien.Pose(right_ep[t_target, :3], right_ep[t_target, 3:7])
+        qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
+        qpos_full[fk.fl_idx] = left_q
+        qpos_full[fk.fr_idx] = right_q
+
+        if corr_left_active:
+            try:
+                res_l = planner_l.plan_path(qpos_full, target_lp, arms_tag='left')
+            except Exception as exc:
+                if debug_dir is not None:
+                    import json
+                    _dbg_corr = os.path.join(debug_dir, 'correction')
+                    os.makedirs(_dbg_corr, exist_ok=True)
+                    with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                        json.dump({
+                            'reason': 'planner_exception_left',
+                            'error': str(exc),
+                            't_star': int(t_star),
+                            'min_dist': float(min_dist),
+                            'rollout': _dbg_rollout,
+                        }, _f, indent=2)
+                return None
+        if corr_right_active:
+            try:
+                res_r = planner_r.plan_path(qpos_full, target_rp, arms_tag='right')
+            except Exception as exc:
+                if debug_dir is not None:
+                    import json
+                    _dbg_corr = os.path.join(debug_dir, 'correction')
+                    os.makedirs(_dbg_corr, exist_ok=True)
+                    with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                        json.dump({
+                            'reason': 'planner_exception_right',
+                            'error': str(exc),
+                            't_star': int(t_star),
+                            'min_dist': float(min_dist),
+                            'rollout': _dbg_rollout,
+                        }, _f, indent=2)
+                return None
+        if (corr_left_active and res_l.get('status') != 'Success') or (corr_right_active and res_r.get('status') != 'Success'):
+            if debug_dir is not None:
+                import json
+                _dbg_corr = os.path.join(debug_dir, 'correction')
+                os.makedirs(_dbg_corr, exist_ok=True)
+                with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
+                    json.dump({
+                        'reason': 'planner_status_fail',
+                        'planner_left_status': res_l.get('status'),
+                        'planner_right_status': res_r.get('status'),
+                        't_star': int(t_star),
+                        'min_dist': float(min_dist),
+                        'rollout': _dbg_rollout,
+                    }, _f, indent=2)
+            return None
+
+        l_path = np.asarray(res_l['position'], dtype=np.float32)
+        r_path = np.asarray(res_r['position'], dtype=np.float32)
+        l_future = l_path[1:] if l_path.shape[0] > 1 else l_path
+        r_future = r_path[1:] if r_path.shape[0] > 1 else r_path
+        prefix_len = int(max(1, l_future.shape[0], r_future.shape[0]))
 
     def _fit_prefix(path_future, curr_q, n):
         p = np.asarray(path_future, dtype=np.float32)
@@ -2093,40 +2199,39 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         pad = np.repeat(cat[-1:].astype(np.float32), out_len - cat.shape[0], axis=0)
         return np.concatenate([cat, pad], axis=0).astype(np.float32)
 
-    l_prefix = _fit_prefix(l_future, left_q, prefix_len)
-    r_prefix = _fit_prefix(r_future, right_q, prefix_len)
+    if not correction_interp_nearest_enable:
+        l_prefix = _fit_prefix(l_future, left_q, prefix_len)
+        r_prefix = _fit_prefix(r_future, right_q, prefix_len)
 
-    gt_left_arm = raw_data.get('gt_left_arm', None)
-    gt_right_arm = raw_data.get('gt_right_arm', None)
-    l_tail = None
-    r_tail = None
-    if gt_left_arm is not None and corr_left_active:
-        l_tail = np.asarray(gt_left_arm[start_ts + t_target + 1:], dtype=np.float32)
-    if gt_right_arm is not None and corr_right_active:
-        r_tail = np.asarray(gt_right_arm[start_ts + t_target + 1:], dtype=np.float32)
+        l_tail = None
+        r_tail = None
+        if gt_left_arm is not None and corr_left_active:
+            l_tail = np.asarray(gt_left_arm[start_ts + t_target + 1:], dtype=np.float32)
+        if gt_right_arm is not None and corr_right_active:
+            r_tail = np.asarray(gt_right_arm[start_ts + t_target + 1:], dtype=np.float32)
 
-    lt = _compose_with_gt_tail(l_prefix, l_tail, chunk_size)
-    rt = _compose_with_gt_tail(r_prefix, r_tail, chunk_size)
+        lt = _compose_with_gt_tail(l_prefix, l_tail, chunk_size)
+        rt = _compose_with_gt_tail(r_prefix, r_tail, chunk_size)
 
-    tl_grip = float(np.clip(left_grip_traj[t_target], 0.0, 1.0))
-    tr_grip = float(np.clip(right_grip_traj[t_target], 0.0, 1.0))
+        tl_grip = float(np.clip(left_grip_traj[t_target], 0.0, 1.0))
+        tr_grip = float(np.clip(right_grip_traj[t_target], 0.0, 1.0))
 
-    # Prefix gripper profile: hold current value first, then change near the end.
-    switch_ratio = float(np.clip(cfg.get('correction_gripper_switch_ratio', 0.8), 0.0, 1.0))
-    switch_idx = int(np.clip(np.floor(prefix_len * switch_ratio), 0, max(0, prefix_len - 1)))
-    l_grip_prefix = np.full((prefix_len,), float(left_grip), dtype=np.float32)
-    r_grip_prefix = np.full((prefix_len,), float(right_grip), dtype=np.float32)
-    tail_len = prefix_len - switch_idx
-    if tail_len > 1:
-        l_grip_prefix[switch_idx:] = np.linspace(float(left_grip), tl_grip, tail_len, dtype=np.float32)
-        r_grip_prefix[switch_idx:] = np.linspace(float(right_grip), tr_grip, tail_len, dtype=np.float32)
-    elif tail_len == 1:
-        l_grip_prefix[-1] = tl_grip
-        r_grip_prefix[-1] = tr_grip
-    l_grip_tail = np.asarray(left_grip_traj[t_target + 1:], dtype=np.float32) if corr_left_active else np.asarray([], dtype=np.float32)
-    r_grip_tail = np.asarray(right_grip_traj[t_target + 1:], dtype=np.float32) if corr_right_active else np.asarray([], dtype=np.float32)
-    lg = _compose_with_gt_tail(l_grip_prefix[:, None], l_grip_tail[:, None], chunk_size)[:, 0]
-    rg = _compose_with_gt_tail(r_grip_prefix[:, None], r_grip_tail[:, None], chunk_size)[:, 0]
+        # Prefix gripper profile: hold current value first, then change near the end.
+        switch_ratio = float(np.clip(cfg.get('correction_gripper_switch_ratio', 0.8), 0.0, 1.0))
+        switch_idx = int(np.clip(np.floor(prefix_len * switch_ratio), 0, max(0, prefix_len - 1)))
+        l_grip_prefix = np.full((prefix_len,), float(left_grip), dtype=np.float32)
+        r_grip_prefix = np.full((prefix_len,), float(right_grip), dtype=np.float32)
+        tail_len = prefix_len - switch_idx
+        if tail_len > 1:
+            l_grip_prefix[switch_idx:] = np.linspace(float(left_grip), tl_grip, tail_len, dtype=np.float32)
+            r_grip_prefix[switch_idx:] = np.linspace(float(right_grip), tr_grip, tail_len, dtype=np.float32)
+        elif tail_len == 1:
+            l_grip_prefix[-1] = tl_grip
+            r_grip_prefix[-1] = tr_grip
+        l_grip_tail = np.asarray(left_grip_traj[t_target + 1:], dtype=np.float32) if corr_left_active else np.asarray([], dtype=np.float32)
+        r_grip_tail = np.asarray(right_grip_traj[t_target + 1:], dtype=np.float32) if corr_right_active else np.asarray([], dtype=np.float32)
+        lg = _compose_with_gt_tail(l_grip_prefix[:, None], l_grip_tail[:, None], chunk_size)[:, 0]
+        rg = _compose_with_gt_tail(r_grip_prefix[:, None], r_grip_tail[:, None], chunk_size)[:, 0]
     if not corr_left_active:
         lt = np.repeat(np.asarray(left_q, dtype=np.float32)[None, :], chunk_size, axis=0)
         lg = np.full((chunk_size,), float(left_grip), dtype=np.float32)
@@ -2413,6 +2518,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             't_star': int(t_star), 'min_dist': float(min_dist),
             'target_mode': target_mode,
             't_target': int(t_target), 'target_lookahead_steps': int(target_lookahead_steps),
+            'correction_interp_nearest_enable': bool(correction_interp_nearest_enable),
+            'correction_interp_prefix_ratio': float(correction_interp_prefix_ratio),
+            'correction_interp_smooth_enable': bool(correction_interp_smooth_enable),
+            'correction_interp_smooth_steps': int(correction_interp_smooth_steps),
+            'correction_interp_smooth_passes': int(correction_interp_smooth_passes),
             'threshold': threshold,
             'nearest_mode': nearest_mode,
             'nearest_gripper_penalty_used': float(nearest_gripper_penalty),
@@ -3110,6 +3220,16 @@ if __name__ == "__main__":
                         help="Correction target mode: forward or backward")
     parser.add_argument("--target_lookahead_steps", type=int, default=0,
                         help="Correction target lookahead steps from nearest t_star on expert trajectory")
+    parser.add_argument("--correction_interp_nearest_enable", type=str2bool, default=False,
+                        help="If true, set correction target to nearest point t_star and bypass planner with interpolation+GT tail")
+    parser.add_argument("--correction_interp_prefix_ratio", type=float, default=0.4,
+                        help="Prefix ratio for interpolation when correction_interp_nearest_enable=true (e.g., 0.4 means 2/5 chunk)")
+    parser.add_argument("--correction_interp_smooth_enable", type=str2bool, default=True,
+                        help="Enable local smoothing near interpolation/GT splice when correction_interp_nearest_enable=true")
+    parser.add_argument("--correction_interp_smooth_steps", type=int, default=3,
+                        help="Number of steps after splice to smooth when correction_interp_nearest_enable=true")
+    parser.add_argument("--correction_interp_smooth_passes", type=int, default=2,
+                        help="Number of local low-pass passes near splice when correction_interp_nearest_enable=true")
     parser.add_argument("--rollout_exec_steps", type=int, default=None,
                         help="Number of actions executed per rollout step (prefix of chunk)")
     parser.add_argument("--correction_freq", type=int,
