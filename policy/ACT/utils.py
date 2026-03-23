@@ -12,7 +12,7 @@ e = IPython.embed
 class EpisodicDataset(torch.utils.data.Dataset):
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
-                 raw_data_dir=None, start_margin=0):
+                 raw_data_dir=None, start_margin=0, sample_skip_head=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -21,6 +21,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.max_action_len = max_action_len
         self.raw_data_dir = raw_data_dir
         self.start_margin = max(0, int(start_margin))
+        self.sample_skip_head = max(0, int(sample_skip_head))
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
@@ -42,7 +43,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 # Avoid sampling too close to episode end so rollout/correction
                 # still has enough future horizon.
                 max_start = max(0, episode_len - 1 - self.start_margin)
-                start_ts = np.random.randint(0, max_start + 1)
+                min_start = min(max_start, self.sample_skip_head)
+                start_ts = np.random.randint(min_start, max_start + 1)
             # get observation at start_ts only
             qpos = root["/observations/qpos"][start_ts]
             image_dict = dict()
@@ -143,7 +145,7 @@ def get_norm_stats(dataset_dir, num_episodes):
 
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-              raw_data_dir=None, start_margin=0):
+              raw_data_dir=None, start_margin=0, sample_skip_head=0):
     print(f"\nData from: {dataset_dir}\n")
     # use all episodes for training
     train_indices = list(range(num_episodes))
@@ -153,7 +155,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
-                                    raw_data_dir=raw_data_dir, start_margin=start_margin)
+                                    raw_data_dir=raw_data_dir, start_margin=start_margin,
+                                    sample_skip_head=sample_skip_head)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,

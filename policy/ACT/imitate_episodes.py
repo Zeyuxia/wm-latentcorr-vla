@@ -1300,6 +1300,7 @@ def main(args):
     rot_axis_left_vec = _parse_vec3(args.get("perturb_rot_axis_left", ""))
     rot_axis_right_vec = _parse_vec3(args.get("perturb_rot_axis_right", ""))
     start_margin = 0
+    sample_skip_head = int(max(0, args.get('sample_skip_head', 0)))
     if enable_wm:
         wm_required = ['evac_ckpt', 'evac_config', 'urdf_path', 'curobo_left_yml',
                         'curobo_right_yml', 'raw_data_dir', 'act_init_ckpt',
@@ -1315,7 +1316,8 @@ def main(args):
     train_dataloader, val_dataloader, stats, _, max_action_len = load_data(dataset_dir, num_episodes, camera_names,
                                                                           batch_size_train, batch_size_val,
                                                                           raw_data_dir=raw_data_dir,
-                                                                          start_margin=start_margin)
+                                                                          start_margin=start_margin,
+                                                                          sample_skip_head=sample_skip_head)
     print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
 
     # save dataset stats
@@ -1340,6 +1342,18 @@ def main(args):
             'single_rollout_correction': args.get('single_rollout_correction', False),
             'target_mode': args.get('target_mode', 'forward'),
             'target_lookahead_steps': args.get('target_lookahead_steps', 0),
+            'closed_loop_action_trigger_enable': args.get('closed_loop_action_trigger_enable', False),
+            'closed_loop_action_threshold': args.get('closed_loop_action_threshold', 0.2),
+            'closed_loop_action_gripper_weight': args.get('closed_loop_action_gripper_weight', 1.0),
+            'closed_loop_action_dist_mode': args.get('closed_loop_action_dist_mode', 'mean_chunk'),
+            'closed_loop_action_last_k': args.get('closed_loop_action_last_k', 4),
+            'closed_loop_max_rollouts': args.get('closed_loop_max_rollouts', 3),
+            'closed_loop_fallback_force_correction': args.get('closed_loop_fallback_force_correction', True),
+            'min_dist_fallback_force_correction': args.get('min_dist_fallback_force_correction', False),
+            'min_dist_trigger_use_delta': args.get('min_dist_trigger_use_delta', False),
+            'min_dist_recover_use_added': args.get('min_dist_recover_use_added', True),
+            'min_dist_recover_ratio': args.get('min_dist_recover_ratio', 0.5),
+            'debug_recover_eval_rollout': args.get('debug_recover_eval_rollout', False),
             'correction_interp_nearest_enable': args.get('correction_interp_nearest_enable', False),
             'correction_interp_prefix_ratio': args.get('correction_interp_prefix_ratio', 0.4),
             'correction_interp_smooth_enable': args.get('correction_interp_smooth_enable', True),
@@ -1731,6 +1745,39 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
         )
         torch.cuda.empty_cache()
 
+    # Debug continuity helpers: keep explicit input frame and stitched video
+    # whose first frame is input_frame.png, followed by model outputs.mp4.
+    if save_dir is not None:
+        try:
+            inp_rgb = np.clip((img_rgb.permute(1, 2, 0).cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
+            inp_bgr = inp_rgb[:, :, ::-1].copy()
+            cv2.imwrite(os.path.join(target_dir, 'input_frame.png'), inp_bgr)
+            out_mp4 = os.path.join(target_dir, 'outputs.mp4')
+            if os.path.isfile(out_mp4):
+                cap = cv2.VideoCapture(out_mp4)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps is None or fps <= 1e-3:
+                    fps = 30.0
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if w > 0 and h > 0:
+                    inp0 = inp_bgr if (inp_bgr.shape[1] == w and inp_bgr.shape[0] == h) else cv2.resize(
+                        inp_bgr, (w, h), interpolation=cv2.INTER_LINEAR
+                    )
+                    out_with_in = os.path.join(target_dir, 'outputs_with_input.mp4')
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    vw = cv2.VideoWriter(out_with_in, fourcc, float(fps), (w, h))
+                    vw.write(inp0)
+                    while True:
+                        ok, fr = cap.read()
+                        if not ok:
+                            break
+                        vw.write(fr)
+                    vw.release()
+                cap.release()
+        except Exception:
+            pass
+
     if tmp_dir is not None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1755,6 +1802,18 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     threshold = cfg['threshold']
     always_correction = bool(cfg.get('always_correction', False))
     max_steps = cfg['max_rollout_steps']
+    closed_loop_action_trigger_enable = bool(cfg.get('closed_loop_action_trigger_enable', False))
+    closed_loop_action_threshold = float(cfg.get('closed_loop_action_threshold', 0.2))
+    closed_loop_action_gripper_weight = float(cfg.get('closed_loop_action_gripper_weight', 1.0))
+    closed_loop_action_dist_mode = str(cfg.get('closed_loop_action_dist_mode', 'mean_chunk')).strip().lower()
+    closed_loop_action_last_k = int(max(1, cfg.get('closed_loop_action_last_k', 4)))
+    closed_loop_max_rollouts = int(max(1, cfg.get('closed_loop_max_rollouts', 3)))
+    closed_loop_fallback_force_correction = bool(cfg.get('closed_loop_fallback_force_correction', True))
+    min_dist_fallback_force_correction = bool(cfg.get('min_dist_fallback_force_correction', False))
+    min_dist_trigger_use_delta = bool(cfg.get('min_dist_trigger_use_delta', False))
+    min_dist_recover_use_added = bool(cfg.get('min_dist_recover_use_added', True))
+    min_dist_recover_ratio = float(cfg.get('min_dist_recover_ratio', 0.5))
+    debug_recover_eval_rollout = bool(cfg.get('debug_recover_eval_rollout', False))
     single_rollout_correction = bool(cfg.get('single_rollout_correction', False))
     target_mode = str(cfg.get('target_mode', 'forward')).strip().lower()
     target_lookahead_steps = int(cfg.get('target_lookahead_steps', 0))
@@ -1787,27 +1846,116 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     _dbg_rollout = []  # collect per-step debug info
     dyn_state = None
     rollout_steps_total = 0
+    evac_rollout_videos = []
+    evac_recover_eval_videos = []
+    action_triggered = False
+    action_trigger_step = None
+    action_trigger_dist = None
+    min_dist_triggered = False
+    min_dist_trigger_step = None
+    min_dist_trigger_dist = None
+    pending_recover_valid = False
+    pending_recover_added = 0.0
+    pending_recover_from_step = None
+    force_generate_correction = False
 
-    for step in range(max_steps):
+    gt_left_arm_full = raw_data.get('gt_left_arm', None)
+    gt_right_arm_full = raw_data.get('gt_right_arm', None)
+    gt_left_grip_full = raw_data.get('left_gripper', None)
+    gt_right_grip_full = raw_data.get('right_gripper', None)
+
+    def _build_gt_action_chunk(abs_start_idx, n_step, fallback_action):
+        n_step = int(max(1, n_step))
+        gt = np.zeros((n_step, 14), dtype=np.float32)
+        fb = np.asarray(fallback_action, dtype=np.float32)
+        for t in range(n_step):
+            gi = int(np.clip(abs_start_idx + t, 0, max(0, raw_data['left_endpose'].shape[0] - 1)))
+            if gt_left_arm_full is not None:
+                gt[t, 0:6] = np.asarray(gt_left_arm_full[gi], dtype=np.float32)
+            else:
+                gt[t, 0:6] = fb[0:6]
+            if gt_right_arm_full is not None:
+                gt[t, 7:13] = np.asarray(gt_right_arm_full[gi], dtype=np.float32)
+            else:
+                gt[t, 7:13] = fb[7:13]
+            if gt_left_grip_full is not None:
+                gt[t, 6] = float(np.clip(gt_left_grip_full[gi], 0.0, 1.0))
+            else:
+                gt[t, 6] = float(np.clip(fb[6], 0.0, 1.0))
+            if gt_right_grip_full is not None:
+                gt[t, 13] = float(np.clip(gt_right_grip_full[gi], 0.0, 1.0))
+            else:
+                gt[t, 13] = float(np.clip(fb[13], 0.0, 1.0))
+        return gt
+
+    def _action_chunk_dist(pred_chunk, gt_chunk, gripper_w=1.0, mode='mean_chunk', last_k=4):
+        p = np.asarray(pred_chunk, dtype=np.float32)
+        g = np.asarray(gt_chunk, dtype=np.float32)
+        if p.shape != g.shape:
+            m = min(len(p), len(g))
+            p = p[:m]
+            g = g[:m]
+        if p.shape[0] == 0:
+            return 0.0
+        d_l = np.linalg.norm(p[:, 0:6] - g[:, 0:6], axis=1)
+        d_r = np.linalg.norm(p[:, 7:13] - g[:, 7:13], axis=1)
+        d_g = np.abs(p[:, 6] - g[:, 6]) + np.abs(p[:, 13] - g[:, 13])
+        d = d_l + d_r + float(gripper_w) * d_g
+        if mode == 'last':
+            return float(d[-1])
+        if mode == 'last_k':
+            k = int(max(1, min(int(last_k), d.shape[0])))
+            return float(np.mean(d[-k:]))
+        return float(np.mean(d))
+
+    def _nearest_with_window(lp, lq, rp, rq, expected_idx, gp):
+        near_w = int(max(1, cfg.get('nearest_window_radius', 32)))
+        expected_idx = int(np.clip(expected_idx, 0, len(left_ep) - 1))
+        return find_nearest_traj_point(
+            lp, lq, rp, rq, left_ep, right_ep, orient_weight,
+            curr_left_grip=left_grip, curr_right_grip=right_grip,
+            left_gripper_traj=left_grip_traj, right_gripper_traj=right_grip_traj,
+            gripper_penalty=gp,
+            window_start=max(0, expected_idx - near_w),
+            window_end=min(len(left_ep), expected_idx + near_w + 1),
+        )
+
+    max_steps_eff = closed_loop_max_rollouts if closed_loop_action_trigger_enable else max_steps
+
+    for step in range(max_steps_eff):
+        step_role = 'recover_eval+perturb' if (min_dist_trigger_use_delta and pending_recover_valid) else 'perturb'
+        recovery_pair_step = pending_recover_from_step
+        evac_debug_dir = os.path.join(debug_dir, 'evac', f'rollout_step_{step:03d}') if debug_dir else None
         left_q, right_q = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
         left_grip, right_grip = curr_qpos_raw[6], curr_qpos_raw[13]
         fk_r = fk.forward(left_q, right_q)
         lp, lq = fk_r['left']
         rp, rq = fk_r['right']
-        if step == 0:
+        if step == 0 and (not min_dist_trigger_use_delta):
             # Strictly align the first rollout step with start_ts slice origin.
             t_star, min_dist = 0, 0.0
         else:
-            near_w = int(max(1, cfg.get('nearest_window_radius', 32)))
             expected_idx = int(np.clip(rollout_steps_total, 0, len(left_ep) - 1))
-            t_star, min_dist = find_nearest_traj_point(
-                lp, lq, rp, rq, left_ep, right_ep, orient_weight,
-                curr_left_grip=left_grip, curr_right_grip=right_grip,
-                left_gripper_traj=left_grip_traj, right_gripper_traj=right_grip_traj,
-                gripper_penalty=gripper_penalty,
-                window_start=max(0, expected_idx - near_w),
-                window_end=min(len(left_ep), expected_idx + near_w + 1))
-        if min_dist >= threshold:
+            t_star, min_dist = _nearest_with_window(lp, lq, rp, rq, expected_idx, gripper_penalty)
+        min_dist_start = float(min_dist)
+        min_dist_end = None
+        min_dist_delta = None
+        min_dist_recover_gain = None
+        min_dist_recover_threshold = None
+        min_dist_recover_eval_end = None
+        if (not closed_loop_action_trigger_enable) and (not min_dist_trigger_use_delta) and (min_dist >= threshold):
+            min_dist_triggered = True
+            min_dist_trigger_step = int(step)
+            min_dist_trigger_dist = float(min_dist)
+            if debug_dir is not None:
+                _dbg_rollout.append({
+                    'step': int(step),
+                    't_star': int(t_star),
+                    'min_dist': float(min_dist),
+                    'min_dist_threshold': float(threshold),
+                    'min_dist_triggered': True,
+                    'reason': 'min_dist_threshold',
+                })
             break
         if t_star >= len(left_ep) - 2:
             if debug_dir is not None:
@@ -1845,6 +1993,106 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # Rollout executes a short online horizon; keep this aligned with rollout_exec_steps.
         exec_len = int(np.clip(rollout_exec_steps, 1, max(1, act_raw.shape[0])))
         act_raw = act_raw[:exec_len].copy()
+        act_pred_raw = act_raw.copy()
+
+        # Recovery is evaluated by THIS step's raw (non-perturbed) VLA action, for the
+        # previous perturb step. After evaluation passes, this step still gets perturbed
+        # and executed to generate the next perturb state.
+        if (not closed_loop_action_trigger_enable) and min_dist_trigger_use_delta and pending_recover_valid:
+            q_eval_end = np.asarray(act_pred_raw[-1], dtype=np.float32)
+            fk_eval = fk.forward(q_eval_end[0:6], q_eval_end[7:13])
+            lp_ev, lq_ev = fk_eval['left']
+            rp_ev, rq_ev = fk_eval['right']
+            _, min_dist_recover_eval_end = _nearest_with_window(
+                lp_ev, lq_ev, rp_ev, rq_ev,
+                int(np.clip(rollout_steps_total + int(exec_len), 0, len(left_ep) - 1)),
+                gripper_penalty,
+            )
+            if debug_recover_eval_rollout and evac_debug_dir is not None:
+                fk_poses_eval = [(lp.copy(), lq.copy(), rp.copy(), rq.copy())]
+                grip_list_eval = [(left_grip, right_grip)]
+                for ai in range(len(act_pred_raw)):
+                    ar = act_pred_raw[ai]
+                    fr = fk.forward(ar[0:6], ar[7:13])
+                    fk_poses_eval.append((fr['left'][0].copy(), fr['left'][1].copy(),
+                                          fr['right'][0].copy(), fr['right'][1].copy()))
+                    grip_list_eval.append((ar[6], ar[13]))
+                evac_eval_debug_dir = os.path.join(evac_debug_dir, 'recover_eval_raw')
+                _ = evac_inference(
+                    evac_model,
+                    evac_cfg,
+                    curr_image[0],
+                    fk_poses_eval,
+                    grip_list_eval,
+                    raw_data,
+                    device,
+                    save_dir=evac_eval_debug_dir,
+                    infer_kwargs=cfg.get('evac_infer_kwargs'),
+                )
+                _vpath_eval = os.path.join(evac_eval_debug_dir, 'outputs.mp4')
+                evac_recover_eval_videos.append({
+                    'step': int(step),
+                    'path': _vpath_eval,
+                    'exists': bool(os.path.exists(_vpath_eval)),
+                })
+            min_dist_recover_gain = float(min_dist_start - float(min_dist_recover_eval_end))
+            if min_dist_recover_use_added:
+                min_dist_recover_threshold = float(max(0.0, pending_recover_added) * max(0.0, min_dist_recover_ratio))
+            else:
+                min_dist_recover_threshold = float(threshold)
+            if min_dist_recover_gain < float(min_dist_recover_threshold):
+                min_dist_triggered = True
+                min_dist_trigger_step = int(step)
+                min_dist_trigger_dist = float(min_dist_recover_gain)
+                if debug_dir is not None:
+                    _dbg_rollout.append({
+                        'step': int(step),
+                        'step_role': step_role,
+                        'paired_perturb_step': (None if recovery_pair_step is None else int(recovery_pair_step)),
+                        't_star': int(t_star),
+                        'min_dist_start': float(min_dist_start),
+                        'min_dist_recover_eval_end': float(min_dist_recover_eval_end),
+                        'min_dist_recover_gain': float(min_dist_recover_gain),
+                        'min_dist_recover_threshold': float(min_dist_recover_threshold),
+                        'min_dist_triggered': True,
+                        'reason': 'min_dist_recovery_insufficient',
+                    })
+                break
+            pending_recover_valid = False
+            pending_recover_added = 0.0
+            pending_recover_from_step = None
+
+        action_dist = None
+        if closed_loop_action_trigger_enable:
+            gt_chunk = _build_gt_action_chunk(
+                abs_start_idx=int(start_ts + int(t_star)),
+                n_step=int(exec_len),
+                fallback_action=curr_qpos_raw,
+            )
+            action_dist = _action_chunk_dist(
+                act_pred_raw,
+                gt_chunk,
+                gripper_w=closed_loop_action_gripper_weight,
+                mode=closed_loop_action_dist_mode,
+                last_k=closed_loop_action_last_k,
+            )
+            if action_dist >= closed_loop_action_threshold:
+                action_triggered = True
+                action_trigger_step = int(step)
+                action_trigger_dist = float(action_dist)
+                if debug_dir is not None:
+                    _dbg_rollout.append({
+                        'step': int(step),
+                        't_star': int(t_star),
+                        'min_dist': float(min_dist),
+                        'action_dist': float(action_dist),
+                        'action_threshold': float(closed_loop_action_threshold),
+                        'action_dist_mode': closed_loop_action_dist_mode,
+                        'action_dist_last_k': int(closed_loop_action_last_k),
+                        'action_triggered': True,
+                        'reason': 'closed_loop_action_threshold',
+                    })
+                break
         active_info = _infer_active_arms_from_gt_window(
             raw_data.get('gt_left_arm'),
             raw_data.get('gt_right_arm'),
@@ -1890,7 +2138,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                              fr['right'][0].copy(), fr['right'][1].copy()))
             grip_list.append((ar[6], ar[13]))
 
-        evac_debug_dir = os.path.join(debug_dir, 'evac', f'rollout_step_{step:03d}') if debug_dir else None
         pred = evac_inference(
             evac_model,
             evac_cfg,
@@ -1902,13 +2149,47 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             save_dir=evac_debug_dir,
             infer_kwargs=cfg.get('evac_infer_kwargs'),
         )
+        if evac_debug_dir is not None:
+            _vpath = os.path.join(evac_debug_dir, 'outputs.mp4')
+            evac_rollout_videos.append({
+                'step': int(step),
+                'path': _vpath,
+                'exists': bool(os.path.exists(_vpath)),
+            })
         new_img = curr_image.clone()
+        if tuple(pred.shape) != tuple(new_img[0].shape):
+            pred_rs = torch.nn.functional.interpolate(
+                pred.unsqueeze(0),
+                size=(new_img.shape[-2], new_img.shape[-1]),
+                mode='bilinear',
+                align_corners=False,
+            )[0]
+            pred = torch.clamp(pred_rs, 0.0, 1.0)
         new_img[0] = pred
         curr_image = new_img
         # Advance state to the end of executed actions.
         a_last = act_raw[-1]
         curr_qpos_raw = a_last
         rollout_steps_total += int(len(act_raw))
+        if (not closed_loop_action_trigger_enable) and min_dist_trigger_use_delta:
+            left_q_e, right_q_e = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
+            left_grip, right_grip = curr_qpos_raw[6], curr_qpos_raw[13]
+            fk_r_e = fk.forward(left_q_e, right_q_e)
+            lp_e, lq_e = fk_r_e['left']
+            rp_e, rq_e = fk_r_e['right']
+            t_star_e, min_dist_end = _nearest_with_window(
+                lp_e, lq_e, rp_e, rq_e,
+                int(np.clip(rollout_steps_total, 0, len(left_ep) - 1)),
+                gripper_penalty,
+            )
+            min_dist_delta = float(min_dist_end - min_dist_start)
+            # Use end-of-rollout nearest as latest anchor for downstream phase/targeting.
+            t_star = int(t_star_e)
+            min_dist = float(min_dist_end)
+            # Record added error from this perturb execution; next step will evaluate recovery.
+            pending_recover_valid = True
+            pending_recover_added = float(max(0.0, min_dist_delta))
+            pending_recover_from_step = int(step)
 
         # collect debug info for this rollout step
         if debug_dir is not None:
@@ -1923,6 +2204,14 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 sampled_error_mode = dyn_state.get('error_mode')
             _dbg_rollout.append({
                 'step': step, 't_star': int(t_star), 'min_dist': float(min_dist),
+                'step_role': step_role,
+                'paired_perturb_step': (None if recovery_pair_step is None else int(recovery_pair_step)),
+                'min_dist_start': float(min_dist_start),
+                'min_dist_end': (None if min_dist_end is None else float(min_dist_end)),
+                'min_dist_delta': (None if min_dist_delta is None else float(min_dist_delta)),
+                'min_dist_recover_gain': (None if min_dist_recover_gain is None else float(min_dist_recover_gain)),
+                'min_dist_recover_threshold': (None if min_dist_recover_threshold is None else float(min_dist_recover_threshold)),
+                'min_dist_recover_eval_end': (None if min_dist_recover_eval_end is None else float(min_dist_recover_eval_end)),
                 'progress': float(progress), 'phase_key': phase_key,
                 'active_left_arm': bool(active_info.get('left_arm', True)),
                 'active_right_arm': bool(active_info.get('right_arm', True)),
@@ -1957,9 +2246,39 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'act_chunk_raw_first': act_raw[0].tolist(),
                 'act_chunk_raw_last': act_raw[-1].tolist(),
                 'rollout_exec_len': int(len(act_raw)),
+                'action_dist': (None if action_dist is None else float(action_dist)),
+                'action_threshold': (None if not closed_loop_action_trigger_enable else float(closed_loop_action_threshold)),
+                'action_dist_mode': (None if not closed_loop_action_trigger_enable else closed_loop_action_dist_mode),
+                'action_dist_last_k': (None if not closed_loop_action_trigger_enable else int(closed_loop_action_last_k)),
+                'action_triggered': bool(False),
             })
         if single_rollout_correction:
             break
+
+    if closed_loop_action_trigger_enable:
+        if action_triggered:
+            force_generate_correction = True
+        elif closed_loop_fallback_force_correction:
+            force_generate_correction = True
+            if debug_dir is not None:
+                _dbg_rollout.append({
+                    'step': int(max_steps_eff),
+                    'action_triggered': False,
+                    'reason': 'closed_loop_fallback_force_correction',
+                    'closed_loop_max_rollouts': int(closed_loop_max_rollouts),
+                })
+    elif min_dist_fallback_force_correction and (not min_dist_triggered):
+        force_generate_correction = True
+        if debug_dir is not None:
+            _dbg_rollout.append({
+                'step': int(max_steps_eff),
+                'min_dist_triggered': bool(min_dist_triggered),
+                'reason': 'min_dist_fallback_force_correction',
+                'max_rollout_steps': int(max_steps),
+            })
+    elif min_dist_triggered:
+        # In min_dist mode, use in-loop trigger as the single source of truth.
+        force_generate_correction = True
 
     # Recompute nearest-point metrics at the final post-rollout state.
     # For pure gripper error modes, disable gripper penalty during nearest-point
@@ -1997,15 +2316,26 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     corr_left_active = bool(corr_active_info['left_arm'] or corr_active_info['left_gripper'])
     corr_right_active = bool(corr_active_info['right_arm'] or corr_active_info['right_gripper'])
 
-    if (not always_correction) and min_dist < threshold:
+    if (not always_correction) and (not force_generate_correction):
         # debug: save rollout info even on skip
         if debug_dir is not None:
             import json
             _dbg_corr = os.path.join(debug_dir, 'correction')
             os.makedirs(_dbg_corr, exist_ok=True)
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
-                json.dump({'reason': 'below_threshold', 'min_dist': float(min_dist),
-                           'threshold': threshold, 'rollout': _dbg_rollout}, _f, indent=2)
+                if closed_loop_action_trigger_enable:
+                    _skip_reason = 'closed_loop_not_triggered'
+                elif min_dist_trigger_use_delta:
+                    _skip_reason = 'min_dist_delta_not_triggered'
+                else:
+                    _skip_reason = 'min_dist_not_triggered'
+                json.dump({'reason': _skip_reason, 'min_dist': float(min_dist),
+                           'threshold': threshold,
+                           'min_dist_triggered': bool(min_dist_triggered),
+                           'min_dist_trigger_step': (None if min_dist_trigger_step is None else int(min_dist_trigger_step)),
+                           'min_dist_trigger_dist': (None if min_dist_trigger_dist is None else float(min_dist_trigger_dist)),
+                           'action_triggered': bool(action_triggered),
+                           'rollout': _dbg_rollout}, _f, indent=2)
         return None
 
     if correction_interp_nearest_enable:
@@ -2510,33 +2840,142 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_traj_raw.png'), traj_u8)
         cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
         cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
-        # save planner results summary
+        # save planner results summary (rollout-centric and concise)
+        _video_map = {}
+        for _v in evac_rollout_videos:
+            try:
+                _video_map[int(_v.get('step'))] = {
+                    'path': _v.get('path'),
+                    'exists': bool(_v.get('exists', False)),
+                }
+            except Exception:
+                continue
+        _eval_video_map = {}
+        for _v in evac_recover_eval_videos:
+            try:
+                _eval_video_map[int(_v.get('step'))] = {
+                    'path': _v.get('path'),
+                    'exists': bool(_v.get('exists', False)),
+                }
+            except Exception:
+                continue
+
+        _rollout_records = []
+        for _r in _dbg_rollout:
+            _step = _r.get('step')
+            _video = _video_map.get(int(_step)) if _step is not None and str(_step).isdigit() else None
+            _video_eval = _eval_video_map.get(int(_step)) if _step is not None and str(_step).isdigit() else None
+            _rollout_records.append({
+                'step': (None if _step is None else int(_step)),
+                'step_role': _r.get('step_role'),
+                'paired_perturb_step': (None if _r.get('paired_perturb_step') is None else int(_r.get('paired_perturb_step'))),
+                't_star': (None if _r.get('t_star') is None else int(_r.get('t_star'))),
+                'min_dist': (None if _r.get('min_dist') is None else float(_r.get('min_dist'))),
+                'min_dist_start': (None if _r.get('min_dist_start') is None else float(_r.get('min_dist_start'))),
+                'min_dist_end': (None if _r.get('min_dist_end') is None else float(_r.get('min_dist_end'))),
+                'min_dist_delta': (None if _r.get('min_dist_delta') is None else float(_r.get('min_dist_delta'))),
+                'min_dist_recover_gain': (None if _r.get('min_dist_recover_gain') is None else float(_r.get('min_dist_recover_gain'))),
+                'min_dist_recover_threshold': (None if _r.get('min_dist_recover_threshold') is None else float(_r.get('min_dist_recover_threshold'))),
+                'min_dist_recover_eval_end': (None if _r.get('min_dist_recover_eval_end') is None else float(_r.get('min_dist_recover_eval_end'))),
+                'phase_key': _r.get('phase_key'),
+                'perturb_mode': _r.get('perturb_mode'),
+                'sampled_error_mode': _r.get('sampled_error_mode'),
+                'active_left_arm': bool(_r.get('active_left_arm', True)),
+                'active_right_arm': bool(_r.get('active_right_arm', True)),
+                'active_left_gripper': bool(_r.get('active_left_gripper', True)),
+                'active_right_gripper': bool(_r.get('active_right_gripper', True)),
+                'active_left_arm_score': (None if _r.get('active_left_arm_score') is None else float(_r.get('active_left_arm_score'))),
+                'active_right_arm_score': (None if _r.get('active_right_arm_score') is None else float(_r.get('active_right_arm_score'))),
+                'active_left_gripper_score': (None if _r.get('active_left_gripper_score') is None else float(_r.get('active_left_gripper_score'))),
+                'active_right_gripper_score': (None if _r.get('active_right_gripper_score') is None else float(_r.get('active_right_gripper_score'))),
+                'action_perturbed': bool(_r.get('action_perturbed', False)),
+                'left_grip': (None if _r.get('left_grip') is None else float(_r.get('left_grip'))),
+                'right_grip': (None if _r.get('right_grip') is None else float(_r.get('right_grip'))),
+                'action_dist': (None if _r.get('action_dist') is None else float(_r.get('action_dist'))),
+                'action_triggered': bool(_r.get('action_triggered', False)),
+                'min_dist_triggered': bool(_r.get('min_dist_triggered', False)),
+                'reason': _r.get('reason'),
+                'evac_video': _video,
+                'evac_recover_eval_video': _video_eval,
+                'evac_video_dir': (None if _video is None else os.path.dirname(_video.get('path'))),
+                'evac_recover_eval_video_dir': (None if _video_eval is None else os.path.dirname(_video_eval.get('path'))),
+            })
+
+        _trigger_source = None
+        _trigger_step = None
+        _trigger_value = None
+        if bool(action_triggered):
+            _trigger_source = 'action_dist'
+            _trigger_step = (None if action_trigger_step is None else int(action_trigger_step))
+            _trigger_value = (None if action_trigger_dist is None else float(action_trigger_dist))
+        elif bool(min_dist_triggered):
+            _trigger_source = 'min_dist'
+            _trigger_step = (None if min_dist_trigger_step is None else int(min_dist_trigger_step))
+            _trigger_value = (None if min_dist_trigger_dist is None else float(min_dist_trigger_dist))
+        elif bool(force_generate_correction):
+            _trigger_source = 'fallback'
+
         _plan_info = {
-            'rollout': _dbg_rollout,
-            'rollout_steps_total': int(rollout_steps_total),
-            'gt_ref_index_for_original': int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1)),
-            't_star': int(t_star), 'min_dist': float(min_dist),
-            'target_mode': target_mode,
-            't_target': int(t_target), 'target_lookahead_steps': int(target_lookahead_steps),
-            'correction_interp_nearest_enable': bool(correction_interp_nearest_enable),
-            'correction_interp_prefix_ratio': float(correction_interp_prefix_ratio),
-            'correction_interp_smooth_enable': bool(correction_interp_smooth_enable),
-            'correction_interp_smooth_steps': int(correction_interp_smooth_steps),
-            'correction_interp_smooth_passes': int(correction_interp_smooth_passes),
-            'threshold': threshold,
-            'nearest_mode': nearest_mode,
-            'nearest_gripper_penalty_used': float(nearest_gripper_penalty),
-            'target_left_pose': left_ep[t_target].tolist(),
-            'target_right_pose': right_ep[t_target].tolist(),
-            'planner_left_status': res_l.get('status'),
-            'planner_right_status': res_r.get('status'),
-            'planner_left_len': len(res_l.get('position', [])),
-            'planner_right_len': len(res_r.get('position', [])),
-            'correction_left_active': bool(corr_left_active),
-            'correction_right_active': bool(corr_right_active),
-            'gripper_left': [float(left_grip), float(tl_grip)],
-            'gripper_right': [float(right_grip), float(tr_grip)],
-            'correction_prefix_len': int(prefix_len),
+            'version': 2,
+            'trigger_mode': (
+                'action_dist'
+                if closed_loop_action_trigger_enable else
+                ('min_dist_recovery' if min_dist_trigger_use_delta else 'min_dist')
+            ),
+            'trigger_threshold': {
+                'min_dist': float(threshold),
+                'action_dist': (float(closed_loop_action_threshold) if closed_loop_action_trigger_enable else None),
+                'min_dist_recover_ratio': (float(min_dist_recover_ratio) if min_dist_trigger_use_delta else None),
+                'min_dist_recover_use_added': (bool(min_dist_recover_use_added) if min_dist_trigger_use_delta else None),
+            },
+            'fallback': {
+                'closed_loop_action': bool(closed_loop_fallback_force_correction),
+                'min_dist': bool(min_dist_fallback_force_correction),
+                'used': bool(force_generate_correction and (not action_triggered) and (not min_dist_triggered)),
+            },
+            'trigger_result': {
+                'triggered': bool(force_generate_correction),
+                'source': _trigger_source,
+                'step': _trigger_step,
+                'value': _trigger_value,
+            },
+            'rollout_summary': {
+                'start_ts': int(start_ts),
+                'rollout_exec_steps': int(rollout_exec_steps),
+                'rollout_steps_total': int(rollout_steps_total),
+                'gt_ref_index_for_original': int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1)),
+                'num_rollouts': int(len(_rollout_records)),
+            },
+            'rollouts': _rollout_records,
+            'final_match': {
+                't_star': int(t_star),
+                'min_dist': float(min_dist),
+                'nearest_mode': nearest_mode,
+                'nearest_gripper_penalty_used': float(nearest_gripper_penalty),
+            },
+            'correction_target': {
+                'target_mode': target_mode,
+                't_target': int(t_target),
+                'target_lookahead_steps': int(target_lookahead_steps),
+                'left_pose': left_ep[t_target].tolist(),
+                'right_pose': right_ep[t_target].tolist(),
+            },
+            'correction_plan': {
+                'left_active': bool(corr_left_active),
+                'right_active': bool(corr_right_active),
+                'planner_left_status': res_l.get('status'),
+                'planner_right_status': res_r.get('status'),
+                'planner_left_len': len(res_l.get('position', [])),
+                'planner_right_len': len(res_r.get('position', [])),
+                'gripper_left': [float(left_grip), float(tl_grip)],
+                'gripper_right': [float(right_grip), float(tr_grip)],
+                'interp_nearest_enable': bool(correction_interp_nearest_enable),
+                'interp_prefix_ratio': float(correction_interp_prefix_ratio),
+                'interp_smooth_enable': bool(correction_interp_smooth_enable),
+                'interp_smooth_steps': int(correction_interp_smooth_steps),
+                'interp_smooth_passes': int(correction_interp_smooth_passes),
+                'correction_prefix_len': int(prefix_len),
+            },
         }
         with open(os.path.join(_dbg_corr, 'correction_info.json'), 'w') as _f:
             json.dump(_plan_info, _f, indent=2)
@@ -2558,11 +2997,37 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         except Exception:
             pass
 
+    action_dist_list = []
+    for _r in _dbg_rollout:
+        _ad = _r.get('action_dist', None) if isinstance(_r, dict) else None
+        if _ad is not None:
+            try:
+                action_dist_list.append(float(_ad))
+            except Exception:
+                pass
+    action_dist_step0 = None
+    for _r in _dbg_rollout:
+        if isinstance(_r, dict) and int(_r.get('step', -1)) == 0 and (_r.get('action_dist', None) is not None):
+            action_dist_step0 = float(_r.get('action_dist'))
+            break
+
+    corr_meta = {
+        "action_triggered": bool(action_triggered),
+        "action_trigger_step": (None if action_trigger_step is None else int(action_trigger_step)),
+        "action_trigger_dist": (None if action_trigger_dist is None else float(action_trigger_dist)),
+        "closed_loop_fallback_used": bool(force_generate_correction and (not action_triggered)),
+        "action_dist_step0": action_dist_step0,
+        "action_dist_last": (None if len(action_dist_list) == 0 else float(action_dist_list[-1])),
+        "action_dist_mean": (None if len(action_dist_list) == 0 else float(np.mean(action_dist_list))),
+        "action_dist_p90": (None if len(action_dist_list) == 0 else float(np.percentile(action_dist_list, 90))),
+    }
+
     return (
         curr_image.to(device),
         torch.from_numpy(qn.astype(np.float32)).to(device),
         torch.from_numpy(padded).float().to(device),
         torch.from_numpy(is_pad).bool().to(device),
+        corr_meta,
     )
 
 
@@ -2794,7 +3259,9 @@ def train_bc(train_dataloader, val_dataloader, config):
         os.makedirs(debug_wm_dir, exist_ok=True)
     # correction statistics tracker
     _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
-                   'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': []}
+                   'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
+                   'n_action_triggered': 0, 'n_action_fallback': 0, 'action_trigger_steps': [],
+                   'action_dist_step0': [], 'action_dist_last': [], 'action_dist_mean': [], 'action_dist_p90': []}
     if enable_wm:
         print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
         _t_init_corr = time.time()
@@ -2880,13 +3347,29 @@ def train_bc(train_dataloader, val_dataloader, config):
                             start_ts=data[5][bi].item())
                         _corr_stats['n_triggered'] += 1
                         if corr is not None:
-                            ci, cq, ca, cp = corr
+                            if isinstance(corr, (tuple, list)) and len(corr) >= 5:
+                                ci, cq, ca, cp, cmeta = corr
+                            else:
+                                ci, cq, ca, cp = corr
+                                cmeta = {}
                             corr_images.append(ci)
                             corr_qpos.append(cq)
                             corr_actions.append(ca)
                             corr_pads.append(cp)
                             corr_mask.append(1.0)
                             _corr_stats['n_success'] += 1
+                            if isinstance(cmeta, dict):
+                                if bool(cmeta.get('action_triggered', False)):
+                                    _corr_stats['n_action_triggered'] += 1
+                                    _st = cmeta.get('action_trigger_step', None)
+                                    if _st is not None:
+                                        _corr_stats['action_trigger_steps'].append(int(_st))
+                                if bool(cmeta.get('closed_loop_fallback_used', False)):
+                                    _corr_stats['n_action_fallback'] += 1
+                                for _k in ('action_dist_step0', 'action_dist_last', 'action_dist_mean', 'action_dist_p90'):
+                                    _v = cmeta.get(_k, None)
+                                    if _v is not None:
+                                        _corr_stats[_k].append(float(_v))
                             if enable_wm and export_corr and accelerator.is_main_process:
                                 _export_correction_sample_as_episode(
                                     export_corr_dir,
@@ -2980,16 +3463,37 @@ def train_bc(train_dataloader, val_dataloader, config):
                 writer.add_scalar('correction/n_success', _corr_stats['n_success'], epoch)
                 writer.add_scalar('correction/n_skipped', _corr_stats['n_skipped'], epoch)
                 writer.add_scalar('correction/n_error', _corr_stats['n_error'], epoch)
+                writer.add_scalar('correction/action_trigger_count', _corr_stats['n_action_triggered'], epoch)
+                writer.add_scalar('correction/action_fallback_count', _corr_stats['n_action_fallback'], epoch)
                 _total = _corr_stats['n_triggered'] or 1
                 writer.add_scalar('correction/success_rate', _corr_stats['n_success'] / _total, epoch)
+                _succ = _corr_stats['n_success'] or 1
+                writer.add_scalar('correction/action_trigger_rate', _corr_stats['n_action_triggered'] / _succ, epoch)
+                writer.add_scalar('correction/action_fallback_rate', _corr_stats['n_action_fallback'] / _succ, epoch)
+                if len(_corr_stats['action_trigger_steps']) > 0:
+                    writer.add_scalar('correction/action_trigger_step_mean',
+                                      float(np.mean(_corr_stats['action_trigger_steps'])), epoch)
+                for _k in ('action_dist_step0', 'action_dist_last', 'action_dist_mean', 'action_dist_p90'):
+                    if len(_corr_stats[_k]) > 0:
+                        writer.add_scalar(f'correction/{_k}_mean', float(np.mean(_corr_stats[_k])), epoch)
+                        writer.add_scalar(f'correction/{_k}_p50', float(np.percentile(_corr_stats[_k], 50)), epoch)
+                        writer.add_scalar(f'correction/{_k}_p90', float(np.percentile(_corr_stats[_k], 90)), epoch)
                 print(f'  [Correction] triggered={_corr_stats["n_triggered"]} '
                       f'success={_corr_stats["n_success"]} '
                       f'skipped={_corr_stats["n_skipped"]} '
                       f'error={_corr_stats["n_error"]} '
+                      f'action_triggered={_corr_stats["n_action_triggered"]} '
+                      f'action_fallback={_corr_stats["n_action_fallback"]} '
                       f'rate={_corr_stats["n_success"]/_total:.2%}')
+                if len(_corr_stats['action_dist_step0']) > 0:
+                    print(f'  [ActionDist] step0 p50={np.percentile(_corr_stats["action_dist_step0"], 50):.4f} '
+                          f'p90={np.percentile(_corr_stats["action_dist_step0"], 90):.4f} '
+                          f'mean={np.mean(_corr_stats["action_dist_step0"]):.4f}')
                 # reset per-epoch
                 _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
-                               'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': []}
+                               'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
+                               'n_action_triggered': 0, 'n_action_fallback': 0, 'action_trigger_steps': [],
+                               'action_dist_step0': [], 'action_dist_last': [], 'action_dist_mean': [], 'action_dist_p90': []}
 
         if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
@@ -3061,6 +3565,8 @@ if __name__ == "__main__":
     # for ACT
     parser.add_argument("--kl_weight", action="store", type=int, help="KL Weight", required=False)
     parser.add_argument("--chunk_size", action="store", type=int, help="chunk_size", required=False)
+    parser.add_argument("--sample_skip_head", action="store", type=int, default=0,
+                        help="Skip first N timesteps when sampling start_ts in dataloader")
     parser.add_argument("--hidden_dim", action="store", type=int, help="hidden_dim", required=False)
     parser.add_argument("--state_dim", action="store", type=int, help="state dim", required=True)
     parser.add_argument("--save_freq", action="store", type=int, help="save ckpt frequency", required=False, default=6000)
@@ -3220,6 +3726,30 @@ if __name__ == "__main__":
                         help="Correction target mode: forward or backward")
     parser.add_argument("--target_lookahead_steps", type=int, default=0,
                         help="Correction target lookahead steps from nearest t_star on expert trajectory")
+    parser.add_argument("--closed_loop_action_trigger_enable", type=str2bool, default=False,
+                        help="Enable closed-loop trigger by ACT action-vs-GT deviation on EVAC-updated images")
+    parser.add_argument("--closed_loop_action_threshold", type=float, default=0.2,
+                        help="Trigger correction when action chunk distance to GT exceeds this threshold")
+    parser.add_argument("--closed_loop_action_gripper_weight", type=float, default=1.0,
+                        help="Gripper term weight in closed-loop action distance")
+    parser.add_argument("--closed_loop_action_dist_mode", type=str, default="mean_chunk",
+                        help="Action distance mode: mean_chunk | last | last_k")
+    parser.add_argument("--closed_loop_action_last_k", type=int, default=4,
+                        help="Use last k steps when closed_loop_action_dist_mode=last_k")
+    parser.add_argument("--closed_loop_max_rollouts", type=int, default=3,
+                        help="Maximum closed-loop rollout attempts before fallback")
+    parser.add_argument("--closed_loop_fallback_force_correction", type=str2bool, default=True,
+                        help="If true, force correction generation when closed-loop attempts do not exceed threshold")
+    parser.add_argument("--min_dist_fallback_force_correction", type=str2bool, default=False,
+                        help="If true, force correction generation when min_dist mode does not reach threshold")
+    parser.add_argument("--min_dist_trigger_use_delta", type=str2bool, default=False,
+                        help="If true in min_dist mode, use perturb/recovery paired-step trigger based on recovery gain")
+    parser.add_argument("--min_dist_recover_use_added", type=str2bool, default=True,
+                        help="If true, in delta mode use dynamic recovery threshold = ratio * max(0, end-start)")
+    parser.add_argument("--min_dist_recover_ratio", type=float, default=0.5,
+                        help="Dynamic recovery ratio used when min_dist_recover_use_added=true")
+    parser.add_argument("--debug_recover_eval_rollout", type=str2bool, default=False,
+                        help="If true, also run EVAC rollout video for unperturbed recovery-eval action in each paired step")
     parser.add_argument("--correction_interp_nearest_enable", type=str2bool, default=False,
                         help="If true, set correction target to nearest point t_star and bypass planner with interpolation+GT tail")
     parser.add_argument("--correction_interp_prefix_ratio", type=float, default=0.4,

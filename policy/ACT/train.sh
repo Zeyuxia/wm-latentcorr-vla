@@ -5,6 +5,8 @@ task_name=open_laptop
 task_config=demo_clean
 expert_data_num=50
 seed=0
+# Skip earliest timesteps in dataloader sampling (avoid trivial/off-screen starts)
+sample_skip_head=16
 
 # Online rollout perturbation options (effective when enable_wm=true)
 enable_perturb=true
@@ -25,7 +27,7 @@ perturb_fail_direction=1,1,1,1,1,1,-1,-1,-1,-1,-1,-1
 perturb_eef_mode=directional_fail
 perturb_use_target_pose_planner=true
 perturb_eef_pos_std=0.01
-perturb_eef_fail_gain=0.04
+perturb_eef_fail_gain=0.08
 perturb_eef_tcp_offset_x=0.085
 perturb_eef_ramp=true
 perturb_eef_ramp_min=0.0
@@ -33,10 +35,10 @@ perturb_eef_ramp_power=1.5
 perturb_eef_ramp_apply_eps=1e-4
 perturb_eef_joint_delta_cap=0.08
 perturb_translation_random_dir=true
-perturb_rot_max_deg=18
+perturb_rot_max_deg=30
 perturb_mag_random=true
-perturb_mag_rand_min=0.85
-perturb_mag_rand_max=1.15
+perturb_mag_rand_min=1.00
+perturb_mag_rand_max=1.40
 perturb_rotation_random_axis=true
 perturb_anti_gt_cos_thresh=1.0
 perturb_reject_sampling_enable=true
@@ -46,7 +48,7 @@ perturb_reject_min_score=0.15
 perturb_reject_prefilter_pool=8
 perturb_reject_orient_weight=0.01
 perturb_reject_gripper_penalty=1.0
-nearest_window_radius=32
+nearest_window_radius=12
 perturb_rot_axis_left=0,0,1
 perturb_rot_axis_right=0,0,1
 perturb_noop_lag_steps=3
@@ -68,19 +70,31 @@ vla_qpos_noise_std=0.0
 
 # World-model correction options (set enable_wm=true to activate)
 enable_wm=true
-# evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
-evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=5624-step=22500.ckpt
+evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+# evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=5624-step=22500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 curobo_right_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
 raw_data_dir=/data/zhenyangfan/RoboTwin/data/${task_name}/${task_config}/data
 act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
-correction_threshold=0.05
-max_rollout_steps=2
-single_rollout_correction=true
+correction_threshold=0.03
+max_rollout_steps=3
+single_rollout_correction=false
 target_mode=backward
 target_lookahead_steps=6
+closed_loop_action_trigger_enable=false
+closed_loop_action_threshold=0.20
+closed_loop_action_gripper_weight=1.0
+closed_loop_action_dist_mode=last
+closed_loop_action_last_k=4
+closed_loop_max_rollouts=3
+closed_loop_fallback_force_correction=true
+min_dist_fallback_force_correction=true
+min_dist_trigger_use_delta=true
+min_dist_recover_use_added=true
+min_dist_recover_ratio=0.5
+debug_recover_eval_rollout=true
 correction_interp_nearest_enable=true
 correction_interp_prefix_ratio=0.4
 correction_interp_smooth_enable=true
@@ -89,9 +103,9 @@ correction_interp_smooth_passes=2
 rollout_exec_steps=16
 correction_freq=1
 correction_weight=2.0
-orient_weight=0.01
+orient_weight=0.0573
 gripper_penalty=1.0
-always_correction=true
+always_correction=false
 debug_wm=true
 export_correction_dataset=true
 export_correction_dir=
@@ -112,7 +126,7 @@ mkdir -p ${ckpt_dir}
 # Save a copy of this script for reproducibility
 cp "$0" ${ckpt_dir}/train.sh
 
-gpu_ids=4,5,6,7
+gpu_ids=0,1,2,3
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')
 
 if [ ${num_gpus} -gt 1 ]; then
@@ -137,6 +151,18 @@ if [ "${enable_wm}" = "true" ]; then
     --single_rollout_correction ${single_rollout_correction} \
     --target_mode ${target_mode} \
     --target_lookahead_steps ${target_lookahead_steps} \
+    --closed_loop_action_trigger_enable ${closed_loop_action_trigger_enable} \
+    --closed_loop_action_threshold ${closed_loop_action_threshold} \
+    --closed_loop_action_gripper_weight ${closed_loop_action_gripper_weight} \
+    --closed_loop_action_dist_mode ${closed_loop_action_dist_mode} \
+    --closed_loop_action_last_k ${closed_loop_action_last_k} \
+    --closed_loop_max_rollouts ${closed_loop_max_rollouts} \
+    --closed_loop_fallback_force_correction ${closed_loop_fallback_force_correction} \
+    --min_dist_fallback_force_correction ${min_dist_fallback_force_correction} \
+    --min_dist_trigger_use_delta ${min_dist_trigger_use_delta} \
+    --min_dist_recover_use_added ${min_dist_recover_use_added} \
+    --min_dist_recover_ratio ${min_dist_recover_ratio} \
+    --debug_recover_eval_rollout ${debug_recover_eval_rollout} \
     --correction_interp_nearest_enable ${correction_interp_nearest_enable} \
     --correction_interp_prefix_ratio ${correction_interp_prefix_ratio} \
     --correction_interp_smooth_enable ${correction_interp_smooth_enable} \
@@ -230,13 +256,14 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     ${multi_gpu_flag} \
     --num_processes ${num_gpus} \
-    --main_process_port 29700 \
+    --main_process_port 29500 \
     imitate_episodes.py \
     --task_name sim-${task_name}-${task_config}-${expert_data_num} \
     --ckpt_dir ${ckpt_dir} \
     --policy_class ACT \
     --kl_weight 10 \
     --chunk_size 50 \
+    --sample_skip_head ${sample_skip_head} \
     --hidden_dim 512 \
     --batch_size 4 \
     --dim_feedforward 3200 \

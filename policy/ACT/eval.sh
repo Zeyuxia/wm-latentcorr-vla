@@ -5,11 +5,11 @@ policy_name=ACT
 task_name=open_laptop
 task_config=demo_clean
 ckpt_setting=demo_clean
-ckpt_dir=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260318_103921
-ckpt_name=policy_epoch_100_seed_0.ckpt
+ckpt_dir=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260322_134409
+ckpt_name=policy_epoch_700_seed_0.ckpt
 seed=0
 seed_file=/data/zhenyangfan/RoboTwin/data/open_laptop/demo_clean/seed.txt
-gpu_id=7
+gpu_id=1
 
 # temporal_agg=${5} # use temporal_agg
 DEBUG=False
