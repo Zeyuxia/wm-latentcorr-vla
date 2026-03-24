@@ -5,13 +5,22 @@ task_name=open_laptop
 task_config=demo_clean
 expert_data_num=50
 seed=0
+sample_pregrasp_bias_enable=true
+sample_pregrasp_prob=0.8
+sample_pregrasp_open_thresh=0.75
+sample_pregrasp_close_thresh=0.35
+sample_pregrasp_window_pre=24
+sample_pregrasp_window_post=8
 # Skip earliest timesteps in dataloader sampling (avoid trivial/off-screen starts)
 sample_skip_head=16
 
 # Online rollout perturbation options (effective when enable_wm=true)
 enable_perturb=true
 perturb_prob=1.0
-perturb_error_mode=auto
+perturb_error_mode=open_laptop_pregrasp
+perturb_open_laptop_pregrasp_close_prob=0.8
+perturb_open_laptop_pregrasp_translation_prob=0.1
+perturb_open_laptop_pregrasp_rotation_prob=0.1
 perturb_space=eef
 perturb_lp_alpha=0.6
 perturb_noise_std=0.04
@@ -33,7 +42,7 @@ perturb_eef_ramp=true
 perturb_eef_ramp_min=0.0
 perturb_eef_ramp_power=1.5
 perturb_eef_ramp_apply_eps=1e-4
-perturb_eef_joint_delta_cap=0.08
+perturb_eef_traj_last_ik_only=false
 perturb_translation_random_dir=true
 perturb_rot_max_deg=30
 perturb_mag_random=true
@@ -46,8 +55,12 @@ perturb_reject_max_trials=4
 perturb_reject_min_delta=0.0005
 perturb_reject_min_score=0.15
 perturb_reject_prefilter_pool=8
+perturb_reject_dir_jitter_eps=0.2
+perturb_reject_require_min_score=true
 perturb_reject_orient_weight=0.01
 perturb_reject_gripper_penalty=1.0
+perturb_active_joint_delta_thresh=0.01
+perturb_active_gripper_delta_thresh=0.05
 nearest_window_radius=12
 perturb_rot_axis_left=0,0,1
 perturb_rot_axis_right=0,0,1
@@ -93,7 +106,7 @@ closed_loop_fallback_force_correction=true
 min_dist_fallback_force_correction=true
 min_dist_trigger_use_delta=true
 min_dist_recover_use_added=true
-min_dist_recover_ratio=0.5
+min_dist_recover_ratio=0.25
 debug_recover_eval_rollout=true
 correction_interp_nearest_enable=true
 correction_interp_prefix_ratio=0.4
@@ -105,6 +118,7 @@ correction_freq=1
 correction_weight=2.0
 orient_weight=0.0573
 gripper_penalty=1.0
+recover_gripper_penalty=0.0
 always_correction=false
 debug_wm=true
 export_correction_dataset=true
@@ -126,7 +140,7 @@ mkdir -p ${ckpt_dir}
 # Save a copy of this script for reproducibility
 cp "$0" ${ckpt_dir}/train.sh
 
-gpu_ids=0,1,2,3
+gpu_ids=7
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')
 
 if [ ${num_gpus} -gt 1 ]; then
@@ -173,6 +187,7 @@ if [ "${enable_wm}" = "true" ]; then
     --correction_weight ${correction_weight} \
     --orient_weight ${orient_weight} \
     --gripper_penalty ${gripper_penalty} \
+    --recover_gripper_penalty ${recover_gripper_penalty} \
     --always_correction ${always_correction} \
     --export_correction_dataset ${export_correction_dataset} \
     --evac_budget_accel ${evac_budget_accel} \
@@ -197,6 +212,9 @@ fi
 perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_prob ${perturb_prob} \
 --perturb_error_mode ${perturb_error_mode} \
+--perturb_open_laptop_pregrasp_close_prob ${perturb_open_laptop_pregrasp_close_prob} \
+--perturb_open_laptop_pregrasp_translation_prob ${perturb_open_laptop_pregrasp_translation_prob} \
+--perturb_open_laptop_pregrasp_rotation_prob ${perturb_open_laptop_pregrasp_rotation_prob} \
 --perturb_space ${perturb_space} \
 --perturb_lp_alpha ${perturb_lp_alpha} \
 --perturb_noise_std ${perturb_noise_std} \
@@ -218,7 +236,7 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_eef_ramp_min ${perturb_eef_ramp_min} \
 --perturb_eef_ramp_power ${perturb_eef_ramp_power} \
 --perturb_eef_ramp_apply_eps ${perturb_eef_ramp_apply_eps} \
---perturb_eef_joint_delta_cap ${perturb_eef_joint_delta_cap} \
+--perturb_eef_traj_last_ik_only ${perturb_eef_traj_last_ik_only} \
 --perturb_translation_random_dir ${perturb_translation_random_dir} \
 --perturb_rot_max_deg ${perturb_rot_max_deg} \
 --perturb_mag_random ${perturb_mag_random} \
@@ -231,8 +249,12 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_reject_min_delta ${perturb_reject_min_delta} \
 --perturb_reject_min_score ${perturb_reject_min_score} \
 --perturb_reject_prefilter_pool ${perturb_reject_prefilter_pool} \
+--perturb_reject_dir_jitter_eps ${perturb_reject_dir_jitter_eps} \
+--perturb_reject_require_min_score ${perturb_reject_require_min_score} \
 --perturb_reject_orient_weight ${perturb_reject_orient_weight} \
 --perturb_reject_gripper_penalty ${perturb_reject_gripper_penalty} \
+--perturb_active_joint_delta_thresh ${perturb_active_joint_delta_thresh} \
+--perturb_active_gripper_delta_thresh ${perturb_active_gripper_delta_thresh} \
 --nearest_window_radius ${nearest_window_radius} \
 --perturb_rot_axis_left ${perturb_rot_axis_left} \
 --perturb_rot_axis_right ${perturb_rot_axis_right} \
@@ -272,6 +294,12 @@ CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     --save_freq 10 \
     --state_dim 14 \
     --seed ${seed} \
+    --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
+    --sample_pregrasp_prob ${sample_pregrasp_prob} \
+    --sample_pregrasp_open_thresh ${sample_pregrasp_open_thresh} \
+    --sample_pregrasp_close_thresh ${sample_pregrasp_close_thresh} \
+    --sample_pregrasp_window_pre ${sample_pregrasp_window_pre} \
+    --sample_pregrasp_window_post ${sample_pregrasp_window_post} \
     ${init_ckpt_flags} \
     ${perturb_flags} \
     ${wm_flags}
