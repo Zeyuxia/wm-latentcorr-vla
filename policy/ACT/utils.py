@@ -16,10 +16,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
                  raw_data_dir=None, start_margin=0, sample_skip_head=0,
                  sample_pregrasp_bias_enable=False,
                  sample_pregrasp_prob=0.0,
-                 sample_pregrasp_open_thresh=0.75,
-                 sample_pregrasp_close_thresh=0.35,
-                 sample_pregrasp_window_pre=24,
-                 sample_pregrasp_window_post=8,
                  sample_pregrasp_phase_window_len=16,
                  sample_pregrasp_avoid_switch_tail=0):
         super(EpisodicDataset).__init__()
@@ -33,10 +29,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.sample_skip_head = max(0, int(sample_skip_head))
         self.sample_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
         self.sample_pregrasp_prob = float(np.clip(sample_pregrasp_prob, 0.0, 1.0))
-        self.sample_pregrasp_open_thresh = float(np.clip(sample_pregrasp_open_thresh, 0.0, 1.0))
-        self.sample_pregrasp_close_thresh = float(np.clip(sample_pregrasp_close_thresh, 0.0, 1.0))
-        self.sample_pregrasp_window_pre = max(0, int(sample_pregrasp_window_pre))
-        self.sample_pregrasp_window_post = max(0, int(sample_pregrasp_window_post))
         self.sample_pregrasp_phase_window_len = max(1, int(sample_pregrasp_phase_window_len))
         self.sample_pregrasp_avoid_switch_tail = max(0, int(sample_pregrasp_avoid_switch_tail))
         self._pregrasp_start_cache = {}
@@ -219,10 +211,6 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               raw_data_dir=None, start_margin=0, sample_skip_head=0,
               sample_pregrasp_bias_enable=False,
               sample_pregrasp_prob=0.0,
-              sample_pregrasp_open_thresh=0.75,
-              sample_pregrasp_close_thresh=0.35,
-              sample_pregrasp_window_pre=24,
-              sample_pregrasp_window_post=8,
               sample_pregrasp_phase_window_len=16,
               sample_pregrasp_avoid_switch_tail=0):
     print(f"\nData from: {dataset_dir}\n")
@@ -259,10 +247,6 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                     sample_skip_head=sample_skip_head,
                                     sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
                                     sample_pregrasp_prob=sample_pregrasp_prob,
-                                    sample_pregrasp_open_thresh=sample_pregrasp_open_thresh,
-                                    sample_pregrasp_close_thresh=sample_pregrasp_close_thresh,
-                                    sample_pregrasp_window_pre=sample_pregrasp_window_pre,
-                                    sample_pregrasp_window_post=sample_pregrasp_window_post,
                                     sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
                                     sample_pregrasp_avoid_switch_tail=sample_pregrasp_avoid_switch_tail)
     train_dataloader = DataLoader(
