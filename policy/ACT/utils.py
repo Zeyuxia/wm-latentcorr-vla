@@ -3,6 +3,7 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
+from phase_utils import infer_phase_key_from_gt_window
 
 import IPython
 
@@ -18,7 +19,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
                  sample_pregrasp_open_thresh=0.75,
                  sample_pregrasp_close_thresh=0.35,
                  sample_pregrasp_window_pre=24,
-                 sample_pregrasp_window_post=8):
+                 sample_pregrasp_window_post=8,
+                 sample_pregrasp_phase_window_len=16,
+                 sample_pregrasp_avoid_switch_tail=0):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -34,6 +37,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.sample_pregrasp_close_thresh = float(np.clip(sample_pregrasp_close_thresh, 0.0, 1.0))
         self.sample_pregrasp_window_pre = max(0, int(sample_pregrasp_window_pre))
         self.sample_pregrasp_window_post = max(0, int(sample_pregrasp_window_post))
+        self.sample_pregrasp_phase_window_len = max(1, int(sample_pregrasp_phase_window_len))
+        self.sample_pregrasp_avoid_switch_tail = max(0, int(sample_pregrasp_avoid_switch_tail))
         self._pregrasp_start_cache = {}
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
@@ -55,25 +60,34 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 self._pregrasp_start_cache[key] = candidates
                 return candidates
 
-            lg = np.asarray(action[:, 6], dtype=np.float32)
-            rg = np.asarray(action[:, 13], dtype=np.float32)
-            open_th = self.sample_pregrasp_open_thresh
-            close_th = self.sample_pregrasp_close_thresh
-
-            l_prev_open = lg[:-1] >= open_th
-            r_prev_open = rg[:-1] >= open_th
-            l_curr_close = lg[1:] <= close_th
-            r_curr_close = rg[1:] <= close_th
-            toggle = np.where((l_prev_open & l_curr_close) | (r_prev_open & r_curr_close))[0]
-            if toggle.size == 0:
-                self._pregrasp_start_cache[key] = candidates
-                return candidates
-
-            first_close = int(toggle[0] + 1)
-            lo = max(int(min_start), first_close - self.sample_pregrasp_window_pre)
-            hi = min(int(max_start), first_close + self.sample_pregrasp_window_post)
-            if hi >= lo:
-                candidates = list(range(lo, hi + 1))
+            lg = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
+            rg = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
+            for ts in range(int(min_start), int(max_start) + 1):
+                ph = infer_phase_key_from_gt_window(
+                    lg[ts:],
+                    rg[ts:],
+                    self.sample_pregrasp_phase_window_len,
+                )
+                if ph == "pregrasp":
+                    candidates.append(int(ts))
+            # Use all detected pregrasp candidates directly, but optionally
+            # drop the tail of each contiguous pregrasp segment to avoid
+            # sampling too close to the close-switch boundary.
+            if len(candidates) > 0 and self.sample_pregrasp_avoid_switch_tail > 0:
+                k = int(self.sample_pregrasp_avoid_switch_tail)
+                kept = []
+                seg_start = 0
+                n = len(candidates)
+                while seg_start < n:
+                    seg_end = seg_start
+                    while seg_end + 1 < n and candidates[seg_end + 1] == candidates[seg_end] + 1:
+                        seg_end += 1
+                    seg = candidates[seg_start:seg_end + 1]
+                    keep_upto = max(0, len(seg) - k)
+                    if keep_upto > 0:
+                        kept.extend(seg[:keep_upto])
+                    seg_start = seg_end + 1
+                candidates = [int(ts) for ts in kept]
         except Exception:
             candidates = []
 
@@ -208,7 +222,9 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               sample_pregrasp_open_thresh=0.75,
               sample_pregrasp_close_thresh=0.35,
               sample_pregrasp_window_pre=24,
-              sample_pregrasp_window_post=8):
+              sample_pregrasp_window_post=8,
+              sample_pregrasp_phase_window_len=16,
+              sample_pregrasp_avoid_switch_tail=0):
     print(f"\nData from: {dataset_dir}\n")
     # Filter episodes that are too short for the requested start sampling range.
     # Need at least one valid start_ts in [sample_skip_head, episode_len - 1 - start_margin].
@@ -246,7 +262,9 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                     sample_pregrasp_open_thresh=sample_pregrasp_open_thresh,
                                     sample_pregrasp_close_thresh=sample_pregrasp_close_thresh,
                                     sample_pregrasp_window_pre=sample_pregrasp_window_pre,
-                                    sample_pregrasp_window_post=sample_pregrasp_window_post)
+                                    sample_pregrasp_window_post=sample_pregrasp_window_post,
+                                    sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
+                                    sample_pregrasp_avoid_switch_tail=sample_pregrasp_avoid_switch_tail)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,

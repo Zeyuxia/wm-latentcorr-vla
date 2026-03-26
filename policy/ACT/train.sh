@@ -5,12 +5,19 @@ task_name=open_laptop
 task_config=demo_clean
 expert_data_num=50
 seed=0
+lr_sched_enable=true
+lr_warmup_steps=30
+lr_min_ratio=0.1
+sp_reg_enable=true
+sp_reg_lambda=1e-5
 sample_pregrasp_bias_enable=true
-sample_pregrasp_prob=0.8
+sample_pregrasp_prob=1.0
 sample_pregrasp_open_thresh=0.75
 sample_pregrasp_close_thresh=0.35
-sample_pregrasp_window_pre=24
-sample_pregrasp_window_post=8
+sample_pregrasp_window_pre=64
+sample_pregrasp_window_post=0
+sample_pregrasp_phase_window_len=16
+sample_pregrasp_avoid_switch_tail=12
 # Skip earliest timesteps in dataloader sampling (avoid trivial/off-screen starts)
 sample_skip_head=16
 
@@ -294,12 +301,19 @@ CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     --save_freq 10 \
     --state_dim 14 \
     --seed ${seed} \
+    --lr_sched_enable ${lr_sched_enable} \
+    --lr_warmup_steps ${lr_warmup_steps} \
+    --lr_min_ratio ${lr_min_ratio} \
+    --sp_reg_enable ${sp_reg_enable} \
+    --sp_reg_lambda ${sp_reg_lambda} \
     --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
     --sample_pregrasp_prob ${sample_pregrasp_prob} \
     --sample_pregrasp_open_thresh ${sample_pregrasp_open_thresh} \
     --sample_pregrasp_close_thresh ${sample_pregrasp_close_thresh} \
     --sample_pregrasp_window_pre ${sample_pregrasp_window_pre} \
     --sample_pregrasp_window_post ${sample_pregrasp_window_post} \
+    --sample_pregrasp_phase_window_len ${sample_pregrasp_phase_window_len} \
+    --sample_pregrasp_avoid_switch_tail ${sample_pregrasp_avoid_switch_tail} \
     ${init_ckpt_flags} \
     ${perturb_flags} \
     ${wm_flags}
