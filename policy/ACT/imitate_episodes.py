@@ -1109,6 +1109,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
     left_grip_traj = raw_data['left_gripper'][start_ts:]
     right_grip_traj = raw_data['right_gripper'][start_ts:]
+    phase_window_len = int(cfg.get('sample_pregrasp_phase_window_len', rollout_exec_steps))
+    phase_key_fixed = _infer_phase_key_from_gt_window(
+        left_grip_traj=left_grip_traj,
+        right_grip_traj=right_grip_traj,
+        window_len=phase_window_len,
+    )
 
     qpos_raw = qpos_data_s.cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
     curr_image = image_data_s.clone()
@@ -1389,12 +1395,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         active_info['right_gripper'] = right_side_active
         progress = float(t_star) / max(1, len(left_ep) - 1)
         # Choose error phase from the whole GT action window (prefix) instead of a single anchor.
-        phase_window_len = int(cfg.get('sample_pregrasp_phase_window_len', rollout_exec_steps))
-        phase_key = _infer_phase_key_from_gt_window(
-            left_grip_traj=left_grip_traj[int(t_star):],
-            right_grip_traj=right_grip_traj[int(t_star):],
-            window_len=phase_window_len,
-        )
+        # Keep phase consistent with sampled start_ts stage.
+        phase_key = phase_key_fixed
         act_raw, perturbed, pert_mode, dyn_state = perturb_action_chunk_online(
             act_raw, cfg, dyn_state, fk=fk, planner_l=planner_l, planner_r=planner_r,
             phase_key=phase_key, init_left_grip=float(left_grip), init_right_grip=float(right_grip),
@@ -1935,6 +1937,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     # --- debug: save correction summary jsons ---
     if debug_dir is not None:
         import json
+        import cv2
         _dbg_corr = os.path.join(debug_dir, 'correction')
         os.makedirs(_dbg_corr, exist_ok=True)
         # Save correction projection overlays on original/corrected images.
@@ -2075,15 +2078,64 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 if len(seq) > 0 and seq[-1] is not None:
                     cv2.circle(img, (int(seq[-1][0]), int(seq[-1][1])), 4, color, -1, cv2.LINE_AA)
 
+            def _annotate_start_end(img, seq, prefix, color):
+                if len(seq) == 0:
+                    return
+                s = seq[0]
+                e = seq[-1]
+                if s is not None:
+                    cv2.putText(
+                        img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA
+                    )
+                if e is not None:
+                    cv2.putText(
+                        img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA
+                    )
+
+            def _draw_legend(img):
+                x0, y0 = 10, 10
+                rows = [("L: green", (0, 255, 0)), ("R: red", (0, 0, 255))]
+                row_h = 18
+                w = 120
+                h = 8 + row_h * len(rows) + 8
+                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
+                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
+                for i, (name, color) in enumerate(rows):
+                    y = y0 + 18 + i * row_h
+                    cv2.circle(img, (x0 + 10, y - 4), 4, color, -1, cv2.LINE_AA)
+                    cv2.putText(img, name, (x0 + 20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+
             for _img in (_overlay_o, _overlay_c):
                 _img[mask] = (0.6 * _img[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
                 _draw_polyline(_img, luv, (0, 255, 0))
                 _draw_polyline(_img, ruv, (0, 0, 255))
+                _annotate_start_end(_img, luv, "L", (0, 255, 0))
+                _annotate_start_end(_img, ruv, "R", (0, 0, 255))
+                _draw_legend(_img)
 
             cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
             cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
         except Exception:
-            pass
+            try:
+                import traceback
+                with open(os.path.join(_dbg_corr, 'corr_projection_error.txt'), 'w') as _f:
+                    _f.write(traceback.format_exc())
+            except Exception:
+                pass
+            # Best-effort fallback: still dump base original/corrected images.
+            try:
+                if '_overlay_o' in locals():
+                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
+                elif '_oimg' in locals():
+                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _oimg)
+                if '_overlay_c' in locals():
+                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+                elif '_cimg' in locals():
+                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _cimg)
+            except Exception:
+                pass
 
         # save planner results summary (rollout-centric and concise)
         _video_map = {}
