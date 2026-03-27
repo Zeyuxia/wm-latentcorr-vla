@@ -32,7 +32,7 @@ max_rollout_steps=3
 target_mode=backward
 target_lookahead_steps=6
 min_dist_fallback_force_correction=true
-min_dist_recover_ratio=0.25
+min_dist_recover_ratio=0.75
 debug_recover_eval_rollout=true
 correction_interp_nearest_enable=true
 correction_interp_prefix_ratio=0.4
@@ -49,11 +49,11 @@ export_correction_dir=
 enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
-perturb_open_laptop_pregrasp_close_prob=0.8
-perturb_open_laptop_pregrasp_translation_prob=0.1
-perturb_open_laptop_pregrasp_rotation_prob=0.1
+perturb_open_laptop_pregrasp_close_prob=0.6
+perturb_open_laptop_pregrasp_translation_prob=0.4
+perturb_open_laptop_pregrasp_rotation_prob=0.0
 perturb_eef_fail_gain=0.08
-perturb_rot_max_deg=30
+perturb_rot_max_deg=15
 perturb_mag_random=true
 perturb_mag_rand_min=1.00
 perturb_mag_rand_max=1.40
@@ -63,7 +63,8 @@ perturb_reject_dir_jitter_eps=0.2
 perturb_active_joint_delta_thresh=0.01
 perturb_active_gripper_delta_thresh=0.05
 nearest_window_radius=12
-perturb_gripper_close_min=0.35
+perturb_gripper_close_min=0.10
+perturb_gripper_open_max=0.90
 perturb_gripper_fast_ratio=0.20
 lr_sched_enable=true
 lr_warmup_steps=30
@@ -73,8 +74,7 @@ sp_reg_lambda=1e-5
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
 sample_pregrasp_phase_window_len=16
-sample_pregrasp_avoid_switch_tail=12
-sample_skip_head=16
+sample_skip_head_ratio=0.25
 
 
 
@@ -134,7 +134,7 @@ fi
 perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_prob ${perturb_prob} \
 --perturb_error_mode ${perturb_error_mode} \
---sample_skip_head ${sample_skip_head} \
+--sample_skip_head_ratio ${sample_skip_head_ratio} \
 --perturb_open_laptop_pregrasp_close_prob ${perturb_open_laptop_pregrasp_close_prob} \
 --perturb_open_laptop_pregrasp_translation_prob ${perturb_open_laptop_pregrasp_translation_prob} \
 --perturb_open_laptop_pregrasp_rotation_prob ${perturb_open_laptop_pregrasp_rotation_prob} \
@@ -150,6 +150,7 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_active_gripper_delta_thresh ${perturb_active_gripper_delta_thresh} \
 --nearest_window_radius ${nearest_window_radius} \
 --perturb_gripper_close_min ${perturb_gripper_close_min} \
+--perturb_gripper_open_max ${perturb_gripper_open_max} \
 --perturb_gripper_fast_ratio ${perturb_gripper_fast_ratio} \
 --lr_sched_enable ${lr_sched_enable} \
 --lr_warmup_steps ${lr_warmup_steps} \
@@ -159,7 +160,6 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
 --sample_pregrasp_prob ${sample_pregrasp_prob} \
 --sample_pregrasp_phase_window_len ${sample_pregrasp_phase_window_len} \
---sample_pregrasp_avoid_switch_tail ${sample_pregrasp_avoid_switch_tail} \
 "
 
 # Build ACT training flags

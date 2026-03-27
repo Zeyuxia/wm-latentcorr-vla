@@ -13,11 +13,11 @@ e = IPython.embed
 class EpisodicDataset(torch.utils.data.Dataset):
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
-                 raw_data_dir=None, start_margin=0, sample_skip_head=0,
+                 raw_data_dir=None, start_margin=0,
+                 sample_skip_head_ratio=None,
                  sample_pregrasp_bias_enable=False,
                  sample_pregrasp_prob=0.0,
-                 sample_pregrasp_phase_window_len=16,
-                 sample_pregrasp_avoid_switch_tail=0):
+                 sample_pregrasp_phase_window_len=16):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -26,17 +26,60 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.max_action_len = max_action_len
         self.raw_data_dir = raw_data_dir
         self.start_margin = max(0, int(start_margin))
-        self.sample_skip_head = max(0, int(sample_skip_head))
+        self.sample_skip_head_ratio = None if sample_skip_head_ratio is None else float(sample_skip_head_ratio)
+        if self.sample_skip_head_ratio is not None:
+            self.sample_skip_head_ratio = float(np.clip(self.sample_skip_head_ratio, 0.0, 0.99))
         self.sample_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
         self.sample_pregrasp_prob = float(np.clip(sample_pregrasp_prob, 0.0, 1.0))
         self.sample_pregrasp_phase_window_len = max(1, int(sample_pregrasp_phase_window_len))
-        self.sample_pregrasp_avoid_switch_tail = max(0, int(sample_pregrasp_avoid_switch_tail))
         self._pregrasp_start_cache = {}
+        self._first_stage_len_cache = {}
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
         return len(self.episode_ids)
+
+    def _get_first_stage_len(self, episode_id, max_start):
+        key = (int(episode_id), int(max_start))
+        if key in self._first_stage_len_cache:
+            return self._first_stage_len_cache[key]
+
+        n_valid = int(max(1, max_start + 1))
+        first_stage_len = n_valid
+        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
+        try:
+            with h5py.File(dataset_path, "r") as root:
+                action = root["/action"][()]
+            if action.ndim == 2 and action.shape[1] >= 14 and action.shape[0] > 1:
+                lg = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
+                rg = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
+                n_scan = min(n_valid, lg.shape[0], rg.shape[0])
+                first_non_approach = n_scan
+                for ts in range(n_scan):
+                    ph = infer_phase_key_from_gt_window(
+                        lg[ts:],
+                        rg[ts:],
+                        self.sample_pregrasp_phase_window_len,
+                    )
+                    if ph != "approach":
+                        first_non_approach = ts
+                        break
+                first_stage_len = int(first_non_approach)
+        except Exception:
+            first_stage_len = n_valid
+
+        first_stage_len = int(np.clip(first_stage_len, 0, n_valid))
+        self._first_stage_len_cache[key] = first_stage_len
+        return first_stage_len
+
+    def _resolve_min_start(self, episode_id, max_start):
+        max_start = int(max(0, max_start))
+        if self.sample_skip_head_ratio is None:
+            return 0
+        first_stage_len = self._get_first_stage_len(episode_id, max_start)
+        min_start_ratio = int(np.floor(float(first_stage_len) * float(self.sample_skip_head_ratio)))
+        return int(np.clip(min_start_ratio, 0, max_start))
 
     def _get_pregrasp_start_candidates(self, episode_id, min_start, max_start):
         key = (int(episode_id), int(min_start), int(max_start))
@@ -62,11 +105,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 )
                 if ph == "pregrasp":
                     candidates.append(int(ts))
-            # Use all detected pregrasp candidates directly, but optionally
-            # drop the tail of each contiguous pregrasp segment to avoid
-            # sampling too close to the close-switch boundary.
-            if len(candidates) > 0 and self.sample_pregrasp_avoid_switch_tail > 0:
-                k = int(self.sample_pregrasp_avoid_switch_tail)
+            # Keep only the front 3/4 of each contiguous pregrasp segment.
+            # This avoids sampling near the switch boundary without using
+            # a hard-coded tail-step threshold.
+            if len(candidates) > 0:
                 kept = []
                 seg_start = 0
                 n = len(candidates)
@@ -75,7 +117,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     while seg_end + 1 < n and candidates[seg_end + 1] == candidates[seg_end] + 1:
                         seg_end += 1
                     seg = candidates[seg_start:seg_end + 1]
-                    keep_upto = max(0, len(seg) - k)
+                    keep_upto = max(1, int(np.floor(len(seg) * 0.75)))
                     if keep_upto > 0:
                         kept.extend(seg[:keep_upto])
                     seg_start = seg_end + 1
@@ -90,6 +132,36 @@ class EpisodicDataset(torch.utils.data.Dataset):
         sample_full_episode = False
 
         episode_id = self.episode_ids[index]
+        sample_pregrasp = False
+        if self.sample_pregrasp_bias_enable and self.sample_pregrasp_prob > 0.0:
+            sample_pregrasp = (np.random.rand() < self.sample_pregrasp_prob)
+        strict_pregrasp = bool(sample_pregrasp and self.sample_pregrasp_prob >= (1.0 - 1e-8))
+
+        # Strict mode: when pregrasp sampling is effectively mandatory (prob=1),
+        # do not fall back to random start_ts; resample across episodes instead.
+        forced_start_ts = None
+        if (not sample_full_episode) and strict_pregrasp:
+            n_ep = len(self.episode_ids)
+            found = False
+            for ofs in range(n_ep):
+                ep_try = self.episode_ids[(index + ofs) % n_ep]
+                path_try = os.path.join(self.dataset_dir, f"episode_{ep_try}.hdf5")
+                with h5py.File(path_try, "r") as root_try:
+                    ep_len_try = int(root_try["/action"].shape[0])
+                max_start_try = max(0, ep_len_try - 1 - self.start_margin)
+                min_start_try = self._resolve_min_start(ep_try, max_start_try)
+                cand_try = self._get_pregrasp_start_candidates(ep_try, min_start_try, max_start_try)
+                if len(cand_try) > 0:
+                    episode_id = ep_try
+                    forced_start_ts = int(np.random.choice(cand_try))
+                    found = True
+                    break
+            if not found:
+                raise RuntimeError(
+                    "Strict pregrasp sampling enabled (sample_pregrasp_prob=1.0), "
+                    "but no pregrasp candidates were found in any episode."
+                )
+
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
             is_sim = None
@@ -101,10 +173,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 # Avoid sampling too close to episode end so rollout/correction
                 # still has enough future horizon.
                 max_start = max(0, episode_len - 1 - self.start_margin)
-                min_start = min(max_start, self.sample_skip_head)
-                start_ts = np.random.randint(min_start, max_start + 1)
-                if self.sample_pregrasp_bias_enable and self.sample_pregrasp_prob > 0.0:
-                    if np.random.rand() < self.sample_pregrasp_prob:
+                min_start = self._resolve_min_start(episode_id, max_start)
+                if forced_start_ts is not None:
+                    start_ts = int(np.clip(forced_start_ts, min_start, max_start))
+                else:
+                    start_ts = np.random.randint(min_start, max_start + 1)
+                    if sample_pregrasp:
                         cand = self._get_pregrasp_start_candidates(episode_id, min_start, max_start)
                         if len(cand) > 0:
                             start_ts = int(np.random.choice(cand))
@@ -208,15 +282,16 @@ def get_norm_stats(dataset_dir, num_episodes):
 
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-              raw_data_dir=None, start_margin=0, sample_skip_head=0,
+              raw_data_dir=None, start_margin=0, sample_skip_head_ratio=None,
               sample_pregrasp_bias_enable=False,
               sample_pregrasp_prob=0.0,
-              sample_pregrasp_phase_window_len=16,
-              sample_pregrasp_avoid_switch_tail=0):
+              sample_pregrasp_phase_window_len=16):
     print(f"\nData from: {dataset_dir}\n")
     # Filter episodes that are too short for the requested start sampling range.
-    # Need at least one valid start_ts in [sample_skip_head, episode_len - 1 - start_margin].
-    min_required_len = int(max(0, sample_skip_head)) + int(max(0, start_margin)) + 1
+    # Need at least one valid start_ts in [min_start, episode_len - 1 - start_margin].
+    # For ratio-based skip-head, min_start depends on episode length, so only require
+    # enough length for max_start >= 0.
+    min_required_len = int(max(0, start_margin)) + 1
     train_indices = []
     skipped_short = []
     for ep in range(num_episodes):
@@ -230,7 +305,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     if len(train_indices) == 0:
         raise ValueError(
             f"No valid episodes: require len >= {min_required_len} "
-            f"(sample_skip_head={int(max(0, sample_skip_head))}, start_margin={int(max(0, start_margin))})."
+            f"(sample_skip_head_ratio={sample_skip_head_ratio}, "
+            f"start_margin={int(max(0, start_margin))})."
         )
     if len(skipped_short) > 0:
         print(
@@ -244,11 +320,10 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
                                     raw_data_dir=raw_data_dir, start_margin=start_margin,
-                                    sample_skip_head=sample_skip_head,
+                                    sample_skip_head_ratio=sample_skip_head_ratio,
                                     sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
                                     sample_pregrasp_prob=sample_pregrasp_prob,
-                                    sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
-                                    sample_pregrasp_avoid_switch_tail=sample_pregrasp_avoid_switch_tail)
+                                    sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
