@@ -16,6 +16,8 @@ eval_video/
 task_config/
 policy/weights/
 policy/ACT/evac*
+policy/ACT_LatentCorr
+act-*
 
 # Environment-specific generated content
 envs/curobo/

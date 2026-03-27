@@ -15,11 +15,6 @@ import numpy as np
 import pickle
 import argparse
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -1396,8 +1391,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # Choose error phase from the whole GT action window (prefix) instead of a single anchor.
         phase_window_len = int(cfg.get('sample_pregrasp_phase_window_len', rollout_exec_steps))
         phase_key = _infer_phase_key_from_gt_window(
-            left_grip_traj=left_grip_traj,
-            right_grip_traj=right_grip_traj,
+            left_grip_traj=left_grip_traj[int(t_star):],
+            right_grip_traj=right_grip_traj[int(t_star):],
             window_len=phase_window_len,
         )
         act_raw, perturbed, pert_mode, dyn_state = perturb_action_chunk_online(
@@ -1937,47 +1932,41 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
     qn = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
 
-    # --- debug: save full correction info ---
+    # --- debug: save correction summary jsons ---
     if debug_dir is not None:
-        import json, cv2
+        import json
         _dbg_corr = os.path.join(debug_dir, 'correction')
         os.makedirs(_dbg_corr, exist_ok=True)
-        # save correction trajectory
-        np.savetxt(os.path.join(_dbg_corr, 'corr_action_raw.csv'), corr, fmt='%.6f', delimiter=',')
-        # save corrected image (curr_image is BGR, cv2 expects BGR)
-        _cimg = (curr_image[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(_dbg_corr, 'corrected_image.png'), _cimg)
-        # save original image as GT frame at matched time (start_ts + t_star)
-        # fallback to current sampled image if GT decode fails.
-        _oimg = (image_data_s[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+        # Save correction projection overlays on original/corrected images.
         try:
-            ep_path = raw_data.get('episode_path', None)
-            if ep_path is not None and os.path.isfile(ep_path):
-                import h5py
-                with h5py.File(ep_path, 'r') as _f_gt:
-                    _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
-                _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
-                if _gt is not None and _gt.size > 0:
-                    _oimg = _gt
-        except Exception:
-            pass
-        # Keep original/corrected overlays in the same resolution.
-        if _oimg.shape[:2] != _cimg.shape[:2]:
-            _oimg = cv2.resize(_oimg, (_cimg.shape[1], _cimg.shape[0]), interpolation=cv2.INTER_LINEAR)
-        cv2.imwrite(os.path.join(_dbg_corr, 'original_image.png'), _oimg)
-        # Project correction trajectory via EVAC original get_traj for consistency.
-        _overlay_o = _oimg.copy()
-        _overlay_c = _cimg.copy()
-        traj_u8 = np.zeros_like(_oimg, dtype=np.uint8) + 50
-        try:
+            _cimg = (curr_image[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+            try:
+                ep_path = raw_data.get('episode_path', None)
+                if ep_path is not None and os.path.isfile(ep_path):
+                    import h5py
+                    with h5py.File(ep_path, 'r') as _f_gt:
+                        _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
+                    _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
+                    if _gt is not None and _gt.size > 0:
+                        _oimg = _gt
+            except Exception:
+                pass
+
+            if _oimg.shape[:2] != _cimg.shape[:2]:
+                _oimg = cv2.resize(_oimg, (_cimg.shape[1], _cimg.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+            _overlay_o = _oimg.copy()
+            _overlay_c = _cimg.copy()
+
             from evac.lvdm.models.ddpm3d import ACWMLatentDiffusion
             import evac.lvdm.models.ddpm3d as ddpm3d_mod
+
             K = raw_data['intrinsic_cv'].astype(np.float32).copy()
             E = np.eye(4, dtype=np.float32)
             E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
-            # Intrinsics are calibrated at native resolution. Overlay images are
-            # 640x480, so scale K to the current image size before projection.
+
             h_native, w_native = raw_data.get('native_resolution', (_oimg.shape[0], _oimg.shape[1]))
             h_img, w_img = _oimg.shape[:2]
             if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
@@ -1992,24 +1981,22 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             fk_seq = [fk.forward(corr[i, 0:6], corr[i, 7:13]) for i in range(corr.shape[0])]
             pose_list = []
             for ai, fr in enumerate(fk_seq):
-                lp, lq_wxyz = fr['left']
-                rp, rq_wxyz = fr['right']
-                # Follow evac_inference exactly: wxyz->xyzw and canonicalize w>=0.
+                lp_i, lq_wxyz = fr['left']
+                rp_i, rq_wxyz = fr['right']
                 lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
                 rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
                 if lq_xyzw[3] < 0:
                     lq_xyzw = -lq_xyzw
                 if rq_xyzw[3] < 0:
                     rq_xyzw = -rq_xyzw
-                # Follow EVAC get_traj convention: gripper in [0,120].
-                lg = float(np.clip(corr[ai, 6], 0.0, 1.0)) * 120.0
-                rg = float(np.clip(corr[ai, 13], 0.0, 1.0)) * 120.0
-                pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
-
+                lg_i = float(np.clip(corr[ai, 6], 0.0, 1.0)) * 120.0
+                rg_i = float(np.clip(corr[ai, 13], 0.0, 1.0)) * 120.0
+                pose_list.append(
+                    np.concatenate([lp_i, lq_xyzw, [lg_i], rp_i, rq_xyzw, [rg_i]], axis=0).astype(np.float32)
+                )
             pose_np = np.stack(pose_list, axis=0)
 
             def _render_endpoint_mask(pose_arr):
-                # Shorten orientation rays for endpoint markers only.
                 _orig_eef_pts = ddpm3d_mod.EndEffectorPts
                 ddpm3d_mod.EndEffectorPts = [
                     [0.0, 0.0, 0.0, 1.0],
@@ -2026,27 +2013,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         c2w[None, ...],
                         torch.from_numpy(K).float().unsqueeze(0),
                         radius=20,
-                    )  # (3,1,T,H,W), in [0,1]
+                    )
                 finally:
                     ddpm3d_mod.EndEffectorPts = _orig_eef_pts
-                traj_np = traj_tensor.detach().cpu().numpy()[:, 0]   # (3,T,H,W)
-                traj_np = np.transpose(traj_np, (1, 2, 3, 0))        # (T,H,W,3)
+                traj_np = traj_tensor.detach().cpu().numpy()[:, 0]
+                traj_np = np.transpose(traj_np, (1, 2, 3, 0))
                 t_len = traj_np.shape[0]
-                idx_start, idx_end = 0, max(0, t_len - 1)
-                traj_endpoints = np.maximum(traj_np[idx_start], traj_np[idx_end])  # (H,W,3)
+                idx_end = max(0, t_len - 1)
+                traj_endpoints = np.maximum(traj_np[0], traj_np[idx_end])
                 traj_u8 = np.clip(traj_endpoints * 255.0, 0.0, 255.0).astype(np.uint8)
                 mask = np.any(np.abs(traj_u8.astype(np.int16) - 50) > 2, axis=2)
-                return traj_u8, mask, idx_end
-
-            traj_u8, mask, idx_end = _render_endpoint_mask(pose_np)
-
-            # Keep UV projection utility for endpoint labels and original-vs-corrected comparison.
-            w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)         # (1,1,4,4)
-            intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)   # (1,1,3,3)
-            cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
-            ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+                return traj_u8, mask
 
             def _project_base_uv_from_pose_np(pose_arr):
+                w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
+                intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
+                cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+                ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+
                 pose_t = torch.from_numpy(pose_arr).float()
                 pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
                 pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
@@ -2056,8 +2040,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 pts_r = torch.matmul(ee2cam_r, ee_key_pts)
                 uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
                 uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
-                uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
-                uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()  # (T,4,2)
+                uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+                uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
                 return uvs_l, uvs_r, pts_l, pts_r
 
             def _extract_base_uv(uvs, pts):
@@ -2072,128 +2056,35 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         seq.append(None)
                 return seq
 
+            traj_u8, mask = _render_endpoint_mask(pose_np)
             uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
-            # reshape pts to [1,T,4,4] for consistent indexing above
-            pts_l_bt = pts_l.reshape(1, pts_l.shape[1], 4, 4)
-            pts_r_bt = pts_r.reshape(1, pts_r.shape[1], 4, 4)
-            luv = _extract_base_uv(uvs_l, pts_l_bt)
-            ruv = _extract_base_uv(uvs_r, pts_r_bt)
+            luv = _extract_base_uv(uvs_l, pts_l.reshape(1, pts_l.shape[1], 4, 4))
+            ruv = _extract_base_uv(uvs_r, pts_r.reshape(1, pts_r.shape[1], 4, 4))
 
-            C_LEFT = (0, 255, 0)
-            C_RIGHT = (0, 0, 255)
-            C_LEFT_GT = (0, 255, 255)
-            C_RIGHT_GT = (255, 255, 0)
-
-            # Middle trajectory: draw only base-point polyline (no orientation rays, no alpha blending).
-            for seq, color in ((luv, C_LEFT), (ruv, C_RIGHT)):
+            def _draw_polyline(img, seq, color):
                 prev = None
-                for k, pt in enumerate(seq):
-                    if k == 0 or k == idx_end:
-                        prev = pt
-                        continue
+                for pt in seq:
                     if pt is None:
                         prev = None
                         continue
                     if prev is not None:
-                        cv2.line(_overlay_c, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), color, 2, cv2.LINE_AA)
+                        cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), color, 2, cv2.LINE_AA)
                     prev = pt
+                if len(seq) > 0 and seq[0] is not None:
+                    cv2.circle(img, (int(seq[0][0]), int(seq[0][1])), 4, color, -1, cv2.LINE_AA)
+                if len(seq) > 0 and seq[-1] is not None:
+                    cv2.circle(img, (int(seq[-1][0]), int(seq[-1][1])), 4, color, -1, cv2.LINE_AA)
 
-            def _mark_start_end(img, seq, color, prefix):
-                if len(seq) == 0:
-                    return
-                s = seq[0]
-                e = seq[-1]
-                if s is not None:
-                    cv2.circle(img, (int(s[0]), int(s[1])), 4, color, -1, cv2.LINE_AA)
-                    cv2.putText(img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-                if e is not None:
-                    cv2.circle(img, (int(e[0]), int(e[1])), 4, color, -1, cv2.LINE_AA)
-                    cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            for _img in (_overlay_o, _overlay_c):
+                _img[mask] = (0.6 * _img[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
+                _draw_polyline(_img, luv, (0, 255, 0))
+                _draw_polyline(_img, ruv, (0, 0, 255))
 
-            _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
-            _mark_start_end(_overlay_c, luv, C_LEFT, "L")
-            _mark_start_end(_overlay_c, ruv, C_RIGHT, "R")
-
-            # On original image, show corrected-start vs GT-reference using the same get_traj circle rendering.
-            n_total = int(raw_data['left_endpose'].shape[0])
-            gt_end = int(min(n_total, gt_ref_idx + pose_np.shape[0]))
-            if gt_end > gt_ref_idx:
-                gt_pose_list = []
-                for gi in range(gt_ref_idx, gt_end):
-                    lp_gt = raw_data['left_endpose'][gi, :3].astype(np.float32)
-                    lq_gt_wxyz = raw_data['left_endpose'][gi, 3:7].astype(np.float32)
-                    rp_gt = raw_data['right_endpose'][gi, :3].astype(np.float32)
-                    rq_gt_wxyz = raw_data['right_endpose'][gi, 3:7].astype(np.float32)
-                    lq_gt_xyzw = np.array([lq_gt_wxyz[1], lq_gt_wxyz[2], lq_gt_wxyz[3], lq_gt_wxyz[0]], dtype=np.float32)
-                    rq_gt_xyzw = np.array([rq_gt_wxyz[1], rq_gt_wxyz[2], rq_gt_wxyz[3], rq_gt_wxyz[0]], dtype=np.float32)
-                    if lq_gt_xyzw[3] < 0:
-                        lq_gt_xyzw = -lq_gt_xyzw
-                    if rq_gt_xyzw[3] < 0:
-                        rq_gt_xyzw = -rq_gt_xyzw
-                    lg_gt = float(np.clip(raw_data['left_gripper'][gi], 0.0, 1.0)) * 120.0
-                    rg_gt = float(np.clip(raw_data['right_gripper'][gi], 0.0, 1.0)) * 120.0
-                    gt_pose_list.append(np.concatenate([lp_gt, lq_gt_xyzw, [lg_gt], rp_gt, rq_gt_xyzw, [rg_gt]], axis=0).astype(np.float32))
-                gt_pose_np = np.stack(gt_pose_list, axis=0)
-                gt_uvs_l, gt_uvs_r, gt_pts_l, gt_pts_r = _project_base_uv_from_pose_np(gt_pose_np)
-                gt_l_seq = _extract_base_uv(gt_uvs_l, gt_pts_l.reshape(1, gt_pts_l.shape[1], 4, 4))
-                gt_r_seq = _extract_base_uv(gt_uvs_r, gt_pts_r.reshape(1, gt_pts_r.shape[1], 4, 4))
-                corr_start_map, corr_start_mask, _ = _render_endpoint_mask(pose_np[:1])
-                gt_start_map, gt_start_mask, _ = _render_endpoint_mask(gt_pose_np[:1])
-                _overlay_o[corr_start_mask] = (0.55 * _overlay_o[corr_start_mask] + 0.45 * corr_start_map[corr_start_mask]).astype(np.uint8)
-                _overlay_o[gt_start_mask] = (0.55 * _overlay_o[gt_start_mask] + 0.45 * gt_start_map[gt_start_mask]).astype(np.uint8)
-
-                def _label_point(img, pt, text, color):
-                    if pt is None:
-                        return
-                    x, y = int(pt[0]), int(pt[1])
-                    cv2.putText(img, text, (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-
-                _label_point(_overlay_o, luv[0] if len(luv) > 0 else None, "L-C", C_LEFT)
-                _label_point(_overlay_o, ruv[0] if len(ruv) > 0 else None, "R-C", C_RIGHT)
-                _label_point(_overlay_o, gt_l_seq[0] if len(gt_l_seq) > 0 else None, "L-GT", C_LEFT_GT)
-                _label_point(_overlay_o, gt_r_seq[0] if len(gt_r_seq) > 0 else None, "R-GT", C_RIGHT_GT)
-
-            def _draw_legend(img, rows):
-                if len(rows) == 0:
-                    return
-                x0, y0 = 10, 10
-                row_h = 20
-                w = 170
-                h = 10 + row_h * len(rows) + 8
-                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
-                cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
-                for i, (name, color) in enumerate(rows):
-                    y = y0 + 18 + i * row_h
-                    cv2.circle(img, (x0 + 12, y - 4), 4, color, -1, cv2.LINE_AA)
-                    cv2.putText(img, name, (x0 + 24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
-
-            _draw_legend(_overlay_c, [
-                ("L start/end", C_LEFT),
-                ("R start/end", C_RIGHT),
-            ])
-            _draw_legend(_overlay_o, [
-                ("L-C corrected", C_LEFT),
-                ("R-C corrected", C_RIGHT),
-                ("L-GT reference", C_LEFT_GT),
-                ("R-GT reference", C_RIGHT_GT),
-            ])
-            with open(os.path.join(_dbg_corr, 'corr_projection_debug.json'), 'w') as _f:
-                json.dump({
-                    'projection_chain': 'evac_inference_compatible_link6',
-                    'mask_pixels': int(np.count_nonzero(mask)),
-                    'gt_ref_index_for_original': int(gt_ref_idx),
-                    'image_hw': [int(h_img), int(w_img)],
-                    'native_hw': [int(h_native), int(w_native)],
-                }, _f, indent=2)
+            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
+            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
         except Exception:
-            import traceback
-            with open(os.path.join(_dbg_corr, 'corr_projection_error.txt'), 'w') as _f:
-                _f.write(traceback.format_exc())
-        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_traj_raw.png'), traj_u8)
-        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
-        cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+            pass
+
         # save planner results summary (rollout-centric and concise)
         _video_map = {}
         for _v in evac_rollout_videos:
@@ -2306,7 +2197,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'gt_ref_index_for_original': int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1)),
                 'num_rollouts': int(len(_rollout_records)),
             },
-            'rollouts': _rollout_records,
             'final_match': {
                 't_star': int(t_star),
                 'min_dist': float(min_dist),
@@ -2338,6 +2228,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'correction_prefix_len': int(prefix_len),
             },
         }
+        # closed_loop_info.json already records detailed closed-loop rollout traces.
+        # Keep correction_info focused on correction planning/targeting summary.
+        _plan_info['rollout_summary'].pop('start_ts', None)
+        _plan_info['rollout_summary'].pop('rollout_exec_steps', None)
+        _plan_info['final_match'].pop('t_star', None)
+        _plan_info['final_match'].pop('anchor_idx', None)
         with open(os.path.join(_dbg_corr, 'correction_info.json'), 'w') as _f:
             json.dump(_plan_info, _f, indent=2)
 
@@ -2350,6 +2246,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _rec = {
                 'step': _r.get('step'),
                 't_star': _r.get('t_star'),
+                'phase_key': _r.get('phase_key'),
                 'anchor_idx': _r.get('anchor_idx'),
                 'action_perturbed': _r.get('action_perturbed'),
                 'perturb_mode': _r.get('perturb_mode'),
@@ -2389,23 +2286,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         }
         with open(os.path.join(_dbg_corr, 'closed_loop_info.json'), 'w') as _f:
             json.dump(_closed_loop_info, _f, indent=2)
-        # save correction trajectory plot
-        try:
-            fig, axes = plt.subplots(2, 1, figsize=(14, 6))
-            labels_l = ['lj1','lj2','lj3','lj4','lj5','lj6','lg']
-            labels_r = ['rj1','rj2','rj3','rj4','rj5','rj6','rg']
-            for j in range(7):
-                axes[0].plot(corr[:, j], label=labels_l[j])
-                axes[1].plot(corr[:, 7+j], label=labels_r[j])
-            axes[0].set_title('Left arm correction trajectory')
-            axes[0].legend(fontsize=7, ncol=4)
-            axes[1].set_title('Right arm correction trajectory')
-            axes[1].legend(fontsize=7, ncol=4)
-            plt.tight_layout()
-            plt.savefig(os.path.join(_dbg_corr, 'corr_trajectory.png'), dpi=100)
-            plt.close(fig)
-        except Exception:
-            pass
 
     corr_meta = {
         "closed_loop_fallback_used": bool(force_generate_correction and (not min_dist_triggered)),
