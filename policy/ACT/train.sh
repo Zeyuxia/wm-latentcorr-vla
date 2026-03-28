@@ -21,21 +21,25 @@ state_dim=14
 
 # World model parameters
 enable_wm=true
-evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+# evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
+evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=5624-step=22500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 curobo_right_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
 raw_data_dir=/data/zhenyangfan/RoboTwin/data/${task_name}/${task_config}/data
 act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
-max_rollout_steps=3
+max_rollout_steps=1
 target_mode=backward
-target_lookahead_steps=6
+target_lookahead_steps=0
 min_dist_fallback_force_correction=true
 min_dist_recover_ratio=0.75
 debug_recover_eval_rollout=true
-correction_interp_nearest_enable=true
-correction_interp_prefix_ratio=0.4
+debug_correction_evac_rollout=true
+correction_interp_nearest_enable=false
+correction_interp_prefix_ratio=0.6
+correction_planner_prefix_ratio=0.5
+correction_compose_gt_tail_enable=true
 rollout_exec_steps=16
 correction_weight=2.0
 orient_weight=0.0573
@@ -49,10 +53,10 @@ export_correction_dir=
 enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
-perturb_open_laptop_pregrasp_close_prob=0.6
-perturb_open_laptop_pregrasp_translation_prob=0.4
+perturb_open_laptop_pregrasp_close_prob=0.5
+perturb_open_laptop_pregrasp_translation_prob=0.5
 perturb_open_laptop_pregrasp_rotation_prob=0.0
-perturb_eef_fail_gain=0.08
+perturb_eef_fail_gain=0.05
 perturb_rot_max_deg=15
 perturb_mag_random=true
 perturb_mag_rand_min=1.00
@@ -73,8 +77,12 @@ sp_reg_enable=true
 sp_reg_lambda=1e-5
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
-sample_pregrasp_phase_window_len=16
+sample_pregrasp_phase_window_len=24
+sample_pregrasp_keep_start_ratio=0.0
+sample_pregrasp_keep_end_ratio=0.5
 sample_skip_head_ratio=0.25
+wm_corr_pregrasp_extra_enable=true
+wm_corr_pregrasp_extra_ratio=0.5
 
 
 
@@ -113,8 +121,11 @@ if [ "${enable_wm}" = "true" ]; then
     --min_dist_fallback_force_correction ${min_dist_fallback_force_correction} \
     --min_dist_recover_ratio ${min_dist_recover_ratio} \
     --debug_recover_eval_rollout ${debug_recover_eval_rollout} \
+    --debug_correction_evac_rollout ${debug_correction_evac_rollout} \
     --correction_interp_nearest_enable ${correction_interp_nearest_enable} \
     --correction_interp_prefix_ratio ${correction_interp_prefix_ratio} \
+    --correction_planner_prefix_ratio ${correction_planner_prefix_ratio} \
+    --correction_compose_gt_tail_enable ${correction_compose_gt_tail_enable} \
     --rollout_exec_steps ${rollout_exec_steps} \
     --correction_weight ${correction_weight} \
     --orient_weight ${orient_weight} \
@@ -160,6 +171,10 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
 --sample_pregrasp_prob ${sample_pregrasp_prob} \
 --sample_pregrasp_phase_window_len ${sample_pregrasp_phase_window_len} \
+--sample_pregrasp_keep_start_ratio ${sample_pregrasp_keep_start_ratio} \
+--sample_pregrasp_keep_end_ratio ${sample_pregrasp_keep_end_ratio} \
+--wm_corr_pregrasp_extra_enable ${wm_corr_pregrasp_extra_enable} \
+--wm_corr_pregrasp_extra_ratio ${wm_corr_pregrasp_extra_ratio} \
 "
 
 # Build ACT training flags
