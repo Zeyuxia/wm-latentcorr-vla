@@ -2,7 +2,7 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-gpu_ids=4
+gpu_ids=4,5,6,7
 main_process_port=28900
 task_name=open_laptop
 task_config=demo_clean
@@ -34,7 +34,7 @@ target_mode=backward
 target_lookahead_steps=4
 min_dist_fallback_force_correction=true
 min_dist_recover_ratio=0.75
-debug_recover_eval_rollout=true
+debug_recover_eval_rollout=false
 debug_correction_evac_rollout=true
 correction_interp_nearest_enable=false
 correction_interp_prefix_ratio=0.6
@@ -198,7 +198,7 @@ if [ -n "${act_init_ckpt}" ]; then
     train_flags="${train_flags} --act_init_ckpt ${act_init_ckpt}"
 fi
 
-CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     ${gpu_flags} \
     imitate_episodes.py \
     ${train_flags} \
