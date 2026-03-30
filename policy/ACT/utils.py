@@ -19,7 +19,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
                  sample_pregrasp_prob=0.0,
                  sample_pregrasp_phase_window_len=16,
                  sample_pregrasp_keep_start_ratio=0.0,
-                 sample_pregrasp_keep_end_ratio=0.5):
+                 sample_pregrasp_keep_end_ratio=0.5,
+                 sample_pregrasp_close_offset_steps=None):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -38,6 +39,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.sample_pregrasp_keep_end_ratio = float(np.clip(sample_pregrasp_keep_end_ratio, 0.0, 1.0))
         if self.sample_pregrasp_keep_end_ratio < self.sample_pregrasp_keep_start_ratio:
             self.sample_pregrasp_keep_end_ratio = self.sample_pregrasp_keep_start_ratio
+        self.sample_pregrasp_close_offset_steps = None
+        if sample_pregrasp_close_offset_steps is not None:
+            s = int(sample_pregrasp_close_offset_steps)
+            if s > 0:
+                self.sample_pregrasp_close_offset_steps = s
         self._pregrasp_start_cache = {}
         self._first_stage_len_cache = {}
         self._strict_pregrasp_calls = 0
@@ -127,10 +133,35 @@ class EpisodicDataset(torch.utils.data.Dataset):
                         seg_end += 1
                     seg = candidates[seg_start:seg_end + 1]
                     seg_len = len(seg)
-                    keep_l = int(np.floor(seg_len * self.sample_pregrasp_keep_start_ratio))
-                    keep_r = int(np.ceil(seg_len * self.sample_pregrasp_keep_end_ratio))
-                    keep_l = int(np.clip(keep_l, 0, max(0, seg_len - 1)))
-                    keep_r = int(np.clip(keep_r, keep_l + 1, seg_len))
+                    if self.sample_pregrasp_close_offset_steps is not None:
+                        # Use a fixed-length pregrasp window before close transition:
+                        # end   = close_idx - rollout_exec_steps
+                        # start = end - rollout_exec_steps
+                        # (both inclusive, clipped to current pregrasp segment)
+                        close_idx = None
+                        l_bin = (lg > 0.5).astype(np.int32)
+                        r_bin = (rg > 0.5).astype(np.int32)
+                        scan_start = int(np.clip(seg[0] + 1, 1, len(l_bin) - 1))
+                        for t in range(scan_start, len(l_bin)):
+                            l_close = bool(l_bin[t - 1] == 1 and l_bin[t] == 0)
+                            r_close = bool(r_bin[t - 1] == 1 and r_bin[t] == 0)
+                            if l_close or r_close:
+                                close_idx = int(t)
+                                break
+                        if close_idx is None:
+                            close_idx = int(seg[-1])
+                        off = int(self.sample_pregrasp_close_offset_steps)
+                        keep_end_abs = int(close_idx - off)
+                        keep_start_abs = int(keep_end_abs - off)
+                        keep_start_abs = int(np.clip(keep_start_abs, seg[0], seg[-1]))
+                        keep_end_abs = int(np.clip(keep_end_abs, keep_start_abs, seg[-1]))
+                        keep_l = int(keep_start_abs - seg[0])
+                        keep_r = int(keep_end_abs - seg[0] + 1)  # slice end (exclusive)
+                    else:
+                        keep_l = int(np.floor(seg_len * self.sample_pregrasp_keep_start_ratio))
+                        keep_l = int(np.clip(keep_l, 0, max(0, seg_len - 1)))
+                        keep_r = int(np.ceil(seg_len * self.sample_pregrasp_keep_end_ratio))
+                        keep_r = int(np.clip(keep_r, keep_l + 1, seg_len))
                     kept.extend(seg[keep_l:keep_r])
                     seg_start = seg_end + 1
                 candidates = [int(ts) for ts in kept]
@@ -352,7 +383,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               sample_pregrasp_prob=0.0,
               sample_pregrasp_phase_window_len=16,
               sample_pregrasp_keep_start_ratio=0.0,
-              sample_pregrasp_keep_end_ratio=0.5):
+              sample_pregrasp_keep_end_ratio=0.5,
+              sample_pregrasp_close_offset_steps=None):
     print(f"\nData from: {dataset_dir}\n")
     # Filter episodes that are too short for the requested start sampling range.
     # Need at least one valid start_ts in [min_start, episode_len - 1 - start_margin].
@@ -392,7 +424,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                     sample_pregrasp_prob=sample_pregrasp_prob,
                                     sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
                                     sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-                                    sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio)
+                                    sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+                                    sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,

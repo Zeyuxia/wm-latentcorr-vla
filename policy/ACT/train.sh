@@ -2,8 +2,8 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-gpu_ids=0
-main_process_port=29500
+gpu_ids=4
+main_process_port=28900
 task_name=open_laptop
 task_config=demo_clean
 expert_data_num=50
@@ -22,7 +22,7 @@ state_dim=14
 # World model parameters
 enable_wm=true
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
-evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=5624-step=22500.ckpt
+evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3124-step=12500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -31,7 +31,7 @@ raw_data_dir=/data/zhenyangfan/RoboTwin/data/${task_name}/${task_config}/data
 act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
 max_rollout_steps=1
 target_mode=backward
-target_lookahead_steps=0
+target_lookahead_steps=4
 min_dist_fallback_force_correction=true
 min_dist_recover_ratio=0.75
 debug_recover_eval_rollout=true
@@ -39,6 +39,7 @@ debug_correction_evac_rollout=true
 correction_interp_nearest_enable=false
 correction_interp_prefix_ratio=0.6
 correction_planner_prefix_ratio=0.5
+correction_gripper_close_prefix_ratio=0.32
 correction_compose_gt_tail_enable=true
 rollout_exec_steps=16
 correction_weight=2.0
@@ -46,6 +47,7 @@ orient_weight=0.0573
 gripper_penalty=1.0
 recover_gripper_penalty=0.0
 debug_wm=true
+debug_loss_batch_projection=true
 export_correction_dataset=true
 export_correction_dir=
 
@@ -54,11 +56,11 @@ enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
 perturb_open_laptop_pregrasp_close_prob=0.5
-perturb_open_laptop_pregrasp_translation_prob=0.5
+perturb_open_laptop_pregrasp_translation_prob=0.0
 perturb_open_laptop_pregrasp_rotation_prob=0.0
-perturb_eef_fail_gain=0.05
+perturb_eef_fail_gain=0.10
 perturb_rot_max_deg=15
-perturb_mag_random=true
+perturb_mag_random=false
 perturb_mag_rand_min=1.00
 perturb_mag_rand_max=1.40
 perturb_reject_sampling_enable=true
@@ -70,21 +72,19 @@ nearest_window_radius=12
 perturb_gripper_close_min=0.10
 perturb_gripper_open_max=0.90
 perturb_gripper_fast_ratio=0.20
-lr_sched_enable=true
+lr_sched_enable=false
 lr_warmup_steps=30
 lr_min_ratio=0.1
-sp_reg_enable=true
-sp_reg_lambda=1e-5
+sp_reg_enable=false
+sp_reg_lambda=0.0
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
-sample_pregrasp_phase_window_len=24
-sample_pregrasp_keep_start_ratio=0.0
+sample_pregrasp_phase_window_len=30
+sample_pregrasp_keep_start_ratio=0.3
 sample_pregrasp_keep_end_ratio=0.5
 sample_skip_head_ratio=0.25
 wm_corr_pregrasp_extra_enable=true
 wm_corr_pregrasp_extra_ratio=0.5
-
-
 
 # Build saving dirs
 timestamp=$(date +"%Y%m%d_%H%M%S")
@@ -125,6 +125,7 @@ if [ "${enable_wm}" = "true" ]; then
     --correction_interp_nearest_enable ${correction_interp_nearest_enable} \
     --correction_interp_prefix_ratio ${correction_interp_prefix_ratio} \
     --correction_planner_prefix_ratio ${correction_planner_prefix_ratio} \
+    --correction_gripper_close_prefix_ratio ${correction_gripper_close_prefix_ratio} \
     --correction_compose_gt_tail_enable ${correction_compose_gt_tail_enable} \
     --rollout_exec_steps ${rollout_exec_steps} \
     --correction_weight ${correction_weight} \
@@ -139,6 +140,7 @@ if [ "${enable_wm}" = "true" ]; then
     if [ "${debug_wm}" = "true" ]; then
         wm_flags="${wm_flags} --debug_wm_correction"
     fi
+    wm_flags="${wm_flags} --debug_loss_batch_projection ${debug_loss_batch_projection}"
 fi
 
 # Build perturb flags

@@ -199,12 +199,12 @@ def _forward_away_dir(forward_dir, curr_pos, anchor_pos):
     return mix.astype(np.float32)
 
 
-def _traj_dir_after_anchor(ep, anchor_idx, lookahead=64):
+def _traj_dir_after_anchor(ep, anchor_idx, lookahead=128):
     d, _ = _traj_dir_after_anchor_with_idx(ep, anchor_idx, lookahead=lookahead)
     return d
 
 
-def _traj_dir_after_anchor_with_idx(ep, anchor_idx, lookahead=64):
+def _traj_dir_after_anchor_with_idx(ep, anchor_idx, lookahead=128):
     if ep is None:
         return None, None
     ep = np.asarray(ep, dtype=np.float32)
@@ -315,16 +315,15 @@ def _perturb_action_chunk_target_pose(
     mode = str(error_mode).lower()
     curr_left_q = np.asarray(curr_left_q, dtype=np.float32)
     curr_right_q = np.asarray(curr_right_q, dtype=np.float32)
-    # Use the unperturbed action chunk terminal pose as perturbation base
-    # (instead of GT target pose), so perturb_pre/post compare in the same frame.
-    q_end = np.asarray(act_raw[-1], dtype=np.float32)
-    fr_end = fk.forward(np.asarray(q_end[0:6], dtype=np.float32), np.asarray(q_end[7:13], dtype=np.float32))
-    l_end_p = np.asarray(fr_end["left"][0], dtype=np.float32)
-    l_end_q = np.asarray(fr_end["left"][1], dtype=np.float32)
-    r_end_p = np.asarray(fr_end["right"][0], dtype=np.float32)
-    r_end_q = np.asarray(fr_end["right"][1], dtype=np.float32)
-    l_pose_base = np.array([l_end_p[0], l_end_p[1], l_end_p[2], l_end_q[0], l_end_q[1], l_end_q[2], l_end_q[3]], dtype=np.float32)
-    r_pose_base = np.array([r_end_p[0], r_end_p[1], r_end_p[2], r_end_q[0], r_end_q[1], r_end_q[2], r_end_q[3]], dtype=np.float32)
+    # Use the first unperturbed action pose as perturbation base.
+    q_base = np.asarray(act_raw[0], dtype=np.float32)
+    fr_base = fk.forward(np.asarray(q_base[0:6], dtype=np.float32), np.asarray(q_base[7:13], dtype=np.float32))
+    l_base_p = np.asarray(fr_base["left"][0], dtype=np.float32)
+    l_base_q = np.asarray(fr_base["left"][1], dtype=np.float32)
+    r_base_p = np.asarray(fr_base["right"][0], dtype=np.float32)
+    r_base_q = np.asarray(fr_base["right"][1], dtype=np.float32)
+    l_pose_base = np.array([l_base_p[0], l_base_p[1], l_base_p[2], l_base_q[0], l_base_q[1], l_base_q[2], l_base_q[3]], dtype=np.float32)
+    r_pose_base = np.array([r_base_p[0], r_base_p[1], r_base_p[2], r_base_q[0], r_base_q[1], r_base_q[2], r_base_q[3]], dtype=np.float32)
     anti_dbg = {}
     if (not active_left_arm) and (not active_right_arm) and mode != "gripper_close":
         return out, False, "target_pose_inactive_arms", None
@@ -414,26 +413,36 @@ def _perturb_action_chunk_target_pose(
     qpos_full[fk.fl_idx] = curr_left_q
     qpos_full[fk.fr_idx] = curr_right_q
 
-    def _compose_plan_with_gt_tail(plan_future, gt_chunk, target_local_idx, out_len):
-        """Keep short planner path; append GT tail after target; resample only when planner path is too long."""
+    def _fit_plan_to_len(plan_future, curr_q, out_len):
+        """Use planner prefix only: resample/pad to fixed output length."""
         p = np.asarray(plan_future, dtype=np.float32)
-        g = np.asarray(gt_chunk, dtype=np.float32)
-        if p.ndim != 2 or p.shape[1] != g.shape[1] or p.shape[0] == 0:
-            return g[:out_len].copy()
-        if p.shape[0] >= out_len:
-            return resample_trajectory(p, out_len).astype(np.float32)
+        if p.ndim != 2 or p.shape[0] == 0:
+            return np.repeat(np.asarray(curr_q, dtype=np.float32)[None, :], out_len, axis=0)
+        if p.shape[0] == out_len:
+            return p.astype(np.float32)
+        return resample_trajectory(p, out_len).astype(np.float32)
 
-        seq = [p]
-        gt_tail_start = int(np.clip(target_local_idx + 1, 0, g.shape[0]))
-        gt_tail = g[gt_tail_start:]
-        if gt_tail.shape[0] > 0:
-            seq.append(gt_tail)
-        cat = np.concatenate(seq, axis=0)
-        if cat.shape[0] >= out_len:
-            return cat[:out_len].astype(np.float32)
-        last = cat[-1:] if cat.shape[0] > 0 else g[-1:]
-        pad = np.repeat(last.astype(np.float32), out_len - cat.shape[0], axis=0)
-        return np.concatenate([cat, pad], axis=0).astype(np.float32)
+    def _time_warp_plan(plan_seq, gamma):
+        """
+        Time-warp a joint trajectory while keeping endpoints unchanged.
+        gamma < 1.0 => faster progress at the beginning, slower near the end.
+        """
+        p = np.asarray(plan_seq, dtype=np.float32)
+        if p.ndim != 2 or p.shape[0] <= 2:
+            return p
+        g = float(gamma)
+        if not np.isfinite(g) or g <= 0.0 or abs(g - 1.0) < 1e-6:
+            return p
+        n = int(p.shape[0])
+        src_t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        dst_t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        dst_t_warp = np.power(dst_t, g).astype(np.float32)
+        out = np.zeros_like(p, dtype=np.float32)
+        for j in range(p.shape[1]):
+            out[:, j] = np.interp(dst_t_warp, src_t, p[:, j]).astype(np.float32)
+        out[0] = p[0]
+        out[-1] = p[-1]
+        return out
 
     # For pure gripper-error modes, keep arm pose fixed at current state.
     if mode == "gripper_close":
@@ -452,7 +461,10 @@ def _perturb_action_chunk_target_pose(
             return act_raw, False, "target_pose_left_empty_path", {"target_idx": int(idx)}
         # Planner path usually includes current state at index 0; action chunk should be future commands.
         l_future = l_path[1:] if l_path.shape[0] > 1 else l_path
-        lt = _compose_plan_with_gt_tail(l_future, out[:, 0:6], local_target_idx, T)
+        if mode == "translation":
+            lift_gamma = float(cfg.get("perturb_translation_lift_gamma", 1.0))
+            l_future = _time_warp_plan(l_future, lift_gamma)
+        lt = _fit_plan_to_len(l_future, curr_left_q, T)
     if active_right_arm and mode != "gripper_close":
         res_r = planner_r.plan_path(qpos_full, sapien.Pose(r_pose[:3], r_pose[3:7]), arms_tag="right")
         if res_r.get("status") != "Success":
@@ -461,7 +473,10 @@ def _perturb_action_chunk_target_pose(
         if r_path.ndim != 2 or r_path.shape[0] == 0:
             return act_raw, False, "target_pose_right_empty_path", {"target_idx": int(idx)}
         r_future = r_path[1:] if r_path.shape[0] > 1 else r_path
-        rt = _compose_plan_with_gt_tail(r_future, out[:, 7:13], local_target_idx, T)
+        if mode == "translation":
+            lift_gamma = float(cfg.get("perturb_translation_lift_gamma", 1.0))
+            r_future = _time_warp_plan(r_future, lift_gamma)
+        rt = _fit_plan_to_len(r_future, curr_right_q, T)
 
     out[:, 0:6] = lt
     out[:, 7:13] = rt
@@ -804,6 +819,20 @@ def main(args):
     sample_pregrasp_keep_end_ratio = float(args['sample_pregrasp_keep_end_ratio'])
     wm_corr_pregrasp_extra_enable = bool(args['wm_corr_pregrasp_extra_enable'])
     wm_corr_pregrasp_extra_ratio = float(np.clip(args['wm_corr_pregrasp_extra_ratio'], 0.0, 1.0))
+    sample_pregrasp_close_offset_steps = None
+    if args.get('rollout_exec_steps', None) is not None:
+        _off = int(args['rollout_exec_steps'])
+        if _off > 0:
+            sample_pregrasp_close_offset_steps = _off
+    # Keep pregrasp-biased sampling strictly behind the WM switch.
+    # When WM is disabled, training should follow plain random start sampling.
+    if not enable_wm:
+        sample_skip_head_ratio = 0.0
+        sample_pregrasp_bias_enable = False
+        sample_pregrasp_prob = 0.0
+        wm_corr_pregrasp_extra_enable = False
+        wm_corr_pregrasp_extra_ratio = 0.0
+        sample_pregrasp_close_offset_steps = None
     if enable_wm:
         wm_required = ['evac_ckpt', 'evac_config', 'urdf_path', 'curobo_left_yml',
                         'curobo_right_yml', 'raw_data_dir', 'act_init_ckpt',
@@ -842,6 +871,7 @@ def main(args):
         sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
         sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
         sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
     )
     corr_train_dataloader = None
     if use_extra_pregrasp_corr:
@@ -860,6 +890,7 @@ def main(args):
             sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
             sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
             sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+            sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
         )
         print(f"[main][rank={_rank}] extra pregrasp correction dataloader enabled | corr_batch_size={corr_batch_size}")
     print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
@@ -891,6 +922,7 @@ def main(args):
             'correction_interp_nearest_enable': args['correction_interp_nearest_enable'],
             'correction_interp_prefix_ratio': args['correction_interp_prefix_ratio'],
             'correction_planner_prefix_ratio': args['correction_planner_prefix_ratio'],
+            'correction_gripper_close_prefix_ratio': args['correction_gripper_close_prefix_ratio'],
             'correction_compose_gt_tail_enable': args['correction_compose_gt_tail_enable'],
             'correction_gripper_switch_ratio': args['correction_gripper_switch_ratio'],
             'rollout_exec_steps': int(rollout_exec_steps),
@@ -927,6 +959,7 @@ def main(args):
         }
     config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
+    config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
     print(f"[main][rank={_rank}] before train_bc | enable_wm={enable_wm}")
     train_bc(train_dataloader, config, corr_train_dataloader=corr_train_dataloader)
 
@@ -1263,6 +1296,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     correction_interp_nearest_enable = bool(cfg['correction_interp_nearest_enable'])
     correction_interp_prefix_ratio = float(np.clip(cfg['correction_interp_prefix_ratio'], 0.0, 1.0))
     correction_planner_prefix_ratio = float(np.clip(cfg.get('correction_planner_prefix_ratio', 0.8), 0.0, 1.0))
+    correction_gripper_close_prefix_ratio = float(
+        np.clip(cfg.get('correction_gripper_close_prefix_ratio', correction_planner_prefix_ratio), 0.0, 1.0)
+    )
     correction_compose_gt_tail_enable = bool(cfg.get('correction_compose_gt_tail_enable', True))
     chunk_size = cfg['chunk_size']
     rollout_exec_steps = int(cfg['rollout_exec_steps'])
@@ -1929,7 +1965,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                            'rollout': _dbg_rollout}, _f, indent=2)
         return None
 
-    if correction_interp_nearest_enable:
+    if nearest_mode == "gripper_close":
+        # For early-close timing error, follow rollout time directly
+        # instead of nearest-point matching.
+        t_target = int(np.clip(rollout_steps_total, 0, len(left_ep) - 1))
+    elif correction_interp_nearest_enable:
         t_target = int(np.clip(t_star, 0, len(left_ep) - 1))
     else:
         if target_mode == 'backward':
@@ -1942,6 +1982,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
     res_l = {'status': 'SkippedInactive', 'position': np.repeat(np.asarray(left_q, dtype=np.float32)[None, :], 1, axis=0)}
     res_r = {'status': 'SkippedInactive', 'position': np.repeat(np.asarray(right_q, dtype=np.float32)[None, :], 1, axis=0)}
+    gripper_close_suffix_len_dbg = None
+    gripper_close_uniformized_points_dbg = None
+    gripper_close_uniformized_spans_dbg = None
     if correction_interp_nearest_enable:
         prefix_len = int(np.clip(np.floor(chunk_size * correction_interp_prefix_ratio), 1, max(1, chunk_size - 1)))
 
@@ -2113,50 +2156,215 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         return np.concatenate([cat, pad], axis=0).astype(np.float32)
 
     if not correction_interp_nearest_enable:
+        if nearest_mode == "gripper_close":
+            # Dedicated correction for early-close error:
+            # 1) quickly reopen gripper, 2) follow GT forward.
+            prefix_len = int(np.clip(np.floor(chunk_size * correction_gripper_close_prefix_ratio), 1, max(1, chunk_size - 1)))
+            # For gripper_close correction, compose tail directly from sampled start_ts.
+            # Do not shift by rollout_steps_total.
+            follow_idx = 0
+            follow_abs = int(start_ts)
+            suffix_len = int(max(0, chunk_size - prefix_len))
+
+            def _interp_prefix(curr, target, n):
+                curr = np.asarray(curr, dtype=np.float32)
+                target = np.asarray(target, dtype=np.float32)
+                if n <= 1:
+                    return target[None, :].astype(np.float32)
+                alpha = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+                return ((1.0 - alpha) * curr[None, :] + alpha * target[None, :]).astype(np.float32)
+
+            def _take_tail(gt_seq, start_idx, n, fallback):
+                if n <= 0:
+                    return np.zeros((0,) + np.asarray(fallback).shape, dtype=np.float32)
+                if gt_seq is None:
+                    return np.repeat(np.asarray(fallback, dtype=np.float32)[None, ...], n, axis=0)
+                g = np.asarray(gt_seq, dtype=np.float32)
+                if g.ndim == 1:
+                    g = g[:, None]
+                s = int(np.clip(start_idx, 0, max(0, g.shape[0])))
+                tail = g[s:s + n]
+                if tail.shape[0] >= n:
+                    return tail.astype(np.float32)
+                last = np.asarray(fallback, dtype=np.float32)
+                if tail.shape[0] > 0:
+                    last = tail[-1]
+                pad = np.repeat(last[None, ...], n - tail.shape[0], axis=0).astype(np.float32)
+                if tail.shape[0] == 0:
+                    return pad
+                return np.concatenate([tail.astype(np.float32), pad], axis=0).astype(np.float32)
+
+            def _resample_joint_pair_by_eef_distance(l_seg, r_seg):
+                """
+                Uniformize by EEF travel distance (active arm only), then interpolate
+                both joint sequences on that distance parameter.
+                """
+                lq = np.asarray(l_seg, dtype=np.float32)
+                rq = np.asarray(r_seg, dtype=np.float32)
+                if lq.ndim != 2 or rq.ndim != 2:
+                    return lq, rq
+                m = int(min(lq.shape[0], rq.shape[0]))
+                if m <= 2:
+                    return lq, rq
+                left_on = bool(active_info_fixed.get('left_arm', True))
+                right_on = bool(active_info_fixed.get('right_arm', True))
+                if (not left_on) and (not right_on):
+                    left_on, right_on = True, True
+                try:
+                    lp_seq, rp_seq = [], []
+                    for i in range(m):
+                        fr = fk.forward(lq[i], rq[i])
+                        lp_seq.append(np.asarray(fr['left'][0], dtype=np.float32))
+                        rp_seq.append(np.asarray(fr['right'][0], dtype=np.float32))
+                    lp = np.stack(lp_seq, axis=0)
+                    rp = np.stack(rp_seq, axis=0)
+                except Exception:
+                    # If FK fails for this segment, keep original sequence.
+                    return lq, rq
+                step = np.zeros((m - 1,), dtype=np.float32)
+                n_used = 0
+                if left_on:
+                    step += np.linalg.norm(lp[1:] - lp[:-1], axis=1)
+                    n_used += 1
+                if right_on:
+                    step += np.linalg.norm(rp[1:] - rp[:-1], axis=1)
+                    n_used += 1
+                step /= float(max(1, n_used))
+                cum = np.concatenate([np.array([0.0], dtype=np.float32), np.cumsum(step, dtype=np.float32)])
+                total = float(cum[-1])
+                if (not np.isfinite(total)) or total <= 1e-8:
+                    return lq, rq
+                tgt = np.linspace(0.0, total, m, dtype=np.float32)
+                lo = np.zeros_like(lq, dtype=np.float32)
+                ro = np.zeros_like(rq, dtype=np.float32)
+                for j in range(lq.shape[1]):
+                    lo[:, j] = np.interp(tgt, cum, lq[:, j]).astype(np.float32)
+                for j in range(rq.shape[1]):
+                    ro[:, j] = np.interp(tgt, cum, rq[:, j]).astype(np.float32)
+                lo[0], lo[-1] = lq[0], lq[-1]
+                ro[0], ro[-1] = rq[0], rq[-1]
+                return lo.astype(np.float32), ro.astype(np.float32)
+
+            def _uniformize_arm_tail_on_static_gripper(l_arm, r_arm, l_gr, r_gr):
+                """
+                Only uniformize arm motion on sub-spans where gripper stays unchanged.
+                Spans that include gripper transitions are kept untouched.
+                """
+                la = np.asarray(l_arm, dtype=np.float32).copy()
+                ra = np.asarray(r_arm, dtype=np.float32).copy()
+                lg = np.asarray(l_gr, dtype=np.float32).reshape(-1)
+                rg = np.asarray(r_gr, dtype=np.float32).reshape(-1)
+                n = int(min(la.shape[0], ra.shape[0], lg.shape[0], rg.shape[0]))
+                if n <= 2:
+                    return la, ra, 0, 0
+                eps = float(cfg.get('correction_gripper_static_eps', 1e-4))
+                edge_change = np.zeros((n - 1,), dtype=bool)
+                for k in range(n - 1):
+                    edge_change[k] = (abs(float(lg[k + 1] - lg[k])) > eps) or (abs(float(rg[k + 1] - rg[k])) > eps)
+                s = 0
+                uniform_pts = 0
+                uniform_spans = 0
+                while s < n:
+                    e = s
+                    while e < n - 1 and (not edge_change[e]):
+                        e += 1
+                    seg_len = int(e - s + 1)
+                    if seg_len >= 3:
+                        _l_new, _r_new = _resample_joint_pair_by_eef_distance(la[s:e + 1], ra[s:e + 1])
+                        la[s:e + 1] = _l_new
+                        ra[s:e + 1] = _r_new
+                        uniform_pts += int(seg_len)
+                        uniform_spans += 1
+                    s = e + 1
+                return la, ra, int(uniform_pts), int(uniform_spans)
+
+            l_tgt_q = np.asarray(left_q, dtype=np.float32) if gt_left_arm is None else np.asarray(gt_left_arm[follow_abs], dtype=np.float32)
+            r_tgt_q = np.asarray(right_q, dtype=np.float32) if gt_right_arm is None else np.asarray(gt_right_arm[follow_abs], dtype=np.float32)
+            # Keep arm still while reopening gripper.
+            l_prefix = np.repeat(np.asarray(left_q, dtype=np.float32)[None, :], prefix_len, axis=0)
+            r_prefix = np.repeat(np.asarray(right_q, dtype=np.float32)[None, :], prefix_len, axis=0)
+            # Then follow GT forward from current rollout time.
+            l_tail = _take_tail(gt_left_arm, follow_abs, suffix_len, l_tgt_q)
+            r_tail = _take_tail(gt_right_arm, follow_abs, suffix_len, r_tgt_q)
+
+            tl_grip = float(np.clip(left_grip_traj[follow_idx], 0.0, 1.0))
+            tr_grip = float(np.clip(right_grip_traj[follow_idx], 0.0, 1.0))
+            # For gripper_close recovery correction, force full open.
+            open_tgt = 1.0
+            open_prefix_len = int(prefix_len)
+
+            def _build_grip_prefix(curr_g, gt_g):
+                curr_g = float(np.clip(curr_g, 0.0, 1.0))
+                gt_g = float(np.clip(gt_g, 0.0, 1.0))
+                g_open = float(max(curr_g, open_tgt))
+                if open_prefix_len <= 1:
+                    return np.array([g_open], dtype=np.float32)
+                return np.linspace(curr_g, g_open, open_prefix_len, dtype=np.float32)
+
+            l_grip_prefix = _build_grip_prefix(left_grip, tl_grip)
+            r_grip_prefix = _build_grip_prefix(right_grip, tr_grip)
+            l_grip_tail = _take_tail(left_grip_traj, follow_idx + 1, suffix_len, np.array([tl_grip], dtype=np.float32))[:, 0]
+            r_grip_tail = _take_tail(right_grip_traj, follow_idx + 1, suffix_len, np.array([tr_grip], dtype=np.float32))[:, 0]
+            gripper_close_suffix_len_dbg = int(suffix_len)
+            # Temporarily disable tail uniformization: keep GT tail as-is.
+            gripper_close_uniformized_points_dbg = 0
+            gripper_close_uniformized_spans_dbg = 0
+            lt = np.concatenate([l_prefix, l_tail], axis=0).astype(np.float32)
+            rt = np.concatenate([r_prefix, r_tail], axis=0).astype(np.float32)
+            lg = np.concatenate([l_grip_prefix, l_grip_tail], axis=0).astype(np.float32)
+            rg = np.concatenate([r_grip_prefix, r_grip_tail], axis=0).astype(np.float32)
+
+            res_l = {'status': 'BypassGripperCloseRecover', 'position': np.stack([np.asarray(left_q, dtype=np.float32), l_tgt_q], axis=0)}
+            res_r = {'status': 'BypassGripperCloseRecover', 'position': np.stack([np.asarray(right_q, dtype=np.float32), r_tgt_q], axis=0)}
+
         if correction_compose_gt_tail_enable:
             prefix_len = int(np.clip(np.floor(chunk_size * correction_planner_prefix_ratio), 1, max(1, chunk_size - 1)))
-        l_prefix = _fit_prefix(l_future, left_q, prefix_len)
-        r_prefix = _fit_prefix(r_future, right_q, prefix_len)
+        if nearest_mode != "gripper_close":
+            l_prefix = _fit_prefix(l_future, left_q, prefix_len)
+            r_prefix = _fit_prefix(r_future, right_q, prefix_len)
 
         l_tail = None
         r_tail = None
-        if correction_compose_gt_tail_enable and gt_left_arm is not None and corr_left_active:
+        if nearest_mode != "gripper_close" and correction_compose_gt_tail_enable and gt_left_arm is not None and corr_left_active:
             l_tail = np.asarray(gt_left_arm[start_ts + t_target + 1:], dtype=np.float32)
-        if correction_compose_gt_tail_enable and gt_right_arm is not None and corr_right_active:
+        if nearest_mode != "gripper_close" and correction_compose_gt_tail_enable and gt_right_arm is not None and corr_right_active:
             r_tail = np.asarray(gt_right_arm[start_ts + t_target + 1:], dtype=np.float32)
 
-        lt = _compose_with_gt_tail(l_prefix, l_tail, chunk_size, force_resample=True)
-        rt = _compose_with_gt_tail(r_prefix, r_tail, chunk_size, force_resample=True)
+        if nearest_mode != "gripper_close":
+            lt = _compose_with_gt_tail(l_prefix, l_tail, chunk_size, force_resample=True)
+            rt = _compose_with_gt_tail(r_prefix, r_tail, chunk_size, force_resample=True)
 
-        tl_grip = float(np.clip(left_grip_traj[t_target], 0.0, 1.0))
-        tr_grip = float(np.clip(right_grip_traj[t_target], 0.0, 1.0))
+        if nearest_mode != "gripper_close":
+            tl_grip = float(np.clip(left_grip_traj[t_target], 0.0, 1.0))
+            tr_grip = float(np.clip(right_grip_traj[t_target], 0.0, 1.0))
 
         # Prefix gripper profile: hold current value first, then change near the end.
         switch_ratio = float(np.clip(cfg['correction_gripper_switch_ratio'], 0.0, 1.0))
         switch_idx = int(np.clip(np.floor(prefix_len * switch_ratio), 0, max(0, prefix_len - 1)))
-        l_grip_prefix = np.full((prefix_len,), float(left_grip), dtype=np.float32)
-        r_grip_prefix = np.full((prefix_len,), float(right_grip), dtype=np.float32)
+        l_grip_prefix = np.full((prefix_len,), float(left_grip), dtype=np.float32) if nearest_mode != "gripper_close" else None
+        r_grip_prefix = np.full((prefix_len,), float(right_grip), dtype=np.float32) if nearest_mode != "gripper_close" else None
         tail_len = prefix_len - switch_idx
-        if tail_len > 1:
+        if nearest_mode != "gripper_close" and tail_len > 1:
             l_grip_prefix[switch_idx:] = np.linspace(float(left_grip), tl_grip, tail_len, dtype=np.float32)
             r_grip_prefix[switch_idx:] = np.linspace(float(right_grip), tr_grip, tail_len, dtype=np.float32)
-        elif tail_len == 1:
+        elif nearest_mode != "gripper_close" and tail_len == 1:
             l_grip_prefix[-1] = tl_grip
             r_grip_prefix[-1] = tr_grip
         l_grip_tail = (
             np.asarray(left_grip_traj[t_target + 1:], dtype=np.float32)
             if (correction_compose_gt_tail_enable and corr_left_active)
             else np.asarray([], dtype=np.float32)
-        )
+        ) if nearest_mode != "gripper_close" else None
         r_grip_tail = (
             np.asarray(right_grip_traj[t_target + 1:], dtype=np.float32)
             if (correction_compose_gt_tail_enable and corr_right_active)
             else np.asarray([], dtype=np.float32)
-        )
-        lg = _compose_with_gt_tail(
+        ) if nearest_mode != "gripper_close" else None
+        if nearest_mode != "gripper_close":
+            lg = _compose_with_gt_tail(
             l_grip_prefix[:, None], l_grip_tail[:, None], chunk_size, force_resample=True
         )[:, 0]
-        rg = _compose_with_gt_tail(
+            rg = _compose_with_gt_tail(
             r_grip_prefix[:, None], r_grip_tail[:, None], chunk_size, force_resample=True
         )[:, 0]
     if not corr_left_active:
@@ -2541,6 +2749,28 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         _draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
                         _draw_phase_legend(_overlay_gt)
 
+            # Mark pregrasp segment quartile points (Q0/Q1/Q2/Q3/Q4) from
+            # dataloader-provided absolute segment range.
+            try:
+                if pregrasp_seg_start is not None and pregrasp_seg_end is not None and n_ep_total > 0:
+                    ps = int(np.clip(int(pregrasp_seg_start), 0, n_ep_total - 1))
+                    pe = int(np.clip(int(pregrasp_seg_end), 0, n_ep_total - 1))
+                    if pe < ps:
+                        ps, pe = pe, ps
+                    if pe >= ps:
+                        q_rel = np.array([0.0, 0.25, 0.50, 0.75, 1.0], dtype=np.float32)
+                        q_idx = [int(np.clip(round(ps + float(r) * (pe - ps)), 0, n_ep_total - 1)) for r in q_rel]
+                        q_pose_np = _build_pose_np_from_raw_indices(q_idx)
+                        if q_pose_np is not None and q_pose_np.shape[0] > 0:
+                            q_uvs_l, q_uvs_r, q_pts_l, q_pts_r = _project_base_uv_from_pose_np(q_pose_np)
+                            q_l_seq = _extract_base_uv(q_uvs_l, q_pts_l.reshape(1, q_pts_l.shape[1], 4, 4))
+                            q_r_seq = _extract_base_uv(q_uvs_r, q_pts_r.reshape(1, q_pts_r.shape[1], 4, 4))
+                            q_labels = [f"Q{i}" for i in range(len(q_idx))]
+                            _draw_pregrasp_quarter_points(_overlay_gt, q_l_seq, q_r_seq, q_labels)
+                            _draw_pregrasp_quarter_points(_overlay_c, q_l_seq, q_r_seq, q_labels)
+            except Exception:
+                pass
+
             # Corrected overlay: keep only correction trajectories + phase-colored GT path.
             _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
             _draw_polyline(_overlay_c, luv, (0, 255, 0))
@@ -2565,12 +2795,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     _draw_point_labeled(_img, p_r_pt, "R-PANCH", (255, 230, 0))
 
                 # Also mark the actual "forward-searched" point used by translation direction.
-                _, pnext_l_idx = _traj_dir_after_anchor_with_idx(raw_data['left_endpose'], pidx, lookahead=64)
-                _, pnext_r_idx = _traj_dir_after_anchor_with_idx(raw_data['right_endpose'], pidx, lookahead=64)
+                _, pnext_l_idx = _traj_dir_after_anchor_with_idx(raw_data['left_endpose'], pidx, lookahead=128)
+                _, pnext_r_idx = _traj_dir_after_anchor_with_idx(raw_data['right_endpose'], pidx, lookahead=128)
                 if pnext_l_idx is None:
-                    pnext_l_idx = int(np.clip(pidx + 64, 0, n_ep_total - 1))
+                    pnext_l_idx = int(np.clip(pidx + 128, 0, n_ep_total - 1))
                 if pnext_r_idx is None:
-                    pnext_r_idx = int(np.clip(pidx + 64, 0, n_ep_total - 1))
+                    pnext_r_idx = int(np.clip(pidx + 128, 0, n_ep_total - 1))
                 pnext_row = _pack_pose_row(
                     raw_data['left_endpose'][pnext_l_idx, :3].astype(np.float32),
                     raw_data['left_endpose'][pnext_l_idx, 3:7].astype(np.float32),
@@ -2794,8 +3024,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'interp_nearest_enable': bool(correction_interp_nearest_enable),
                 'interp_prefix_ratio': float(correction_interp_prefix_ratio),
                 'planner_prefix_ratio': float(correction_planner_prefix_ratio),
+                'gripper_close_prefix_ratio': float(correction_gripper_close_prefix_ratio),
                 'compose_gt_tail_enable': bool(correction_compose_gt_tail_enable),
                 'correction_prefix_len': int(prefix_len),
+                'gripper_close_suffix_len': (None if gripper_close_suffix_len_dbg is None else int(gripper_close_suffix_len_dbg)),
+                'gripper_close_uniformized_points': (None if gripper_close_uniformized_points_dbg is None else int(gripper_close_uniformized_points_dbg)),
+                'gripper_close_uniformized_spans': (None if gripper_close_uniformized_spans_dbg is None else int(gripper_close_uniformized_spans_dbg)),
                 'debug_correction_evac_rollout': bool(debug_correction_evac_rollout),
                 'evac_correction_generated_video': evac_corr_video,
             },
@@ -2876,6 +3110,142 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data[0], data[1], data[2], data[3]
     return policy(qpos_data, image_data, action_data, is_pad)
+
+
+def _save_loss_batch_projection(
+    save_dir,
+    image_cam,
+    action_norm,
+    is_pad,
+    raw_data,
+    fk,
+    norm_stats,
+    meta=None,
+):
+    os.makedirs(save_dir, exist_ok=True)
+    import json
+    import cv2
+
+    act = np.asarray(action_norm.detach().cpu().numpy(), dtype=np.float32)
+    pad = np.asarray(is_pad.detach().cpu().numpy(), dtype=bool).reshape(-1)
+    if act.ndim != 2 or act.shape[1] < 14:
+        return
+    valid = np.where(~pad)[0]
+    if valid.size == 0:
+        return
+    act = act[valid]
+    act_raw = np.asarray(act * norm_stats['action_std'] + norm_stats['action_mean'], dtype=np.float32)
+    if act_raw.shape[0] <= 0:
+        return
+
+    img_u8 = np.clip(
+        image_cam.detach().cpu().permute(1, 2, 0).numpy() * 255.0, 0.0, 255.0
+    ).astype(np.uint8)
+    overlay = img_u8.copy()
+
+    K = raw_data['intrinsic_cv'].astype(np.float32).copy()
+    E = np.eye(4, dtype=np.float32)
+    E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
+    h_native, w_native = raw_data.get('native_resolution', (overlay.shape[0], overlay.shape[1]))
+    h_img, w_img = overlay.shape[:2]
+    if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
+        sx = float(w_img) / float(w_native)
+        sy = float(h_img) / float(h_native)
+        K[0, 0] *= sx
+        K[0, 2] *= sx
+        K[1, 1] *= sy
+        K[1, 2] *= sy
+
+    pose_list = []
+    for i in range(act_raw.shape[0]):
+        fr = fk.forward(act_raw[i, 0:6], act_raw[i, 7:13])
+        lp, lq_wxyz = fr['left']
+        rp, rq_wxyz = fr['right']
+        lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
+        rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
+        if lq_xyzw[3] < 0:
+            lq_xyzw = -lq_xyzw
+        if rq_xyzw[3] < 0:
+            rq_xyzw = -rq_xyzw
+        lg = float(np.clip(act_raw[i, 6], 0.0, 1.0)) * 120.0
+        rg = float(np.clip(act_raw[i, 13], 0.0, 1.0)) * 120.0
+        pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
+    pose_np = np.stack(pose_list, axis=0)
+
+    try:
+        import evac.lvdm.models.ddpm3d as ddpm3d_mod
+        w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
+        intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
+        cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+        ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+
+        def _project_base_uv_from_pose_np(pose_arr):
+            pose_t = torch.from_numpy(pose_arr).float()
+            pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
+            pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
+            ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
+            ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
+            pts_l = torch.matmul(ee2cam_l, ee_key_pts)
+            pts_r = torch.matmul(ee2cam_r, ee_key_pts)
+            uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
+            uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
+            uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+            uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+            return uvs_l, uvs_r, pts_l, pts_r
+
+        def _extract_base_uv(uvs, pts):
+            seq = []
+            for i in range(uvs.shape[0]):
+                z = float(pts[0, i, 2, 0].item())
+                u = int(uvs[i, 0, 0])
+                v = int(uvs[i, 0, 1])
+                if z > 1e-6 and (0 <= u < w_img) and (0 <= v < h_img):
+                    seq.append((u, v))
+                else:
+                    seq.append(None)
+            return seq
+
+        def _draw_polyline(img, seq, color):
+            prev = None
+            for pt in seq:
+                if pt is None:
+                    prev = None
+                    continue
+                if prev is not None:
+                    cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), color, 2, cv2.LINE_AA)
+                prev = pt
+
+        def _annotate_start_end(img, seq, prefix, color):
+            if len(seq) == 0:
+                return
+            s = seq[0]
+            e = seq[-1]
+            if s is not None:
+                cv2.circle(img, (int(s[0]), int(s[1])), 4, color, -1, cv2.LINE_AA)
+                cv2.putText(img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            if e is not None:
+                cv2.circle(img, (int(e[0]), int(e[1])), 4, color, -1, cv2.LINE_AA)
+                cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
+        luv = _extract_base_uv(uvs_l, pts_l.reshape(1, pts_l.shape[1], 4, 4))
+        ruv = _extract_base_uv(uvs_r, pts_r.reshape(1, pts_r.shape[1], 4, 4))
+        _draw_polyline(overlay, luv, (0, 255, 0))
+        _draw_polyline(overlay, ruv, (0, 0, 255))
+        _annotate_start_end(overlay, luv, "L", (0, 255, 0))
+        _annotate_start_end(overlay, ruv, "R", (0, 0, 255))
+        cv2.imwrite(os.path.join(save_dir, 'loss_projection_on_input.png'), overlay)
+    except Exception:
+        import traceback
+        with open(os.path.join(save_dir, 'loss_projection_error.txt'), 'w') as _f:
+            _f.write(traceback.format_exc())
+        cv2.imwrite(os.path.join(save_dir, 'loss_projection_on_input.png'), overlay)
+
+    meta_out = {'n_valid_actions': int(act_raw.shape[0]), 'image_hw': [int(h_img), int(w_img)]}
+    if isinstance(meta, dict):
+        meta_out.update(meta)
+    with open(os.path.join(save_dir, 'loss_projection_meta.json'), 'w') as _f:
+        json.dump(meta_out, _f, indent=2)
 
 def train_bc(train_dataloader, config, corr_train_dataloader=None):
     _r = int(os.environ.get("RANK", -1))
@@ -2967,6 +3337,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
 
     correction_modules = None
     debug_wm = config.get('debug_wm_correction', False)
+    debug_loss_batch_projection = bool(config.get('debug_loss_batch_projection', False))
     debug_wm_dir = os.path.join(ckpt_dir, 'debug_wm') if debug_wm else None
     if debug_wm_dir and accelerator.is_main_process:
         os.makedirs(debug_wm_dir, exist_ok=True)
@@ -3100,6 +3471,51 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                     mixed_qpos = torch.cat([base_qpos, cq_b], dim=0)
                     mixed_actions = torch.cat([base_actions, ca_b], dim=0)
                     mixed_pads = torch.cat([base_pads, cp_b], dim=0)
+                    if debug_loss_batch_projection and _step_dbg is not None:
+                        _loss_dbg = os.path.join(_step_dbg, 'loss_batch_projection')
+                        os.makedirs(_loss_dbg, exist_ok=True)
+                        _raw_cache = {}
+
+                        def _get_raw(ep_id_i):
+                            _k = int(ep_id_i)
+                            if _k not in _raw_cache:
+                                _raw_cache[_k] = load_raw_data(raw_data_dir, _k)
+                            return _raw_cache[_k]
+
+                        for i in range(bs_base):
+                            ep_i = int(data[4][i].item())
+                            st_i = int(data[5][i].item())
+                            _sdir = os.path.join(_loss_dbg, f'base_{i:03d}_ep{ep_i}_ts{st_i:04d}')
+                            _save_loss_batch_projection(
+                                _sdir,
+                                mixed_images[i][0],
+                                mixed_actions[i],
+                                mixed_pads[i],
+                                _get_raw(ep_i),
+                                correction_modules['fk'],
+                                norm_stats,
+                                meta={'sample_type': 'base', 'episode_id': ep_i, 'start_ts': st_i},
+                            )
+                        for j in range(bs):
+                            k = bs_base + j
+                            ep_j = int(corr_source[4][j].item())
+                            st_j = int(corr_source[5][j].item())
+                            _sdir = os.path.join(_loss_dbg, f'corr_{j:03d}_ep{ep_j}_ts{st_j:04d}')
+                            _save_loss_batch_projection(
+                                _sdir,
+                                mixed_images[k][0],
+                                mixed_actions[k],
+                                mixed_pads[k],
+                                _get_raw(ep_j),
+                                correction_modules['fk'],
+                                norm_stats,
+                                meta={
+                                    'sample_type': 'correction',
+                                    'episode_id': ep_j,
+                                    'start_ts': st_j,
+                                    'correction_generated': bool(corr_mask[j] > 0.5),
+                                },
+                            )
 
                     mixed_dict = policy(
                         mixed_qpos,
@@ -3136,24 +3552,36 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                     loss = forward_dict["loss"]
 
             # Optional L2-SP regularization to reduce catastrophic forgetting.
+            # IMPORTANT: do not build an autograd graph from model parameters outside
+            # forward() under DDP, otherwise hooks can fire twice ("marked ready twice").
             if sp_ref_params is not None:
-                sp_loss = None
-                for n, p in policy.named_parameters():
-                    if (not p.requires_grad) or (n not in sp_ref_params):
-                        continue
-                    d = p - sp_ref_params[n]
-                    term = torch.sum(d * d)
-                    sp_loss = term if sp_loss is None else (sp_loss + term)
-                if sp_loss is None:
-                    sp_loss = torch.tensor(0.0, device=accelerator.device)
                 base_loss = loss
-                loss = base_loss + sp_reg_lambda * sp_loss
+                sp_loss_val = torch.tensor(0.0, device=accelerator.device)
+                with torch.no_grad():
+                    for n, p in policy.named_parameters():
+                        if (not p.requires_grad) or (n not in sp_ref_params):
+                            continue
+                        d = p - sp_ref_params[n]
+                        sp_loss_val = sp_loss_val + torch.sum(d * d)
+
+                accelerator.backward(base_loss)
+                with torch.no_grad():
+                    for n, p in policy.named_parameters():
+                        if (not p.requires_grad) or (n not in sp_ref_params):
+                            continue
+                        reg_grad = (2.0 * sp_reg_lambda) * (p - sp_ref_params[n])
+                        if p.grad is None:
+                            p.grad = reg_grad.clone()
+                        else:
+                            p.grad.add_(reg_grad)
+
+                loss = base_loss + sp_reg_lambda * sp_loss_val
                 forward_dict = dict(forward_dict)
                 forward_dict["loss_base"] = base_loss
-                forward_dict["sp_loss"] = sp_loss
+                forward_dict["sp_loss"] = sp_loss_val
                 forward_dict["loss"] = loss
-
-            accelerator.backward(loss)
+            else:
+                accelerator.backward(loss)
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
@@ -3338,6 +3766,8 @@ if __name__ == "__main__":
                         help="Prefix ratio for interpolation when correction_interp_nearest_enable=true (e.g., 0.4 means 2/5 chunk)")
     parser.add_argument("--correction_planner_prefix_ratio", type=float, default=0.8,
                         help="Prefix ratio for planner-based correction when correction_interp_nearest_enable=false and compose_gt_tail_enable=true")
+    parser.add_argument("--correction_gripper_close_prefix_ratio", type=float, default=0.8,
+                        help="Prefix ratio used only by gripper_close correction branch (open-first then GT-follow)")
     parser.add_argument("--correction_compose_gt_tail_enable", type=str2bool, default=True,
                         help="If true, compose correction prefix with GT tail; if false, use correction-only trajectory for full chunk")
     parser.add_argument("--correction_gripper_switch_ratio", type=float, default=0.8,
@@ -3355,6 +3785,8 @@ if __name__ == "__main__":
                              "(default: follow gripper_penalty)")
     parser.add_argument("--debug_wm_correction", action="store_true",
                         help="Enable debug visualization for WM correction (saves images/stats to ckpt_dir/debug_wm)")
+    parser.add_argument("--debug_loss_batch_projection", type=str2bool, default=False,
+                        help="Save projection images for every sample in the final batch used for loss update.")
     parser.add_argument("--export_correction_dataset", type=str2bool, default=False,
                         help="Export successful correction samples as ACT-compatible hdf5 episodes")
     parser.add_argument("--export_correction_dir", type=str, default="",
