@@ -737,23 +737,58 @@ def main(args):
     policy_class = args["policy_class"]
     onscreen_render = args.get("onscreen_render", False)
     task_name = args["task_name"]
+    multi_task_names_raw = str(args.get("multi_task_names", "")).strip()
+    multi_task_weights_raw = str(args.get("multi_task_weights", "")).strip()
+    multi_task_names = []
+    if multi_task_names_raw:
+        multi_task_names = [x.strip() for x in multi_task_names_raw.split(",") if x.strip()]
+    use_multi_task = len(multi_task_names) > 0
     batch_size_train = args["batch_size"]
     num_epochs = args["num_epochs"]
 
     # get task parameters
-    is_sim = task_name[:4] == "sim-"
-    if is_sim:
-        from constants import SIM_TASK_CONFIGS
+    def _resolve_task_cfg(_task_name):
+        _is_sim = _task_name[:4] == "sim-"
+        if _is_sim:
+            from constants import SIM_TASK_CONFIGS
+            _task_cfg = SIM_TASK_CONFIGS[_task_name]
+        else:
+            from aloha_scripts.constants import TASK_CONFIGS
+            _task_cfg = TASK_CONFIGS[_task_name]
+        return _task_cfg, _is_sim
 
-        task_config = SIM_TASK_CONFIGS[task_name]
+    dataset_dirs = None
+    num_episodes_list = None
+    multi_task_weights = None
+    if use_multi_task:
+        resolved = [_resolve_task_cfg(nm) for nm in multi_task_names]
+        task_cfgs = [x[0] for x in resolved]
+        is_sim = all(x[1] for x in resolved)
+        camera_names = task_cfgs[0]["camera_names"]
+        for i, tc in enumerate(task_cfgs):
+            if tc["camera_names"] != camera_names:
+                raise ValueError(
+                    f"multi_task camera_names mismatch at task={multi_task_names[i]}: "
+                    f"{tc['camera_names']} vs {camera_names}"
+                )
+        dataset_dirs = [tc["dataset_dir"] for tc in task_cfgs]
+        num_episodes_list = [int(tc["num_episodes"]) for tc in task_cfgs]
+        episode_len = max(int(tc["episode_len"]) for tc in task_cfgs)
+        dataset_dir = dataset_dirs[0]
+        num_episodes = num_episodes_list[0]
+        if multi_task_weights_raw:
+            multi_task_weights = [float(x.strip()) for x in multi_task_weights_raw.split(",") if x.strip()]
+            if len(multi_task_weights) != len(multi_task_names):
+                raise ValueError(
+                    f"multi_task_weights length ({len(multi_task_weights)}) "
+                    f"must match multi_task_names length ({len(multi_task_names)})"
+                )
     else:
-        from aloha_scripts.constants import TASK_CONFIGS
-
-        task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config["dataset_dir"]
-    num_episodes = task_config["num_episodes"]
-    episode_len = task_config["episode_len"]
-    camera_names = task_config["camera_names"]
+        task_config, is_sim = _resolve_task_cfg(task_name)
+        dataset_dir = task_config["dataset_dir"]
+        num_episodes = task_config["num_episodes"]
+        episode_len = task_config["episode_len"]
+        camera_names = task_config["camera_names"]
 
     # fixed parameters
     state_dim = 14  # yiheng
@@ -796,7 +831,7 @@ def main(args):
         "policy_class": policy_class,
         "onscreen_render": onscreen_render,
         "policy_config": policy_config,
-        "task_name": task_name,
+        "task_name": ((",".join(multi_task_names)) if use_multi_task else task_name),
         "seed": args["seed"],
         "temporal_agg": args["temporal_agg"],
         "camera_names": camera_names,
@@ -834,6 +869,8 @@ def main(args):
         wm_corr_pregrasp_extra_ratio = 0.0
         sample_pregrasp_close_offset_steps = None
     if enable_wm:
+        if use_multi_task:
+            raise ValueError("enable_wm_correction currently does not support multi-task training")
         wm_required = ['evac_ckpt', 'evac_config', 'urdf_path', 'curobo_left_yml',
                         'curobo_right_yml', 'raw_data_dir', 'act_init_ckpt',
                         'max_rollout_steps',
@@ -872,6 +909,9 @@ def main(args):
         sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
         sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
         sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+        dataset_dirs=dataset_dirs,
+        num_episodes_list=num_episodes_list,
+        task_weights=multi_task_weights,
     )
     corr_train_dataloader = None
     if use_extra_pregrasp_corr:
@@ -891,6 +931,9 @@ def main(args):
             sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
             sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+            dataset_dirs=dataset_dirs,
+            num_episodes_list=num_episodes_list,
+            task_weights=multi_task_weights,
         )
         print(f"[main][rank={_rank}] extra pregrasp correction dataloader enabled | corr_batch_size={corr_batch_size}")
     print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
@@ -3649,6 +3692,10 @@ if __name__ == "__main__":
         required=True,
     )
     parser.add_argument("--task_name", action="store", type=str, help="task_name", required=True)
+    parser.add_argument("--multi_task_names", action="store", type=str, default="",
+                        help="Comma-separated task names for multi-task training, e.g. sim-open_laptop-demo_clean-50,sim-blocks_ranking_rgb-demo_clean-50")
+    parser.add_argument("--multi_task_weights", action="store", type=str, default="",
+                        help="Comma-separated sampling weights for multi_task_names, e.g. 1.0,1.0")
     parser.add_argument("--batch_size", action="store", type=int, help="batch_size", required=True)
     parser.add_argument("--seed", action="store", type=int, help="seed", required=True)
     parser.add_argument("--num_epochs", action="store", type=int, help="num_epochs", required=True)

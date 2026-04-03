@@ -31,7 +31,15 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override["kl_weight"]
         print(f"KL Weight {self.kl_weight}")
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, return_per_sample=False):
+    def __call__(
+        self,
+        qpos,
+        image,
+        actions=None,
+        is_pad=None,
+        return_per_sample=False,
+        external_latent_input=None,
+    ):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         image = normalize(image)
@@ -39,7 +47,14 @@ class ACTPolicy(nn.Module):
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)
+            a_hat, is_pad_hat, (mu, logvar) = self.model(
+                qpos,
+                image,
+                env_state,
+                actions,
+                is_pad,
+                external_latent_input=external_latent_input,
+            )
             loss_dict = dict()
 
             # Per-sample masked L1. Keeping mean over fixed tensor dims preserves
@@ -66,7 +81,12 @@ class ACTPolicy(nn.Module):
                 loss_dict["loss_per_sample"] = loss_per_sample
             return loss_dict
         else:  # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state)  # no action, sample from prior
+            a_hat, _, (_, _) = self.model(
+                qpos,
+                image,
+                env_state,
+                external_latent_input=external_latent_input,
+            )  # no action, sample from prior
             return a_hat
 
     def configure_optimizers(self):

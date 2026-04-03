@@ -80,6 +80,10 @@ def load_seed_list(seed_file):
 
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    eval_tag = str(usr_args.get("eval_tag", "")).strip()
+    if eval_tag:
+        safe_tag = re.sub(r"[^0-9A-Za-z._-]+", "_", eval_tag)
+        current_time = f"{current_time}_{safe_tag}"
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]

@@ -2,11 +2,23 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-gpu_ids=4,5,6,7
-main_process_port=28900
-task_name=open_laptop
+train_tag="place_cans_plasticbox_openloopbase"
+gpu_ids=0,1,2,3,4,5,6,7
+main_process_port=29400
+
+# Single-task settings (used when task_names is empty)
+task_name=place_cans_plasticbox
 task_config=demo_clean
 expert_data_num=50
+
+# Multi-task settings (task_names non-empty -> override single-task data source)
+# Format example:
+# task_names="sim-open_laptop-demo_clean-50,sim-blocks_ranking_rgb-demo_clean-50"
+# task_weights="1.0,1.0"
+task_names=
+task_weights=
+
+# Common training hyper-parameters
 seed=0
 policy_class=ACT
 kl_weight=10
@@ -20,7 +32,7 @@ save_freq=10
 state_dim=14
 
 # World model parameters
-enable_wm=true
+enable_wm=false
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
 evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3124-step=12500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
@@ -28,14 +40,14 @@ urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_d
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 curobo_right_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
 raw_data_dir=/data/zhenyangfan/RoboTwin/data/${task_name}/${task_config}/data
-act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
+# act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
 max_rollout_steps=1
 target_mode=backward
 target_lookahead_steps=4
 min_dist_fallback_force_correction=true
 min_dist_recover_ratio=0.75
 debug_recover_eval_rollout=false
-debug_correction_evac_rollout=true
+debug_correction_evac_rollout=false
 correction_interp_nearest_enable=false
 correction_interp_prefix_ratio=0.6
 correction_planner_prefix_ratio=0.5
@@ -88,6 +100,10 @@ wm_corr_pregrasp_extra_ratio=0.5
 
 # Build saving dirs
 timestamp=$(date +"%Y%m%d_%H%M%S")
+if [ -n "${train_tag}" ]; then
+    safe_train_tag=$(echo "${train_tag}" | sed 's/[^0-9A-Za-z._-]/_/g')
+    timestamp="${timestamp}_${safe_train_tag}"
+fi
 ckpt_dir=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/${timestamp}
 mkdir -p ${ckpt_dir}
 cp "$0" ${ckpt_dir}/train.sh
@@ -194,6 +210,12 @@ train_flags="--task_name sim-${task_name}-${task_config}-${expert_data_num} \
 --state_dim ${state_dim} \
 --seed ${seed} \
 "
+if [ -n "${task_names}" ]; then
+    train_flags="${train_flags} --multi_task_names ${task_names}"
+fi
+if [ -n "${task_weights}" ]; then
+    train_flags="${train_flags} --multi_task_weights ${task_weights}"
+fi
 if [ -n "${act_init_ckpt}" ]; then
     train_flags="${train_flags} --act_init_ckpt ${act_init_ckpt}"
 fi

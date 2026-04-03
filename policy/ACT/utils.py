@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import os
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, ConcatDataset, WeightedRandomSampler
 from phase_utils import infer_phase_key_from_gt_window
 
 import IPython
@@ -384,58 +384,156 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               sample_pregrasp_phase_window_len=16,
               sample_pregrasp_keep_start_ratio=0.0,
               sample_pregrasp_keep_end_ratio=0.5,
-              sample_pregrasp_close_offset_steps=None):
-    print(f"\nData from: {dataset_dir}\n")
-    # Filter episodes that are too short for the requested start sampling range.
-    # Need at least one valid start_ts in [min_start, episode_len - 1 - start_margin].
-    # For ratio-based skip-head, min_start depends on episode length, so only require
-    # enough length for max_start >= 0.
-    min_required_len = int(max(0, start_margin)) + 1
-    train_indices = []
-    skipped_short = []
-    for ep in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f"episode_{ep}.hdf5")
-        with h5py.File(dataset_path, "r") as root:
-            ep_len = int(root["/action"].shape[0])
-        if ep_len >= min_required_len:
-            train_indices.append(ep)
-        else:
-            skipped_short.append((ep, ep_len))
-    if len(train_indices) == 0:
-        raise ValueError(
-            f"No valid episodes: require len >= {min_required_len} "
-            f"(sample_skip_head_ratio={sample_skip_head_ratio}, "
-            f"start_margin={int(max(0, start_margin))})."
+              sample_pregrasp_close_offset_steps=None,
+              dataset_dirs=None,
+              num_episodes_list=None,
+              task_weights=None):
+    def _collect_valid_indices(_dataset_dir, _num_episodes):
+        min_required_len = int(max(0, start_margin)) + 1
+        _train_indices = []
+        _skipped_short = []
+        for ep in range(_num_episodes):
+            dataset_path = os.path.join(_dataset_dir, f"episode_{ep}.hdf5")
+            with h5py.File(dataset_path, "r") as root:
+                ep_len = int(root["/action"].shape[0])
+            if ep_len >= min_required_len:
+                _train_indices.append(ep)
+            else:
+                _skipped_short.append((ep, ep_len))
+        if len(_train_indices) == 0:
+            raise ValueError(
+                f"No valid episodes: dataset={_dataset_dir}, require len >= {min_required_len} "
+                f"(sample_skip_head_ratio={sample_skip_head_ratio}, "
+                f"start_margin={int(max(0, start_margin))})."
+            )
+        if len(_skipped_short) > 0:
+            print(
+                f"[load_data] filtered short episodes: {len(_skipped_short)}/{_num_episodes} "
+                f"(dataset={_dataset_dir}, min_required_len={min_required_len})"
+            )
+        return _train_indices
+
+    def _get_norm_stats_multi(_dataset_dirs, _num_episodes_list):
+        all_qpos_data = []
+        all_action_data = []
+        for ds_dir, n_ep in zip(_dataset_dirs, _num_episodes_list):
+            for episode_idx in range(int(n_ep)):
+                dataset_path = os.path.join(ds_dir, f"episode_{episode_idx}.hdf5")
+                with h5py.File(dataset_path, "r") as root:
+                    qpos = root["/observations/qpos"][()]
+                    action = root["/action"][()]
+                all_qpos_data.append(torch.from_numpy(qpos))
+                all_action_data.append(torch.from_numpy(action))
+
+        max_qpos_len = max(q.size(0) for q in all_qpos_data)
+        max_action_len = max(a.size(0) for a in all_action_data)
+
+        padded_qpos = []
+        for qpos in all_qpos_data:
+            if qpos.size(0) < max_qpos_len:
+                pad = qpos[-1:].repeat(max_qpos_len - qpos.size(0), 1)
+                qpos = torch.cat([qpos, pad], dim=0)
+            padded_qpos.append(qpos)
+
+        padded_action = []
+        for action in all_action_data:
+            if action.size(0) < max_action_len:
+                pad = action[-1:].repeat(max_action_len - action.size(0), 1)
+                action = torch.cat([action, pad], dim=0)
+            padded_action.append(action)
+
+        all_qpos_data = torch.stack(padded_qpos)
+        all_action_data = torch.stack(padded_action)
+        action_mean = all_action_data.mean(dim=[0, 1], keepdim=True)
+        action_std = all_action_data.std(dim=[0, 1], keepdim=True)
+        action_std = torch.clip(action_std, 1e-2, np.inf)
+        qpos_mean = all_qpos_data.mean(dim=[0, 1], keepdim=True)
+        qpos_std = all_qpos_data.std(dim=[0, 1], keepdim=True)
+        qpos_std = torch.clip(qpos_std, 1e-2, np.inf)
+        stats = {
+            "action_mean": action_mean.numpy().squeeze(),
+            "action_std": action_std.numpy().squeeze(),
+            "qpos_mean": qpos_mean.numpy().squeeze(),
+            "qpos_std": qpos_std.numpy().squeeze(),
+            "example_qpos": padded_qpos[-1],
+        }
+        return stats, max_action_len
+
+    if dataset_dirs is None:
+        print(f"\nData from: {dataset_dir}\n")
+        train_indices = _collect_valid_indices(dataset_dir, num_episodes)
+        norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
+        train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
+                                        raw_data_dir=raw_data_dir, start_margin=start_margin,
+                                        sample_skip_head_ratio=sample_skip_head_ratio,
+                                        sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
+                                        sample_pregrasp_prob=sample_pregrasp_prob,
+                                        sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
+                                        sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
+                                        sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+                                        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_train,
+            shuffle=True,
+            pin_memory=True,
+            num_workers=1,
+            prefetch_factor=1,
         )
-    if len(skipped_short) > 0:
-        print(
-            f"[load_data] filtered short episodes: {len(skipped_short)}/{num_episodes} "
-            f"(min_required_len={min_required_len})"
+        return train_dataloader, None, norm_stats, train_dataset.is_sim, max_action_len
+
+    if raw_data_dir is not None:
+        raise ValueError("Multi-task load_data currently does not support raw_data_dir")
+    if num_episodes_list is None or len(dataset_dirs) != len(num_episodes_list):
+        raise ValueError("dataset_dirs and num_episodes_list must have the same length")
+
+    print("\nData from multiple tasks:")
+    for _d in dataset_dirs:
+        print(f"  - {_d}")
+    print("")
+
+    norm_stats, max_action_len = _get_norm_stats_multi(dataset_dirs, num_episodes_list)
+    sub_datasets = []
+    for ds_dir, n_ep in zip(dataset_dirs, num_episodes_list):
+        train_indices = _collect_valid_indices(ds_dir, int(n_ep))
+        ds = EpisodicDataset(train_indices, ds_dir, camera_names, norm_stats, max_action_len,
+                             raw_data_dir=None, start_margin=start_margin,
+                             sample_skip_head_ratio=sample_skip_head_ratio,
+                             sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
+                             sample_pregrasp_prob=sample_pregrasp_prob,
+                             sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
+                             sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
+                             sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+                             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
+        sub_datasets.append(ds)
+
+    train_dataset = ConcatDataset(sub_datasets)
+    sampler = None
+    if task_weights is not None:
+        if len(task_weights) != len(sub_datasets):
+            raise ValueError("task_weights length must match number of datasets")
+        sample_weights = []
+        for w, ds in zip(task_weights, sub_datasets):
+            n = max(1, len(ds))
+            sample_weights.extend([float(w) / float(n)] * len(ds))
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(train_dataset),
+            replacement=True,
         )
 
-    # obtain normalization stats for qpos and action
-    norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
-
-    # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
-                                    raw_data_dir=raw_data_dir, start_margin=start_margin,
-                                    sample_skip_head_ratio=sample_skip_head_ratio,
-                                    sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
-                                    sample_pregrasp_prob=sample_pregrasp_prob,
-                                    sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
-                                    sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-                                    sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-                                    sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         pin_memory=True,
         num_workers=1,
         prefetch_factor=1,
     )
 
-    return train_dataloader, None, norm_stats, train_dataset.is_sim, max_action_len
+    is_sim = sub_datasets[0].is_sim if len(sub_datasets) > 0 else True
+    return train_dataloader, None, norm_stats, is_sim, max_action_len
 
 
 ### env utils
