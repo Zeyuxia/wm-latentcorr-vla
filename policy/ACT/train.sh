@@ -2,7 +2,7 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-train_tag="open_laptop"
+train_tag="open_laptop_recover_transaltion_test"
 gpu_ids=4
 main_process_port=29500
 
@@ -45,6 +45,13 @@ max_rollout_steps=1
 correction_force_generate=true
 debug_correction_evac_rollout=true
 rollout_exec_steps=16
+recover_eval_enable=true
+recover_eval_use_for_trigger=false
+recover_eval_save_video=true
+recover_eval_gripper_open_thresh=0.8
+recover_eval_pos_thresh_m=0.03
+recover_eval_rot_thresh_deg=10.0
+recover_eval_nearest_window_radius=16
 orient_weight=0.0573
 gripper_penalty=1.0
 debug_wm=true
@@ -57,8 +64,8 @@ enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
 perturb_open_laptop_pregrasp_close_prob=0.0
-perturb_open_laptop_pregrasp_translation_prob=0.0
-perturb_open_laptop_pregrasp_rotation_prob=1.0
+perturb_open_laptop_pregrasp_translation_prob=1.0
+perturb_open_laptop_pregrasp_rotation_prob=0.0
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
 sample_phase_window_len=30
@@ -112,6 +119,13 @@ if [ "${enable_wm}" = "true" ]; then
     --correction_force_generate ${correction_force_generate} \
     --debug_correction_evac_rollout ${debug_correction_evac_rollout} \
     --rollout_exec_steps ${rollout_exec_steps} \
+    --recover_eval_enable ${recover_eval_enable} \
+    --recover_eval_use_for_trigger ${recover_eval_use_for_trigger} \
+    --recover_eval_save_video ${recover_eval_save_video} \
+    --recover_eval_gripper_open_thresh ${recover_eval_gripper_open_thresh} \
+    --recover_eval_pos_thresh_m ${recover_eval_pos_thresh_m} \
+    --recover_eval_rot_thresh_deg ${recover_eval_rot_thresh_deg} \
+    --recover_eval_nearest_window_radius ${recover_eval_nearest_window_radius} \
     --orient_weight ${orient_weight} \
     --gripper_penalty ${gripper_penalty} \
     --export_correction_dataset ${export_correction_dataset} \

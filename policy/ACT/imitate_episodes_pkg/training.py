@@ -252,6 +252,13 @@ def main(args):
             'correction_force_generate': args['correction_force_generate'],
             'debug_correction_evac_rollout': args.get('debug_correction_evac_rollout', False),
             'rollout_exec_steps': int(rollout_exec_steps),
+            'recover_eval_enable': bool(args.get('recover_eval_enable', False)),
+            'recover_eval_use_for_trigger': bool(args.get('recover_eval_use_for_trigger', False)),
+            'recover_eval_save_video': bool(args.get('recover_eval_save_video', False)),
+            'recover_eval_gripper_open_thresh': float(args.get('recover_eval_gripper_open_thresh', 0.8)),
+            'recover_eval_pos_thresh_m': float(args.get('recover_eval_pos_thresh_m', 0.03)),
+            'recover_eval_rot_thresh_deg': float(args.get('recover_eval_rot_thresh_deg', 10.0)),
+            'recover_eval_nearest_window_radius': int(args.get('recover_eval_nearest_window_radius', 16)),
             'sample_phase_window_len': int(args['sample_phase_window_len']),
             'chunk_size': args['chunk_size'],
             'max_action_len': max_action_len,
@@ -473,8 +480,9 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             norm_stats, correction_modules, correction_cfg,
                             accelerator.device, debug_dir=_bi_dbg,
                             start_ts=corr_source[5][bi].item(),
-                            pregrasp_seg_start=(corr_source[6][bi].item() if len(corr_source) > 6 else None),
-                            pregrasp_seg_end=(corr_source[7][bi].item() if len(corr_source) > 7 else None),
+                            sampled_phase_id=corr_source[6][bi].item(),
+                            pregrasp_seg_start=corr_source[7][bi].item(),
+                            pregrasp_seg_end=corr_source[8][bi].item(),
                         )
                         _corr_stats['n_triggered'] += 1
                         if corr is not None:

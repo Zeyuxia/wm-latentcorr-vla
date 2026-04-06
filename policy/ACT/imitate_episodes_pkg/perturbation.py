@@ -211,11 +211,18 @@ def _perturb_action_chunk_target_pose(
     mode = str(error_mode).lower()
     curr_left_q = np.asarray(curr_left_q, dtype=np.float32)
     curr_right_q = np.asarray(curr_right_q, dtype=np.float32)
+    sampled_axis_l = None
+    sampled_axis_r = None
+    sampled_dir_l = None
+    sampled_dir_r = None
+    sampled_rotation_deg = None
+    sampled_translation_gain_m = None
 
     if mode == "rotation":
         # Rotate around the unified sampled-start target pose.
         angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0)) * mag_scale
         angle = np.deg2rad(angle_max_deg)
+        sampled_rotation_deg = float(angle_max_deg)
         axis_l = None
         axis_r = None
         if forced_axis_left is not None:
@@ -227,6 +234,8 @@ def _perturb_action_chunk_target_pose(
             axis_r = _sample_unit_vec3()
         axis_l = _unit_vec3(axis_l) if axis_l is not None else _sample_unit_vec3()
         axis_r = _unit_vec3(axis_r) if axis_r is not None else _sample_unit_vec3()
+        sampled_axis_l = np.asarray(axis_l, dtype=np.float32).tolist()
+        sampled_axis_r = np.asarray(axis_r, dtype=np.float32).tolist()
         if active_left_arm:
             ql_xyzw = np.array([l_pose[4], l_pose[5], l_pose[6], l_pose[3]], dtype=np.float32)
             ql_new = (R.from_rotvec(np.asarray(axis_l, dtype=np.float32) * angle) * R.from_quat(ql_xyzw)).as_quat()
@@ -239,6 +248,7 @@ def _perturb_action_chunk_target_pose(
     elif mode == "translation":
         # Translate from the same sampled-start target pose.
         fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03)) * mag_scale
+        sampled_translation_gain_m = float(fail_gain)
         dir_l = None
         dir_r = None
         if forced_dir_left is not None:
@@ -249,6 +259,8 @@ def _perturb_action_chunk_target_pose(
             dir_l = _sample_in_forward_hemisphere(_eef_forward_dir_from_wxyz(l_pose[3:7]))
         if dir_r is None:
             dir_r = _sample_in_forward_hemisphere(_eef_forward_dir_from_wxyz(r_pose[3:7]))
+        sampled_dir_l = np.asarray(dir_l, dtype=np.float32).tolist()
+        sampled_dir_r = np.asarray(dir_r, dtype=np.float32).tolist()
         if active_left_arm:
             l_pose[:3] = l_pose[:3] + fail_gain * np.asarray(dir_l, dtype=np.float32)
         if active_right_arm:
@@ -324,6 +336,12 @@ def _perturb_action_chunk_target_pose(
     info = {
         "target_idx": int(idx),
         "perturb_mag_scale": float(mag_scale),
+        "perturb_translation_gain_m": sampled_translation_gain_m,
+        "perturb_rotation_deg": sampled_rotation_deg,
+        "perturb_dir_left": sampled_dir_l,
+        "perturb_dir_right": sampled_dir_r,
+        "perturb_axis_left": sampled_axis_l,
+        "perturb_axis_right": sampled_axis_r,
         "error_mode": mode,
     }
     return out, True, mode_tag, info

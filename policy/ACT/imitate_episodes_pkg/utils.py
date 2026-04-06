@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import numpy as np
 
+PHASE_KEYS = ("approach", "pregrasp", "transport", "place")
+PHASE_KEY_TO_ID = {k: i for i, k in enumerate(PHASE_KEYS)}
+PHASE_ID_TO_KEY = {i: k for i, k in enumerate(PHASE_KEYS)}
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -89,6 +93,24 @@ def infer_phase_key_from_gt_window(left_grip_traj, right_grip_traj, window_len):
     if (mean_l <= 0.5) or (mean_r <= 0.5):
         return "transport"
     return "approach"
+
+
+def phase_key_to_id(phase_key):
+    key = str(phase_key).strip().lower()
+    if key not in PHASE_KEY_TO_ID:
+        raise ValueError(
+            f"Invalid phase_key={phase_key!r}. Expected one of {list(PHASE_KEY_TO_ID.keys())}."
+        )
+    return int(PHASE_KEY_TO_ID[key])
+
+
+def phase_id_to_key(phase_id):
+    idx = int(phase_id)
+    if idx not in PHASE_ID_TO_KEY:
+        raise ValueError(
+            f"Invalid phase_id={phase_id!r}. Expected one of {list(PHASE_ID_TO_KEY.keys())}."
+        )
+    return str(PHASE_ID_TO_KEY[idx])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -199,6 +221,20 @@ def build_parser() -> argparse.ArgumentParser:
                             help="If true, run EVAC once on final generated correction trajectory and save outputs.mp4")
         parser.add_argument("--rollout_exec_steps", type=int, default=None,
                             help="Number of actions executed per rollout step (prefix of chunk)")
+        parser.add_argument("--recover_eval_enable", type=str2bool, default=False,
+                            help="Evaluate if ACT can recover from perturbed observation at each rollout step")
+        parser.add_argument("--recover_eval_use_for_trigger", type=str2bool, default=False,
+                            help="If true, skip correction generation when recover_eval marks recoverable")
+        parser.add_argument("--recover_eval_save_video", type=str2bool, default=False,
+                            help="If true, save EVAC rollout video for ACT recover-eval action sequence at each rollout step")
+        parser.add_argument("--recover_eval_gripper_open_thresh", type=float, default=0.8,
+                            help="Recoverability threshold for gripper_close: max open value in first rollout_exec_steps")
+        parser.add_argument("--recover_eval_pos_thresh_m", type=float, default=0.03,
+                            help="Recoverability threshold for translation: EEF position error at step rollout_exec_steps (meters)")
+        parser.add_argument("--recover_eval_rot_thresh_deg", type=float, default=10.0,
+                            help="Recoverability threshold for rotation: EEF orientation error at step rollout_exec_steps (degrees)")
+        parser.add_argument("--recover_eval_nearest_window_radius", type=int, default=16,
+                            help="Forward-only nearest matching radius for translation/rotation recover_eval around center=start_ts+rollout_exec_steps")
         parser.add_argument("--orient_weight", type=float,
                             help="Weight for orientation distance in nearest-point matching (0=position only)")
         parser.add_argument("--gripper_penalty", type=float,

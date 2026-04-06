@@ -19,7 +19,7 @@ if _EVAC_ROOT not in sys.path:
 
 from constants import SIM_TASK_CONFIGS
 from imitate_episodes_pkg.correction import correction_step, load_raw_data
-from imitate_episodes_pkg.utils import build_evac_infer_kwargs
+from imitate_episodes_pkg.utils import build_evac_infer_kwargs, phase_id_to_key
 from imitate_episodes_pkg.training import init_correction, make_policy
 from utils import load_data
 
@@ -139,8 +139,10 @@ def main():
     image_data, qpos_data = data[0], data[1]
     ep_id = int(data[4][0].item())
     start_ts = int(data[5][0].item())
-    pregrasp_seg_start = int(data[6][0].item()) if len(data) > 6 else None
-    pregrasp_seg_end = int(data[7][0].item()) if len(data) > 7 else None
+    sampled_phase_id = int(data[6][0].item())
+    sampled_phase_key = phase_id_to_key(sampled_phase_id)
+    pregrasp_seg_start = int(data[7][0].item())
+    pregrasp_seg_end = int(data[8][0].item())
 
     policy_config = {
         "lr": 4e-5,
@@ -230,6 +232,7 @@ def main():
         device,
         debug_dir=debug_dir,
         start_ts=start_ts,
+        sampled_phase_id=sampled_phase_id,
         pregrasp_seg_start=pregrasp_seg_start,
         pregrasp_seg_end=pregrasp_seg_end,
     )
@@ -237,6 +240,8 @@ def main():
     result = {
         "episode_id": ep_id,
         "start_ts": start_ts,
+        "sampled_phase_id": sampled_phase_id,
+        "sampled_phase_key": sampled_phase_key,
         "pregrasp_seg_start": pregrasp_seg_start,
         "pregrasp_seg_end": pregrasp_seg_end,
         "debug_dir": debug_dir,

@@ -3,7 +3,7 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader, ConcatDataset, WeightedRandomSampler
-from imitate_episodes_pkg.utils import infer_phase_key_from_gt_window
+from imitate_episodes_pkg.utils import infer_phase_key_from_gt_window, phase_key_to_id
 
 import IPython
 
@@ -278,6 +278,13 @@ class EpisodicDataset(torch.utils.data.Dataset):
             action = root["/action"][start_ts:]
             action_len = episode_len - start_ts
 
+        sampled_phase = infer_phase_key_from_gt_window(
+            action[:, 6],
+            action[:, 13],
+            self.sample_phase_window_len,
+        )
+        sampled_phase_id = phase_key_to_id(sampled_phase)
+
         self.is_sim = is_sim
 
         padded_action = np.zeros((self.max_action_len, action.shape[1]), dtype=np.float32)  # 根据max_action_len初始化
@@ -313,6 +320,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 is_pad,
                 torch.tensor(episode_id),
                 torch.tensor(start_ts),
+                torch.tensor(sampled_phase_id),
                 torch.tensor(pregrasp_seg_start),
                 torch.tensor(pregrasp_seg_end),
             )

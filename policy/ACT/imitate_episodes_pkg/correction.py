@@ -6,7 +6,7 @@ import re
 import numpy as np
 import torch
 
-from imitate_episodes_pkg.utils import resample_trajectory
+from imitate_episodes_pkg.utils import phase_id_to_key, resample_trajectory
 from imitate_episodes_pkg.perturbation import (
     _infer_active_arms_from_gt_window,
     _infer_phase_key_from_gt_window,
@@ -121,6 +121,20 @@ def find_nearest_traj_point(fk_left_pos, fk_left_quat, fk_right_pos, fk_right_qu
             dists = d_win
     t_star = np.argmin(dists)
     return t_star, dists[t_star]
+
+
+def _quat_geodesic_deg_wxyz(q1_wxyz, q2_wxyz):
+    q1 = np.asarray(q1_wxyz, dtype=np.float32).reshape(4,)
+    q2 = np.asarray(q2_wxyz, dtype=np.float32).reshape(4,)
+    n1 = float(np.linalg.norm(q1))
+    n2 = float(np.linalg.norm(q2))
+    if n1 < 1e-8 or n2 < 1e-8:
+        return 180.0
+    q1 = q1 / n1
+    q2 = q2 / n2
+    dot = float(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0))
+    rad = 2.0 * float(np.arccos(dot))
+    return float(np.rad2deg(rad))
 
 def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_data, device,
                    save_dir=None, ddim_steps=27, infer_kwargs=None):
@@ -240,7 +254,7 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
 
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     norm_stats, modules, cfg, device, debug_dir=None, start_ts=0,
-                    pregrasp_seg_start=None, pregrasp_seg_end=None):
+                    sampled_phase_id=None, pregrasp_seg_start=None, pregrasp_seg_end=None):
     fk = modules['fk']
     evac_model = modules['evac_model']
     evac_cfg = modules['evac_config']
@@ -258,15 +272,22 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     max_action_len = cfg['max_action_len']
     orient_weight = float(cfg['orient_weight'])
     gripper_penalty = float(cfg['gripper_penalty'])
+    recover_eval_enable = bool(cfg.get('recover_eval_enable', False))
+    recover_eval_use_for_trigger = bool(cfg.get('recover_eval_use_for_trigger', False))
+    recover_eval_save_video = bool(cfg.get('recover_eval_save_video', False))
+    recover_eval_gripper_open_thresh = float(cfg.get('recover_eval_gripper_open_thresh', 0.8))
+    recover_eval_pos_thresh_m = float(cfg.get('recover_eval_pos_thresh_m', 0.03))
+    recover_eval_rot_thresh_deg = float(cfg.get('recover_eval_rot_thresh_deg', 10.0))
 
     left_grip_traj = raw_data['left_gripper'][start_ts:]
     right_grip_traj = raw_data['right_gripper'][start_ts:]
+    if sampled_phase_id is None:
+        raise RuntimeError(
+            f"Missing sampled_phase_id at correction_step (start_ts={int(start_ts)}). "
+            "Dataloader must provide sampled_phase_id for each sample."
+        )
+    phase_key_fixed = phase_id_to_key(int(sampled_phase_id))
     phase_window_len = int(cfg['sample_phase_window_len'])
-    phase_key_fixed = _infer_phase_key_from_gt_window(
-        left_grip_traj=left_grip_traj,
-        right_grip_traj=right_grip_traj,
-        window_len=phase_window_len,
-    )
 
     qpos_raw = qpos_data_s.cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
     curr_image = image_data_s.clone()
@@ -280,6 +301,18 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     dyn_state = None
     rollout_steps_total = 0
     evac_rollout_videos = []
+    recover_eval_any = False
+    recover_eval_first_step = None
+    recover_eval_last = {
+        'recoverable': False,
+        'mode': None,
+        'metric_name': None,
+        'metric': None,
+        'threshold': None,
+        'horizon': None,
+        'gt_ref_idx': None,
+    }
+    recover_eval_plot_last = None
 
     active_info_fixed = _infer_active_arms_from_gt_window(
         raw_data.get('gt_left_arm'),
@@ -400,11 +433,303 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         fk_r_e = fk.forward(left_q_e, right_q_e)
         lp_e, lq_e = fk_r_e['left']
         rp_e, rq_e = fk_r_e['right']
+        sampled_error_mode = None
+        perturb_mag_scale = None
+        perturb_translation_gain_m = None
+        perturb_rotation_deg = None
+        perturb_dir_left = None
+        perturb_dir_right = None
+        perturb_axis_left = None
+        perturb_axis_right = None
+        if isinstance(dyn_state, dict):
+            sampled_error_mode = dyn_state.get('error_mode')
+            perturb_mag_scale = dyn_state.get('perturb_mag_scale')
+            perturb_translation_gain_m = dyn_state.get('perturb_translation_gain_m')
+            perturb_rotation_deg = dyn_state.get('perturb_rotation_deg')
+            perturb_dir_left = dyn_state.get('perturb_dir_left')
+            perturb_dir_right = dyn_state.get('perturb_dir_right')
+            perturb_axis_left = dyn_state.get('perturb_axis_left')
+            perturb_axis_right = dyn_state.get('perturb_axis_right')
+
+        recover_eval_mode = sampled_error_mode
+        recover_eval_recoverable = None
+        recover_eval_metric_name = None
+        recover_eval_metric = None
+        recover_eval_threshold = None
+        recover_eval_horizon = None
+        recover_eval_gt_ref_idx = None
+        recover_eval_nearest_idx = None
+        recover_eval_nearest_dist = None
+        recover_eval_window_start = None
+        recover_eval_window_end = None
+        recover_eval_error = None
+        recover_eval_video = None
+
+        if recover_eval_enable:
+            try:
+                qn_eval = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
+                qt_eval = torch.from_numpy(qn_eval).float().unsqueeze(0).to(device)
+                it_eval = curr_image.unsqueeze(0).to(device)
+                _was_training_eval = policy_unwrapped.training
+                policy_unwrapped.eval()
+                try:
+                    with torch.no_grad():
+                        act_chunk_eval = policy_unwrapped(qt_eval, it_eval)
+                finally:
+                    if _was_training_eval:
+                        policy_unwrapped.train()
+                act_eval_np = act_chunk_eval.squeeze(0).cpu().numpy()
+                act_eval_raw = act_eval_np * norm_stats['action_std'] + norm_stats['action_mean']
+
+                h_eval = int(np.clip(rollout_exec_steps, 1, max(1, act_eval_raw.shape[0])))
+                act_eval_raw = act_eval_raw[:h_eval].copy()
+                k_eval = int(max(0, h_eval - 1))
+                fr_eval_last = fk.forward(act_eval_raw[k_eval, 0:6], act_eval_raw[k_eval, 7:13])
+                pred_left_grip_eval = float(np.clip(act_eval_raw[k_eval, 6], 0.0, 1.0))
+                pred_right_grip_eval = float(np.clip(act_eval_raw[k_eval, 13], 0.0, 1.0))
+                recover_eval_horizon = int(h_eval)
+                gt_ref_idx = int(np.clip(start_ts + h_eval, 0, raw_data['left_endpose'].shape[0] - 1))
+
+                if recover_eval_save_video and (debug_dir is not None):
+                    try:
+                        # Video-only smoothing: bridge from current perturbed state
+                        # to ACT first recover action using planner for 16 steps.
+                        bridge_steps = int(max(1, cfg.get('recover_eval_video_bridge_steps', 16)))
+                        act_eval_vis_raw = np.asarray(act_eval_raw, dtype=np.float32).copy()
+                        _bridge_meta = {
+                            'bridge_steps': int(bridge_steps),
+                            'left_status': 'Inactive',
+                            'right_status': 'Inactive',
+                        }
+                        if act_eval_vis_raw.shape[0] > 0:
+                            _target0 = np.asarray(act_eval_vis_raw[0], dtype=np.float32)
+                            _prefix = np.repeat(_target0[None, :], bridge_steps, axis=0).astype(np.float32)
+                            _prefix[:, 0:6] = np.repeat(np.asarray(left_q_e, dtype=np.float32)[None, :], bridge_steps, axis=0)
+                            _prefix[:, 7:13] = np.repeat(np.asarray(right_q_e, dtype=np.float32)[None, :], bridge_steps, axis=0)
+
+                            if bool(active_info.get('left_gripper', True)):
+                                _prefix[:, 6] = np.linspace(float(left_grip), float(_target0[6]), bridge_steps, dtype=np.float32)
+                            else:
+                                _prefix[:, 6] = float(left_grip)
+                            if bool(active_info.get('right_gripper', True)):
+                                _prefix[:, 13] = np.linspace(float(right_grip), float(_target0[13]), bridge_steps, dtype=np.float32)
+                            else:
+                                _prefix[:, 13] = float(right_grip)
+
+                            _qpos_full = np.zeros(len(fk.jnames), dtype=np.float32)
+                            _qpos_full[fk.fl_idx] = np.asarray(left_q_e, dtype=np.float32)
+                            _qpos_full[fk.fr_idx] = np.asarray(right_q_e, dtype=np.float32)
+                            import sapien
+                            _fr_tgt = fk.forward(_target0[0:6], _target0[7:13])
+
+                            if bool(active_info.get('left_arm', True)):
+                                _pose_l = sapien.Pose(
+                                    np.asarray(_fr_tgt['left'][0], dtype=np.float32),
+                                    np.asarray(_fr_tgt['left'][1], dtype=np.float32),
+                                )
+                                _res_l = planner_l.plan_path(_qpos_full, _pose_l, arms_tag='left')
+                                _bridge_meta['left_status'] = str(_res_l.get('status'))
+                                if str(_res_l.get('status')) == 'Success':
+                                    _path_l = np.asarray(_res_l.get('position', []), dtype=np.float32)
+                                    if _path_l.ndim == 2 and _path_l.shape[0] > 0:
+                                        _future_l = _path_l[1:] if _path_l.shape[0] > 1 else _path_l
+                                        _prefix[:, 0:6] = resample_trajectory(_future_l, bridge_steps).astype(np.float32)
+
+                            if bool(active_info.get('right_arm', True)):
+                                _pose_r = sapien.Pose(
+                                    np.asarray(_fr_tgt['right'][0], dtype=np.float32),
+                                    np.asarray(_fr_tgt['right'][1], dtype=np.float32),
+                                )
+                                _res_r = planner_r.plan_path(_qpos_full, _pose_r, arms_tag='right')
+                                _bridge_meta['right_status'] = str(_res_r.get('status'))
+                                if str(_res_r.get('status')) == 'Success':
+                                    _path_r = np.asarray(_res_r.get('position', []), dtype=np.float32)
+                                    if _path_r.ndim == 2 and _path_r.shape[0] > 0:
+                                        _future_r = _path_r[1:] if _path_r.shape[0] > 1 else _path_r
+                                        _prefix[:, 7:13] = resample_trajectory(_future_r, bridge_steps).astype(np.float32)
+
+                            act_eval_vis_raw = np.concatenate([_prefix, act_eval_vis_raw], axis=0).astype(np.float32)
+
+                        fk_eval_poses = [(lp_e.copy(), lq_e.copy(), rp_e.copy(), rq_e.copy())]
+                        grip_eval_list = [(float(left_grip), float(right_grip))]
+                        for _ai in range(act_eval_vis_raw.shape[0]):
+                            _ar = act_eval_vis_raw[_ai]
+                            _fr = fk.forward(_ar[0:6], _ar[7:13])
+                            fk_eval_poses.append((
+                                _fr['left'][0].copy(), _fr['left'][1].copy(),
+                                _fr['right'][0].copy(), _fr['right'][1].copy(),
+                            ))
+                            grip_eval_list.append((float(_ar[6]), float(_ar[13])))
+                        evac_recover_eval_dir = os.path.join(
+                            debug_dir, 'evac_recover_eval', f'rollout_step_{step:03d}'
+                        )
+                        _ = evac_inference(
+                            evac_model,
+                            evac_cfg,
+                            curr_image[0],
+                            fk_eval_poses,
+                            grip_eval_list,
+                            raw_data,
+                            device,
+                            save_dir=evac_recover_eval_dir,
+                            infer_kwargs=cfg.get('evac_infer_kwargs'),
+                        )
+                        _vpath_recover = os.path.join(evac_recover_eval_dir, 'outputs.mp4')
+                        recover_eval_video = {
+                            'path': _vpath_recover,
+                            'exists': bool(os.path.exists(_vpath_recover)),
+                            'bridge_steps': int(_bridge_meta.get('bridge_steps', 0)),
+                            'bridge_left_status': _bridge_meta.get('left_status'),
+                            'bridge_right_status': _bridge_meta.get('right_status'),
+                        }
+                    except Exception as _exc_recover_video:
+                        recover_eval_video = {
+                            'path': None,
+                            'exists': False,
+                            'error': str(_exc_recover_video),
+                        }
+
+                mode_eval = str(recover_eval_mode).strip().lower() if recover_eval_mode is not None else ""
+                if mode_eval == "gripper_close":
+                    recover_eval_gt_ref_idx = int(gt_ref_idx)
+                    open_vals = []
+                    if bool(active_info.get('left_gripper', True)):
+                        open_vals.append(float(np.max(act_eval_raw[:, 6])))
+                    if bool(active_info.get('right_gripper', True)):
+                        open_vals.append(float(np.max(act_eval_raw[:, 13])))
+                    recover_eval_metric_name = "gripper_open_max"
+                    recover_eval_metric = (None if len(open_vals) == 0 else float(np.max(open_vals)))
+                    recover_eval_threshold = float(recover_eval_gripper_open_thresh)
+                    recover_eval_recoverable = (
+                        recover_eval_metric is not None and
+                        float(recover_eval_metric) >= float(recover_eval_threshold)
+                    )
+                elif mode_eval == "translation":
+                    fr_eval = fr_eval_last
+                    # Forward-only nearest matching around center=start_ts+H.
+                    near_w_eval = int(max(1, cfg.get('recover_eval_nearest_window_radius', int(max(1, rollout_exec_steps)))))
+                    ws = int(np.clip(gt_ref_idx, 0, raw_data['left_endpose'].shape[0] - 1))
+                    we = int(np.clip(gt_ref_idx + near_w_eval + 1, ws + 1, raw_data['left_endpose'].shape[0]))
+                    nidx_abs, ndist = find_nearest_traj_point(
+                        np.asarray(fr_eval['left'][0], dtype=np.float32),
+                        np.asarray(fr_eval['left'][1], dtype=np.float32),
+                        np.asarray(fr_eval['right'][0], dtype=np.float32),
+                        np.asarray(fr_eval['right'][1], dtype=np.float32),
+                        raw_data['left_endpose'],
+                        raw_data['right_endpose'],
+                        orient_weight=0.0,
+                        curr_left_grip=pred_left_grip_eval,
+                        curr_right_grip=pred_right_grip_eval,
+                        left_gripper_traj=raw_data.get('left_gripper'),
+                        right_gripper_traj=raw_data.get('right_gripper'),
+                        gripper_penalty=0.0,
+                        window_start=ws,
+                        window_end=we,
+                    )
+                    recover_eval_nearest_idx = int(nidx_abs)
+                    recover_eval_nearest_dist = float(ndist)
+                    recover_eval_window_start = int(ws)
+                    recover_eval_window_end = int(we)
+                    recover_eval_gt_ref_idx = int(nidx_abs)
+                    pos_errs = []
+                    if bool(active_info.get('left_arm', True)):
+                        pos_errs.append(float(np.linalg.norm(
+                            np.asarray(fr_eval['left'][0], dtype=np.float32) -
+                            np.asarray(raw_data['left_endpose'][recover_eval_gt_ref_idx, :3], dtype=np.float32)
+                        )))
+                    if bool(active_info.get('right_arm', True)):
+                        pos_errs.append(float(np.linalg.norm(
+                            np.asarray(fr_eval['right'][0], dtype=np.float32) -
+                            np.asarray(raw_data['right_endpose'][recover_eval_gt_ref_idx, :3], dtype=np.float32)
+                        )))
+                    recover_eval_metric_name = "pos_err_m"
+                    recover_eval_metric = (None if len(pos_errs) == 0 else float(np.mean(pos_errs)))
+                    recover_eval_threshold = float(recover_eval_pos_thresh_m)
+                    recover_eval_recoverable = (
+                        recover_eval_metric is not None and
+                        float(recover_eval_metric) <= float(recover_eval_threshold)
+                    )
+                elif mode_eval == "rotation":
+                    fr_eval = fr_eval_last
+                    # Forward-only nearest matching around center=start_ts+H.
+                    near_w_eval = int(max(1, cfg.get('recover_eval_nearest_window_radius', int(max(1, rollout_exec_steps)))))
+                    ws = int(np.clip(gt_ref_idx, 0, raw_data['left_endpose'].shape[0] - 1))
+                    we = int(np.clip(gt_ref_idx + near_w_eval + 1, ws + 1, raw_data['left_endpose'].shape[0]))
+                    nidx_abs, ndist = find_nearest_traj_point(
+                        np.asarray(fr_eval['left'][0], dtype=np.float32),
+                        np.asarray(fr_eval['left'][1], dtype=np.float32),
+                        np.asarray(fr_eval['right'][0], dtype=np.float32),
+                        np.asarray(fr_eval['right'][1], dtype=np.float32),
+                        raw_data['left_endpose'],
+                        raw_data['right_endpose'],
+                        orient_weight=0.0,
+                        curr_left_grip=pred_left_grip_eval,
+                        curr_right_grip=pred_right_grip_eval,
+                        left_gripper_traj=raw_data.get('left_gripper'),
+                        right_gripper_traj=raw_data.get('right_gripper'),
+                        gripper_penalty=0.0,
+                        window_start=ws,
+                        window_end=we,
+                    )
+                    recover_eval_nearest_idx = int(nidx_abs)
+                    recover_eval_nearest_dist = float(ndist)
+                    recover_eval_window_start = int(ws)
+                    recover_eval_window_end = int(we)
+                    recover_eval_gt_ref_idx = int(nidx_abs)
+                    rot_errs = []
+                    if bool(active_info.get('left_arm', True)):
+                        rot_errs.append(_quat_geodesic_deg_wxyz(
+                            fr_eval['left'][1],
+                            raw_data['left_endpose'][recover_eval_gt_ref_idx, 3:7],
+                        ))
+                    if bool(active_info.get('right_arm', True)):
+                        rot_errs.append(_quat_geodesic_deg_wxyz(
+                            fr_eval['right'][1],
+                            raw_data['right_endpose'][recover_eval_gt_ref_idx, 3:7],
+                        ))
+                    recover_eval_metric_name = "rot_err_deg"
+                    recover_eval_metric = (None if len(rot_errs) == 0 else float(np.mean(rot_errs)))
+                    recover_eval_threshold = float(recover_eval_rot_thresh_deg)
+                    recover_eval_recoverable = (
+                        recover_eval_metric is not None and
+                        float(recover_eval_metric) <= float(recover_eval_threshold)
+                    )
+                else:
+                    recover_eval_recoverable = False
+
+                if recover_eval_gt_ref_idx is not None:
+                    recover_eval_plot_last = {
+                        'mode': mode_eval,
+                        'gt_ref_idx': int(recover_eval_gt_ref_idx),
+                        'pred_left_pos': np.asarray(fr_eval_last['left'][0], dtype=np.float32).copy(),
+                        'pred_left_quat': np.asarray(fr_eval_last['left'][1], dtype=np.float32).copy(),
+                        'pred_right_pos': np.asarray(fr_eval_last['right'][0], dtype=np.float32).copy(),
+                        'pred_right_quat': np.asarray(fr_eval_last['right'][1], dtype=np.float32).copy(),
+                        'pred_left_grip': float(pred_left_grip_eval),
+                        'pred_right_grip': float(pred_right_grip_eval),
+                        'active_left_arm': bool(active_info.get('left_arm', True)),
+                        'active_right_arm': bool(active_info.get('right_arm', True)),
+                    }
+            except Exception as exc:
+                recover_eval_recoverable = False
+                recover_eval_error = str(exc)
+
+            if bool(recover_eval_recoverable):
+                recover_eval_any = True
+                if recover_eval_first_step is None:
+                    recover_eval_first_step = int(step)
+            recover_eval_last = {
+                'recoverable': bool(recover_eval_recoverable),
+                'mode': recover_eval_mode,
+                'metric_name': recover_eval_metric_name,
+                'metric': (None if recover_eval_metric is None else float(recover_eval_metric)),
+                'threshold': (None if recover_eval_threshold is None else float(recover_eval_threshold)),
+                'horizon': (None if recover_eval_horizon is None else int(recover_eval_horizon)),
+                'gt_ref_idx': (None if recover_eval_gt_ref_idx is None else int(recover_eval_gt_ref_idx)),
+            }
+
         # collect debug info for this rollout step
         if debug_dir is not None:
-            sampled_error_mode = None
-            if isinstance(dyn_state, dict):
-                sampled_error_mode = dyn_state.get('error_mode')
             _dbg_rollout.append({
                 'step': step, 't_star': int(t_star), 'min_dist': float(min_dist),
                 'min_dist_start': float(min_dist_start),
@@ -420,9 +745,54 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'action_perturbed': bool(perturbed),
                 'perturb_mode': pert_mode,
                 'sampled_error_mode': sampled_error_mode,
+                'perturb_mag_scale': (
+                    None if perturb_mag_scale is None else float(perturb_mag_scale)
+                ),
+                'perturb_translation_gain_m': (
+                    None if perturb_translation_gain_m is None else float(perturb_translation_gain_m)
+                ),
+                'perturb_rotation_deg': (
+                    None if perturb_rotation_deg is None else float(perturb_rotation_deg)
+                ),
+                'perturb_dir_left': perturb_dir_left,
+                'perturb_dir_right': perturb_dir_right,
+                'perturb_axis_left': perturb_axis_left,
+                'perturb_axis_right': perturb_axis_right,
                 'act_chunk_raw_first': act_raw[0].tolist(),
                 'act_chunk_raw_last': act_raw[-1].tolist(),
                 'rollout_exec_len': int(len(act_raw)),
+                'recover_eval_enable': bool(recover_eval_enable),
+                'recover_eval_mode': recover_eval_mode,
+                'recover_eval_recoverable': (
+                    None if recover_eval_recoverable is None else bool(recover_eval_recoverable)
+                ),
+                'recover_eval_metric_name': recover_eval_metric_name,
+                'recover_eval_metric': (
+                    None if recover_eval_metric is None else float(recover_eval_metric)
+                ),
+                'recover_eval_threshold': (
+                    None if recover_eval_threshold is None else float(recover_eval_threshold)
+                ),
+                'recover_eval_horizon': (
+                    None if recover_eval_horizon is None else int(recover_eval_horizon)
+                ),
+                'recover_eval_gt_ref_idx': (
+                    None if recover_eval_gt_ref_idx is None else int(recover_eval_gt_ref_idx)
+                ),
+                'recover_eval_nearest_idx': (
+                    None if recover_eval_nearest_idx is None else int(recover_eval_nearest_idx)
+                ),
+                'recover_eval_nearest_dist': (
+                    None if recover_eval_nearest_dist is None else float(recover_eval_nearest_dist)
+                ),
+                'recover_eval_window_start': (
+                    None if recover_eval_window_start is None else int(recover_eval_window_start)
+                ),
+                'recover_eval_window_end': (
+                    None if recover_eval_window_end is None else int(recover_eval_window_end)
+                ),
+                'recover_eval_error': recover_eval_error,
+                'recover_eval_video': recover_eval_video,
             })
 
     force_generate_correction = False
@@ -434,6 +804,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'reason': 'correction_force_generate',
                 'max_rollout_steps': int(max_steps),
             })
+    if recover_eval_enable and recover_eval_use_for_trigger and recover_eval_any:
+        force_generate_correction = False
+        if debug_dir is not None:
+            _dbg_rollout.append({
+                'step': int(max_steps_eff),
+                'reason': 'recover_eval_skip_correction',
+                'recover_eval_first_step': (
+                    None if recover_eval_first_step is None else int(recover_eval_first_step)
+                ),
+            })
+
+    # IMPORTANT: correction planning must start from post-rollout state.
+    # `left_q/right_q` inside rollout loop are sampled before executing act_raw,
+    # so refresh them from `curr_qpos_raw` here.
+    left_q = np.asarray(curr_qpos_raw[0:6], dtype=np.float32)
+    right_q = np.asarray(curr_qpos_raw[7:13], dtype=np.float32)
+    left_grip = float(curr_qpos_raw[6])
+    right_grip = float(curr_qpos_raw[13])
 
     nearest_mode = ""
     if isinstance(dyn_state, dict):
@@ -449,10 +837,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _dbg_corr = os.path.join(debug_dir, 'correction')
             os.makedirs(_dbg_corr, exist_ok=True)
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
-                _skip_reason = 'correction_not_forced'
-                json.dump({'reason': _skip_reason, 'min_dist': float(min_dist),
-                           'threshold': None,
-                           'rollout': _dbg_rollout}, _f, indent=2)
+                _skip_reason = (
+                    'recover_eval_recoverable'
+                    if (recover_eval_enable and recover_eval_use_for_trigger and recover_eval_any)
+                    else 'correction_not_forced'
+                )
+                json.dump({
+                    'reason': _skip_reason,
+                    'min_dist': float(min_dist),
+                    'threshold': None,
+                    'recover_eval_enable': bool(recover_eval_enable),
+                    'recover_eval_use_for_trigger': bool(recover_eval_use_for_trigger),
+                    'recover_eval_any': bool(recover_eval_any),
+                    'recover_eval_first_step': (
+                        None if recover_eval_first_step is None else int(recover_eval_first_step)
+                    ),
+                    'recover_eval_last': recover_eval_last,
+                    'rollout': _dbg_rollout
+                }, _f, indent=2)
         return None
 
     gt_left_arm = raw_data.get('gt_left_arm', None)
@@ -707,6 +1109,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         _dbg_corr = os.path.join(debug_dir, 'correction')
         os.makedirs(_dbg_corr, exist_ok=True)
         evac_corr_video = None
+        recover_eval_proj_meta = None
         if debug_correction_evac_rollout:
             try:
                 _lq0, _rq0 = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
@@ -868,6 +1271,57 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         seq.append(None)
                 return seq
 
+            def _extract_key_uvs(uvs, pts):
+                pts_uv = []
+                if getattr(uvs, "ndim", 0) != 3:
+                    return pts_uv
+                n_key = int(uvs.shape[1])
+                for j in range(n_key):
+                    try:
+                        z = float(pts[0, 0, 2, j].item())
+                        u = int(uvs[0, j, 0])
+                        v = int(uvs[0, j, 1])
+                    except Exception:
+                        pts_uv.append(None)
+                        continue
+                    if z > 1e-6 and (0 <= u < w_img) and (0 <= v < h_img):
+                        pts_uv.append((u, v))
+                    else:
+                        pts_uv.append(None)
+                return pts_uv
+
+            def _pack_pose_row(lp_i, lq_wxyz, lg_01, rp_i, rq_wxyz, rg_01):
+                lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
+                rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
+                if lq_xyzw[3] < 0:
+                    lq_xyzw = -lq_xyzw
+                if rq_xyzw[3] < 0:
+                    rq_xyzw = -rq_xyzw
+                lg = float(np.clip(lg_01, 0.0, 1.0)) * 120.0
+                rg = float(np.clip(rg_01, 0.0, 1.0)) * 120.0
+                return np.concatenate([lp_i, lq_xyzw, [lg], rp_i, rq_xyzw, [rg]], axis=0).astype(np.float32)
+
+            def _draw_pose_axes(img, uv_pts, label, label_color, thickness=2):
+                if uv_pts is None or len(uv_pts) < 1:
+                    return
+                base = uv_pts[0]
+                if base is None:
+                    return
+                axis_cols = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # x,y,z (BGR)
+                bx, by = int(base[0]), int(base[1])
+                cv2.circle(img, (bx, by), 4, label_color, -1, cv2.LINE_AA)
+                cv2.putText(
+                    img, label, (bx + 6, by - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, label_color, 1, cv2.LINE_AA
+                )
+                for ai in range(1, min(4, len(uv_pts))):
+                    pt = uv_pts[ai]
+                    if pt is None:
+                        continue
+                    px, py = int(pt[0]), int(pt[1])
+                    cv2.line(img, (bx, by), (px, py), axis_cols[ai - 1], thickness, cv2.LINE_AA)
+                    cv2.circle(img, (px, py), 2, axis_cols[ai - 1], -1, cv2.LINE_AA)
+
             traj_u8, mask = _render_endpoint_mask(pose_np)
             uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
             luv = _extract_base_uv(uvs_l, pts_l.reshape(1, pts_l.shape[1], 4, 4))
@@ -1013,6 +1467,64 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _annotate_start_end(_overlay_c, luv, "L", (0, 255, 0))
             _annotate_start_end(_overlay_c, ruv, "R", (0, 0, 255))
 
+            # Extra recover-eval projection on corrected image:
+            # REF = recover_eval reference GT pose, PRED = VLA recover final pose.
+            if isinstance(recover_eval_plot_last, dict):
+                try:
+                    _overlay_recover = _cimg.copy()
+                    _rid = int(np.clip(
+                        int(recover_eval_plot_last.get('gt_ref_idx', 0)),
+                        0,
+                        raw_data['left_endpose'].shape[0] - 1,
+                    ))
+                    _row_ref = _pack_pose_row(
+                        np.asarray(raw_data['left_endpose'][_rid, :3], dtype=np.float32),
+                        np.asarray(raw_data['left_endpose'][_rid, 3:7], dtype=np.float32),
+                        float(raw_data['left_gripper'][_rid]),
+                        np.asarray(raw_data['right_endpose'][_rid, :3], dtype=np.float32),
+                        np.asarray(raw_data['right_endpose'][_rid, 3:7], dtype=np.float32),
+                        float(raw_data['right_gripper'][_rid]),
+                    )
+                    _row_pred = _pack_pose_row(
+                        np.asarray(recover_eval_plot_last.get('pred_left_pos'), dtype=np.float32),
+                        np.asarray(recover_eval_plot_last.get('pred_left_quat'), dtype=np.float32),
+                        float(recover_eval_plot_last.get('pred_left_grip', 0.0)),
+                        np.asarray(recover_eval_plot_last.get('pred_right_pos'), dtype=np.float32),
+                        np.asarray(recover_eval_plot_last.get('pred_right_quat'), dtype=np.float32),
+                        float(recover_eval_plot_last.get('pred_right_grip', 0.0)),
+                    )
+                    _uvl_ref, _uvr_ref, _ptl_ref, _ptr_ref = _project_base_uv_from_pose_np(_row_ref[None, :])
+                    _uvl_pred, _uvr_pred, _ptl_pred, _ptr_pred = _project_base_uv_from_pose_np(_row_pred[None, :])
+                    _l_ref_pts = _extract_key_uvs(_uvl_ref, _ptl_ref)
+                    _r_ref_pts = _extract_key_uvs(_uvr_ref, _ptr_ref)
+                    _l_pred_pts = _extract_key_uvs(_uvl_pred, _ptl_pred)
+                    _r_pred_pts = _extract_key_uvs(_uvr_pred, _ptr_pred)
+
+                    if bool(recover_eval_plot_last.get('active_left_arm', True)):
+                        _draw_pose_axes(_overlay_recover, _l_ref_pts, "REF-L", (0, 210, 255), thickness=1)
+                        _draw_pose_axes(_overlay_recover, _l_pred_pts, "PRED-L", (255, 255, 0), thickness=2)
+                    if bool(recover_eval_plot_last.get('active_right_arm', True)):
+                        _draw_pose_axes(_overlay_recover, _r_ref_pts, "REF-R", (0, 165, 255), thickness=1)
+                        _draw_pose_axes(_overlay_recover, _r_pred_pts, "PRED-R", (255, 220, 0), thickness=2)
+
+                    _recover_proj_path = os.path.join(_dbg_corr, 'recover_eval_projection_on_corrected.png')
+                    cv2.imwrite(_recover_proj_path, _overlay_recover)
+                    recover_eval_proj_meta = {
+                        'path': _recover_proj_path,
+                        'exists': bool(os.path.exists(_recover_proj_path)),
+                        'mode': recover_eval_plot_last.get('mode'),
+                        'gt_ref_idx': int(_rid),
+                        'active_left_arm': bool(recover_eval_plot_last.get('active_left_arm', True)),
+                        'active_right_arm': bool(recover_eval_plot_last.get('active_right_arm', True)),
+                    }
+                except Exception:
+                    try:
+                        import traceback
+                        with open(os.path.join(_dbg_corr, 'recover_eval_projection_error.txt'), 'w') as _f:
+                            _f.write(traceback.format_exc())
+                    except Exception:
+                        pass
+
             cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_original.png'), _overlay_o)
             cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
             cv2.imwrite(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _overlay_gt)
@@ -1062,6 +1574,19 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'phase_key': _r.get('phase_key'),
                 'perturb_mode': _r.get('perturb_mode'),
                 'sampled_error_mode': _r.get('sampled_error_mode'),
+                'perturb_mag_scale': (
+                    None if _r.get('perturb_mag_scale') is None else float(_r.get('perturb_mag_scale'))
+                ),
+                'perturb_translation_gain_m': (
+                    None if _r.get('perturb_translation_gain_m') is None else float(_r.get('perturb_translation_gain_m'))
+                ),
+                'perturb_rotation_deg': (
+                    None if _r.get('perturb_rotation_deg') is None else float(_r.get('perturb_rotation_deg'))
+                ),
+                'perturb_dir_left': _r.get('perturb_dir_left'),
+                'perturb_dir_right': _r.get('perturb_dir_right'),
+                'perturb_axis_left': _r.get('perturb_axis_left'),
+                'perturb_axis_right': _r.get('perturb_axis_right'),
                 'active_left_arm': bool(_r.get('active_left_arm', True)),
                 'active_right_arm': bool(_r.get('active_right_arm', True)),
                 'active_left_gripper': bool(_r.get('active_left_gripper', True)),
@@ -1072,6 +1597,37 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'left_grip': (None if _r.get('left_grip') is None else float(_r.get('left_grip'))),
                 'right_grip': (None if _r.get('right_grip') is None else float(_r.get('right_grip'))),
                 'reason': _r.get('reason'),
+                'recover_eval_enable': bool(_r.get('recover_eval_enable', False)),
+                'recover_eval_mode': _r.get('recover_eval_mode'),
+                'recover_eval_recoverable': (
+                    None if _r.get('recover_eval_recoverable') is None else bool(_r.get('recover_eval_recoverable'))
+                ),
+                'recover_eval_metric_name': _r.get('recover_eval_metric_name'),
+                'recover_eval_metric': (
+                    None if _r.get('recover_eval_metric') is None else float(_r.get('recover_eval_metric'))
+                ),
+                'recover_eval_threshold': (
+                    None if _r.get('recover_eval_threshold') is None else float(_r.get('recover_eval_threshold'))
+                ),
+                'recover_eval_horizon': (
+                    None if _r.get('recover_eval_horizon') is None else int(_r.get('recover_eval_horizon'))
+                ),
+                'recover_eval_gt_ref_idx': (
+                    None if _r.get('recover_eval_gt_ref_idx') is None else int(_r.get('recover_eval_gt_ref_idx'))
+                ),
+                'recover_eval_nearest_idx': (
+                    None if _r.get('recover_eval_nearest_idx') is None else int(_r.get('recover_eval_nearest_idx'))
+                ),
+                'recover_eval_nearest_dist': (
+                    None if _r.get('recover_eval_nearest_dist') is None else float(_r.get('recover_eval_nearest_dist'))
+                ),
+                'recover_eval_window_start': (
+                    None if _r.get('recover_eval_window_start') is None else int(_r.get('recover_eval_window_start'))
+                ),
+                'recover_eval_window_end': (
+                    None if _r.get('recover_eval_window_end') is None else int(_r.get('recover_eval_window_end'))
+                ),
+                'recover_eval_video': _r.get('recover_eval_video'),
                 'evac_video': _video,
                 'evac_video_dir': (None if _video is None else os.path.dirname(_video.get('path'))),
             })
@@ -1085,6 +1641,16 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             'final_match': {
                 'min_dist': float(min_dist),
                 'nearest_mode': nearest_mode,
+            },
+            'recover_eval_summary': {
+                'enable': bool(recover_eval_enable),
+                'use_for_trigger': bool(recover_eval_use_for_trigger),
+                'any_recoverable': bool(recover_eval_any),
+                'first_recoverable_step': (
+                    None if recover_eval_first_step is None else int(recover_eval_first_step)
+                ),
+                'last': recover_eval_last,
+                'projection_on_corrected': recover_eval_proj_meta,
             },
             'correction_plan': {
                 'left_active': bool(corr_left_active),
@@ -1116,6 +1682,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'action_perturbed': _r.get('action_perturbed'),
                 'perturb_mode': _r.get('perturb_mode'),
                 'sampled_error_mode': _r.get('sampled_error_mode'),
+                'perturb_mag_scale': _r.get('perturb_mag_scale'),
+                'perturb_translation_gain_m': _r.get('perturb_translation_gain_m'),
+                'perturb_rotation_deg': _r.get('perturb_rotation_deg'),
+                'perturb_dir_left': _r.get('perturb_dir_left'),
+                'perturb_dir_right': _r.get('perturb_dir_right'),
+                'perturb_axis_left': _r.get('perturb_axis_left'),
+                'perturb_axis_right': _r.get('perturb_axis_right'),
+                'recover_eval_mode': _r.get('recover_eval_mode'),
+                'recover_eval_recoverable': _r.get('recover_eval_recoverable'),
+                'recover_eval_metric_name': _r.get('recover_eval_metric_name'),
+                'recover_eval_metric': _r.get('recover_eval_metric'),
+                'recover_eval_threshold': _r.get('recover_eval_threshold'),
+                'recover_eval_gt_ref_idx': _r.get('recover_eval_gt_ref_idx'),
+                'recover_eval_nearest_idx': _r.get('recover_eval_nearest_idx'),
+                'recover_eval_nearest_dist': _r.get('recover_eval_nearest_dist'),
+                'recover_eval_window_start': _r.get('recover_eval_window_start'),
+                'recover_eval_window_end': _r.get('recover_eval_window_end'),
+                'recover_eval_video': _r.get('recover_eval_video'),
             }
             _closed_loop_rollouts.append(_drop_none(_rec))
 
@@ -1127,6 +1711,15 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             'rollout_exec_steps': int(rollout_exec_steps),
             'final_match': {
                 't_star': int(t_star),
+            },
+            'recover_eval_summary': {
+                'enable': bool(recover_eval_enable),
+                'use_for_trigger': bool(recover_eval_use_for_trigger),
+                'any_recoverable': bool(recover_eval_any),
+                'first_recoverable_step': (
+                    None if recover_eval_first_step is None else int(recover_eval_first_step)
+                ),
+                'last': recover_eval_last,
             },
             'rollouts': _closed_loop_rollouts,
         }
@@ -1156,6 +1749,13 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "rollout_exec_steps": int(rollout_exec_steps),
         "t_star": int(t_star),
         "min_dist": float(min_dist),
+        "recover_eval_enable": bool(recover_eval_enable),
+        "recover_eval_use_for_trigger": bool(recover_eval_use_for_trigger),
+        "recover_eval_any": bool(recover_eval_any),
+        "recover_eval_first_step": (
+            None if recover_eval_first_step is None else int(recover_eval_first_step)
+        ),
+        "recover_eval_last": recover_eval_last,
         "error_action_prefix_raw": error_action_prefix_raw,
     }
 
