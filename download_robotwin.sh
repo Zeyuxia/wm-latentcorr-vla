@@ -12,7 +12,7 @@ RETRY_DELAY=5
 
 # 定义需要下载的文件列表
 FILES=(
-    "dataset/open_laptop/aloha-agilex_clean_50.zip"
+    "dataset/beat_block_hammer/aloha-agilex_clean_50.zip"
 )
 # ===========================================
 
@@ -30,11 +30,10 @@ while [ $attempt -le $MAX_RETRIES ]; do
     
     # 执行下载命令
     # "${FILES[@]}" 会自动展开为上面定义的文件列表
-    huggingface-cli download "$REPO_ID" \
+    hf download "$REPO_ID" \
         --include "${FILES[@]}" \
         --repo-type dataset \
         --local-dir "$LOCAL_DIR" \
-        --resume-download  # 显式开启断点续传（新版CLI默认开启，加上更保险）
 
     # 检查上一条命令的退出状态码 ($?)
     if [ $? -eq 0 ]; then

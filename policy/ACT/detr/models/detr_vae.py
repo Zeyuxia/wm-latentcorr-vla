@@ -79,7 +79,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim)  # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, external_latent_input=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -116,6 +116,14 @@ class DETRVAE(nn.Module):
             mu = logvar = None
             latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
             latent_input = self.latent_out_proj(latent_sample)
+
+        if external_latent_input is not None:
+            if external_latent_input.shape != latent_input.shape:
+                raise ValueError(
+                    f"external_latent_input shape mismatch: expected {tuple(latent_input.shape)}, "
+                    f"got {tuple(external_latent_input.shape)}"
+                )
+            latent_input = latent_input + external_latent_input
 
         if self.backbones is not None:
             # Image observation features and position embeddings
