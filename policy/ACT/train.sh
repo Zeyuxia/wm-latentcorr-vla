@@ -2,12 +2,12 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-train_tag="place_cans_plasticbox_openloopbase"
-gpu_ids=0,1,2,3,4,5,6,7
-main_process_port=29400
+train_tag="open_laptop"
+gpu_ids=4
+main_process_port=29500
 
 # Single-task settings (used when task_names is empty)
-task_name=place_cans_plasticbox
+task_name=open_laptop
 task_config=demo_clean
 expert_data_num=50
 
@@ -32,7 +32,7 @@ save_freq=10
 state_dim=14
 
 # World model parameters
-enable_wm=false
+enable_wm=true
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
 evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3124-step=12500.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
@@ -40,24 +40,13 @@ urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_d
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 curobo_right_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
 raw_data_dir=/data/zhenyangfan/RoboTwin/data/${task_name}/${task_config}/data
-# act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933/policy_epoch_1000_seed_0.ckpt
+act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933_1000epoch_baseline/policy_epoch_1000_seed_0.ckpt
 max_rollout_steps=1
-target_mode=backward
-target_lookahead_steps=4
-min_dist_fallback_force_correction=true
-min_dist_recover_ratio=0.75
-debug_recover_eval_rollout=false
-debug_correction_evac_rollout=false
-correction_interp_nearest_enable=false
-correction_interp_prefix_ratio=0.6
-correction_planner_prefix_ratio=0.5
-correction_gripper_close_prefix_ratio=0.32
-correction_compose_gt_tail_enable=true
+correction_force_generate=true
+debug_correction_evac_rollout=true
 rollout_exec_steps=16
-correction_weight=2.0
 orient_weight=0.0573
 gripper_penalty=1.0
-recover_gripper_penalty=0.0
 debug_wm=true
 debug_loss_batch_projection=true
 export_correction_dataset=true
@@ -67,36 +56,24 @@ export_correction_dir=
 enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
-perturb_open_laptop_pregrasp_close_prob=0.5
+perturb_open_laptop_pregrasp_close_prob=0.0
 perturb_open_laptop_pregrasp_translation_prob=0.0
-perturb_open_laptop_pregrasp_rotation_prob=0.0
-perturb_eef_fail_gain=0.10
-perturb_rot_max_deg=15
-perturb_mag_random=false
-perturb_mag_rand_min=1.00
-perturb_mag_rand_max=1.40
-perturb_reject_sampling_enable=true
-perturb_reject_max_trials=4
-perturb_reject_dir_jitter_eps=0.2
-perturb_active_joint_delta_thresh=0.01
-perturb_active_gripper_delta_thresh=0.05
-nearest_window_radius=12
-perturb_gripper_close_min=0.10
-perturb_gripper_open_max=0.90
-perturb_gripper_fast_ratio=0.20
-lr_sched_enable=false
-lr_warmup_steps=30
-lr_min_ratio=0.1
-sp_reg_enable=false
-sp_reg_lambda=0.0
+perturb_open_laptop_pregrasp_rotation_prob=1.0
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
-sample_pregrasp_phase_window_len=30
+sample_phase_window_len=30
 sample_pregrasp_keep_start_ratio=0.3
 sample_pregrasp_keep_end_ratio=0.5
 sample_skip_head_ratio=0.25
 wm_corr_pregrasp_extra_enable=true
 wm_corr_pregrasp_extra_ratio=0.5
+perturb_eef_fail_gain=0.10
+perturb_rot_max_deg=15
+perturb_mag_random=true
+perturb_mag_rand_min=1.00
+perturb_mag_rand_max=1.40
+perturb_active_joint_delta_thresh=0.01
+perturb_active_gripper_delta_thresh=0.05
 
 # Build saving dirs
 timestamp=$(date +"%Y%m%d_%H%M%S")
@@ -132,22 +109,11 @@ if [ "${enable_wm}" = "true" ]; then
     --raw_data_dir ${raw_data_dir} \
     --act_init_ckpt ${act_init_ckpt} \
     --max_rollout_steps ${max_rollout_steps} \
-    --target_mode ${target_mode} \
-    --target_lookahead_steps ${target_lookahead_steps} \
-    --min_dist_fallback_force_correction ${min_dist_fallback_force_correction} \
-    --min_dist_recover_ratio ${min_dist_recover_ratio} \
-    --debug_recover_eval_rollout ${debug_recover_eval_rollout} \
+    --correction_force_generate ${correction_force_generate} \
     --debug_correction_evac_rollout ${debug_correction_evac_rollout} \
-    --correction_interp_nearest_enable ${correction_interp_nearest_enable} \
-    --correction_interp_prefix_ratio ${correction_interp_prefix_ratio} \
-    --correction_planner_prefix_ratio ${correction_planner_prefix_ratio} \
-    --correction_gripper_close_prefix_ratio ${correction_gripper_close_prefix_ratio} \
-    --correction_compose_gt_tail_enable ${correction_compose_gt_tail_enable} \
     --rollout_exec_steps ${rollout_exec_steps} \
-    --correction_weight ${correction_weight} \
     --orient_weight ${orient_weight} \
     --gripper_penalty ${gripper_penalty} \
-    --recover_gripper_penalty ${recover_gripper_penalty} \
     --export_correction_dataset ${export_correction_dataset} \
     "
     if [ -n "${export_correction_dir}" ]; then
@@ -172,23 +138,11 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_mag_random ${perturb_mag_random} \
 --perturb_mag_rand_min ${perturb_mag_rand_min} \
 --perturb_mag_rand_max ${perturb_mag_rand_max} \
---perturb_reject_sampling_enable ${perturb_reject_sampling_enable} \
---perturb_reject_max_trials ${perturb_reject_max_trials} \
---perturb_reject_dir_jitter_eps ${perturb_reject_dir_jitter_eps} \
 --perturb_active_joint_delta_thresh ${perturb_active_joint_delta_thresh} \
 --perturb_active_gripper_delta_thresh ${perturb_active_gripper_delta_thresh} \
---nearest_window_radius ${nearest_window_radius} \
---perturb_gripper_close_min ${perturb_gripper_close_min} \
---perturb_gripper_open_max ${perturb_gripper_open_max} \
---perturb_gripper_fast_ratio ${perturb_gripper_fast_ratio} \
---lr_sched_enable ${lr_sched_enable} \
---lr_warmup_steps ${lr_warmup_steps} \
---lr_min_ratio ${lr_min_ratio} \
---sp_reg_enable ${sp_reg_enable} \
---sp_reg_lambda ${sp_reg_lambda} \
 --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
 --sample_pregrasp_prob ${sample_pregrasp_prob} \
---sample_pregrasp_phase_window_len ${sample_pregrasp_phase_window_len} \
+--sample_phase_window_len ${sample_phase_window_len} \
 --sample_pregrasp_keep_start_ratio ${sample_pregrasp_keep_start_ratio} \
 --sample_pregrasp_keep_end_ratio ${sample_pregrasp_keep_end_ratio} \
 --wm_corr_pregrasp_extra_enable ${wm_corr_pregrasp_extra_enable} \

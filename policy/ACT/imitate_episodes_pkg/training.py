@@ -1,0 +1,658 @@
+from __future__ import annotations
+
+import os
+import sys
+import time
+import pickle
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from utils import load_data
+from utils import compute_dict_mean, detach_dict
+from act_policy import ACTPolicy, CNNMLPPolicy
+from imitate_episodes_pkg.correction import (
+    _export_correction_sample_as_episode,
+    _init_export_episode_id,
+    _save_loss_batch_projection,
+    correction_step,
+    load_raw_data,
+)
+from imitate_episodes_pkg.utils import build_evac_infer_kwargs
+
+def main(args):
+    set_seed(int(args["seed"]))
+    _rank = int(os.environ.get("RANK", -1))
+    _local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    print(f"[main][rank={_rank} local_rank={_local_rank}] start")
+    # command line parameters
+    ckpt_dir = args["ckpt_dir"]
+    policy_class = args["policy_class"]
+    onscreen_render = args.get("onscreen_render", False)
+    task_name = args["task_name"]
+    multi_task_names_raw = str(args.get("multi_task_names", "")).strip()
+    multi_task_weights_raw = str(args.get("multi_task_weights", "")).strip()
+    multi_task_names = []
+    if multi_task_names_raw:
+        multi_task_names = [x.strip() for x in multi_task_names_raw.split(",") if x.strip()]
+    use_multi_task = len(multi_task_names) > 0
+    batch_size_train = args["batch_size"]
+    num_epochs = args["num_epochs"]
+
+    # get task parameters
+    def _resolve_task_cfg(_task_name):
+        _is_sim = _task_name[:4] == "sim-"
+        if _is_sim:
+            from constants import SIM_TASK_CONFIGS
+            _task_cfg = SIM_TASK_CONFIGS[_task_name]
+        else:
+            from aloha_scripts.constants import TASK_CONFIGS
+            _task_cfg = TASK_CONFIGS[_task_name]
+        return _task_cfg, _is_sim
+
+    dataset_dirs = None
+    num_episodes_list = None
+    multi_task_weights = None
+    if use_multi_task:
+        resolved = [_resolve_task_cfg(nm) for nm in multi_task_names]
+        task_cfgs = [x[0] for x in resolved]
+        is_sim = all(x[1] for x in resolved)
+        camera_names = task_cfgs[0]["camera_names"]
+        for i, tc in enumerate(task_cfgs):
+            if tc["camera_names"] != camera_names:
+                raise ValueError(
+                    f"multi_task camera_names mismatch at task={multi_task_names[i]}: "
+                    f"{tc['camera_names']} vs {camera_names}"
+                )
+        dataset_dirs = [tc["dataset_dir"] for tc in task_cfgs]
+        num_episodes_list = [int(tc["num_episodes"]) for tc in task_cfgs]
+        episode_len = max(int(tc["episode_len"]) for tc in task_cfgs)
+        dataset_dir = dataset_dirs[0]
+        num_episodes = num_episodes_list[0]
+        if multi_task_weights_raw:
+            multi_task_weights = [float(x.strip()) for x in multi_task_weights_raw.split(",") if x.strip()]
+            if len(multi_task_weights) != len(multi_task_names):
+                raise ValueError(
+                    f"multi_task_weights length ({len(multi_task_weights)}) "
+                    f"must match multi_task_names length ({len(multi_task_names)})"
+                )
+    else:
+        task_config, is_sim = _resolve_task_cfg(task_name)
+        dataset_dir = task_config["dataset_dir"]
+        num_episodes = task_config["num_episodes"]
+        episode_len = task_config["episode_len"]
+        camera_names = task_config["camera_names"]
+
+    # fixed parameters
+    state_dim = 14  # yiheng
+    lr_backbone = 1e-5
+    backbone = "resnet18"
+    if policy_class == "ACT":
+        enc_layers = 4
+        dec_layers = 7
+        nheads = 8
+        policy_config = {
+            "lr": args["lr"],
+            "num_queries": args["chunk_size"],
+            "kl_weight": args["kl_weight"],
+            "hidden_dim": args["hidden_dim"],
+            "dim_feedforward": args["dim_feedforward"],
+            "lr_backbone": lr_backbone,
+            "backbone": backbone,
+            "enc_layers": enc_layers,
+            "dec_layers": dec_layers,
+            "nheads": nheads,
+            "camera_names": camera_names,
+        }
+    elif policy_class == "CNNMLP":
+        policy_config = {
+            "lr": args["lr"],
+            "lr_backbone": lr_backbone,
+            "backbone": backbone,
+            "num_queries": 1,
+            "camera_names": camera_names,
+        }
+    else:
+        raise NotImplementedError
+
+    config = {
+        "num_epochs": num_epochs,
+        "ckpt_dir": ckpt_dir,
+        "episode_len": episode_len,
+        "state_dim": state_dim,
+        "lr": args["lr"],
+        "policy_class": policy_class,
+        "onscreen_render": onscreen_render,
+        "policy_config": policy_config,
+        "task_name": ((",".join(multi_task_names)) if use_multi_task else task_name),
+        "seed": args["seed"],
+        "temporal_agg": args["temporal_agg"],
+        "camera_names": camera_names,
+        "real_robot": not is_sim,
+        "save_freq": args['save_freq'],
+    }
+
+    enable_wm = args['enable_wm_correction']
+    start_margin = 0
+    sample_skip_head_ratio = float(args['sample_skip_head_ratio'])
+    sample_pregrasp_bias_enable = bool(args['sample_pregrasp_bias_enable'])
+    sample_pregrasp_prob = float(args['sample_pregrasp_prob'])
+    sample_phase_window_len = int(args['sample_phase_window_len'])
+    sample_pregrasp_keep_start_ratio = float(args['sample_pregrasp_keep_start_ratio'])
+    sample_pregrasp_keep_end_ratio = float(args['sample_pregrasp_keep_end_ratio'])
+    wm_corr_pregrasp_extra_enable = bool(args['wm_corr_pregrasp_extra_enable'])
+    wm_corr_pregrasp_extra_ratio = float(np.clip(args['wm_corr_pregrasp_extra_ratio'], 0.0, 1.0))
+    sample_pregrasp_close_offset_steps = None
+    if args.get('rollout_exec_steps', None) is not None:
+        _off = int(args['rollout_exec_steps'])
+        if _off > 0:
+            sample_pregrasp_close_offset_steps = _off
+    # Keep pregrasp-biased sampling strictly behind the WM switch.
+    # When WM is disabled, training should follow plain random start sampling.
+    if not enable_wm:
+        sample_skip_head_ratio = 0.0
+        sample_pregrasp_bias_enable = False
+        sample_pregrasp_prob = 0.0
+        wm_corr_pregrasp_extra_enable = False
+        wm_corr_pregrasp_extra_ratio = 0.0
+        sample_pregrasp_close_offset_steps = None
+    if enable_wm:
+        if use_multi_task:
+            raise ValueError("enable_wm_correction currently does not support multi-task training")
+        wm_required = ['evac_ckpt', 'evac_config', 'urdf_path', 'curobo_left_yml',
+                        'curobo_right_yml', 'raw_data_dir', 'act_init_ckpt',
+                        'max_rollout_steps',
+                        'orient_weight', 'gripper_penalty']
+        missing = [k for k in wm_required if args.get(k) is None]
+        if missing:
+            raise ValueError(f"--enable_wm_correction requires these args: {missing}")
+        # Reserve tail horizon based on actual rollout execution steps.
+        if args['rollout_exec_steps'] is None:
+            raise ValueError("rollout_exec_steps must be explicitly provided when enable_wm_correction=true")
+        exec_steps = int(args['rollout_exec_steps'])
+        start_margin = int(args['max_rollout_steps']) * int(exec_steps)
+    raw_data_dir = args['raw_data_dir'] if enable_wm else None
+    print(f"[main][rank={_rank}] before load_data | dataset_dir={dataset_dir} | num_episodes={num_episodes} | start_margin={start_margin}")
+    _t_load = time.time()
+    use_extra_pregrasp_corr = bool(enable_wm and wm_corr_pregrasp_extra_enable and wm_corr_pregrasp_extra_ratio > 0.0)
+    base_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
+    base_pregrasp_prob = float(sample_pregrasp_prob)
+    base_sample_skip_head_ratio = 0.0 if enable_wm else float(sample_skip_head_ratio)
+    if use_extra_pregrasp_corr:
+        # Main batch follows normal sampling (same as no-WM), correction batch is separate.
+        base_pregrasp_bias_enable = False
+        base_pregrasp_prob = 0.0
+
+    train_dataloader, _, stats, _, max_action_len = load_data(
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_train,
+        raw_data_dir=raw_data_dir,
+        start_margin=start_margin,
+        sample_skip_head_ratio=base_sample_skip_head_ratio,
+        sample_pregrasp_bias_enable=base_pregrasp_bias_enable,
+        sample_pregrasp_prob=base_pregrasp_prob,
+        sample_phase_window_len=sample_phase_window_len,
+        sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
+        sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+        dataset_dirs=dataset_dirs,
+        num_episodes_list=num_episodes_list,
+        task_weights=multi_task_weights,
+    )
+    corr_train_dataloader = None
+    if use_extra_pregrasp_corr:
+        corr_batch_size = int(max(1, round(float(batch_size_train) * float(wm_corr_pregrasp_extra_ratio))))
+        corr_train_dataloader, _, _, _, _ = load_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            corr_batch_size,
+            corr_batch_size,
+            raw_data_dir=raw_data_dir,
+            start_margin=start_margin,
+            sample_skip_head_ratio=sample_skip_head_ratio,
+            sample_pregrasp_bias_enable=True,
+            sample_pregrasp_prob=1.0,
+            sample_phase_window_len=sample_phase_window_len,
+            sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
+            sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+            sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+            dataset_dirs=dataset_dirs,
+            num_episodes_list=num_episodes_list,
+            task_weights=multi_task_weights,
+        )
+        print(f"[main][rank={_rank}] extra pregrasp correction dataloader enabled | corr_batch_size={corr_batch_size}")
+    print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
+
+    # save dataset stats
+    if not os.path.isdir(ckpt_dir):
+        os.makedirs(ckpt_dir, exist_ok=True)
+    stats_path = os.path.join(ckpt_dir, f"dataset_stats.pkl")
+    with open(stats_path, "wb") as f:
+        pickle.dump(stats, f)
+
+    config['enable_wm_correction'] = enable_wm
+    if enable_wm:
+        config['wm_args'] = args
+        config['raw_data_dir'] = raw_data_dir
+        config['norm_stats'] = stats
+        config['dataset_dir'] = dataset_dir
+        rollout_exec_steps = args.get('rollout_exec_steps', None)
+        if rollout_exec_steps is None or int(rollout_exec_steps) <= 0:
+            rollout_exec_steps = int(args['chunk_size'])
+        config['correction_cfg'] = {
+            'max_rollout_steps': args['max_rollout_steps'],
+            'correction_force_generate': args['correction_force_generate'],
+            'debug_correction_evac_rollout': args.get('debug_correction_evac_rollout', False),
+            'rollout_exec_steps': int(rollout_exec_steps),
+            'sample_phase_window_len': int(args['sample_phase_window_len']),
+            'chunk_size': args['chunk_size'],
+            'max_action_len': max_action_len,
+            'orient_weight': args['orient_weight'],
+            'gripper_penalty': args['gripper_penalty'],
+            'evac_infer_kwargs': build_evac_infer_kwargs(args),
+            'enable_perturb': args['enable_perturb'],
+            'perturb_prob': args['perturb_prob'],
+            'perturb_error_mode': args['perturb_error_mode'],
+            'perturb_open_laptop_pregrasp_close_prob': args['perturb_open_laptop_pregrasp_close_prob'],
+            'perturb_open_laptop_pregrasp_translation_prob': args['perturb_open_laptop_pregrasp_translation_prob'],
+            'perturb_open_laptop_pregrasp_rotation_prob': args['perturb_open_laptop_pregrasp_rotation_prob'],
+            'perturb_eef_fail_gain': args['perturb_eef_fail_gain'],
+            'perturb_rot_max_deg': args['perturb_rot_max_deg'],
+            'perturb_mag_random': args['perturb_mag_random'],
+            'perturb_mag_rand_min': args['perturb_mag_rand_min'],
+            'perturb_mag_rand_max': args['perturb_mag_rand_max'],
+            'perturb_active_joint_delta_thresh': args['perturb_active_joint_delta_thresh'],
+            'perturb_active_gripper_delta_thresh': args['perturb_active_gripper_delta_thresh'],
+            'export_correction_dataset': args['export_correction_dataset'],
+            'export_correction_dir': args['export_correction_dir'],
+        }
+    config['act_init_ckpt'] = args.get('act_init_ckpt')
+    config['debug_wm_correction'] = args.get('debug_wm_correction', False)
+    config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
+    print(f"[main][rank={_rank}] before train_bc | enable_wm={enable_wm}")
+    train_bc(train_dataloader, config, corr_train_dataloader=corr_train_dataloader)
+
+def make_policy(policy_class, policy_config):
+    if policy_class == "ACT":
+        policy = ACTPolicy(policy_config)
+    elif policy_class == "CNNMLP":
+        policy = CNNMLPPolicy(policy_config)
+    else:
+        raise NotImplementedError
+    return policy
+
+def make_optimizer(policy_class, policy):
+    if policy_class == "ACT":
+        optimizer = policy.configure_optimizers()
+    elif policy_class == "CNNMLP":
+        optimizer = policy.configure_optimizers()
+    else:
+        raise NotImplementedError
+    return optimizer
+
+def init_correction(args, device):
+    import sapien
+    from omegaconf import OmegaConf
+    # EVAC internal modules (e.g. ddpm3d) do `from utils.general_utils import ...`
+    # which needs evac/evac/ on sys.path AND `utils` in sys.modules to point to
+    # evac's utils package (not ACT's utils.py which is already cached).
+    _act_root = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    _evac_evac = os.path.join(_act_root, 'evac', 'evac')
+    if _evac_evac not in sys.path:
+        sys.path.insert(0, _evac_evac)
+    # Temporarily swap out ACT's utils module so EVAC can load its own utils package
+    _act_utils = sys.modules.pop('utils', None)
+    from evac.utils.general_utils import load_checkpoints, instantiate_from_config
+    from util.fk_sapien import SapienFK
+    _robotwin_root = os.path.realpath(os.path.join(_act_root, '..', '..'))
+    sys.path.insert(0, _robotwin_root)
+    sys.path.insert(0, os.path.join(_robotwin_root, 'envs', 'robot'))
+    _prev_cwd = os.getcwd()
+    os.chdir(_robotwin_root)
+    from planner import CuroboPlanner
+    os.chdir(_prev_cwd)
+
+    evac_cfg = OmegaConf.load(args['evac_config'])
+    evac_cfg.model.pretrained_checkpoint = args['evac_ckpt']
+    evac_model = instantiate_from_config(evac_cfg.model)
+    evac_model = load_checkpoints(evac_model, evac_cfg.model, ignore_mismatched_sizes=False)
+    evac_model = evac_model.to(device)
+    evac_model.eval()
+    for p in evac_model.parameters():
+        p.requires_grad = False
+
+    fk = SapienFK(args['urdf_path'])
+
+    root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
+    left_joints = [f'fl_joint{i}' for i in range(1, 7)]
+    right_joints = [f'fr_joint{i}' for i in range(1, 7)]
+    planner_l = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=args['curobo_left_yml'])
+    planner_r = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=args['curobo_right_yml'])
+
+    return {
+        'evac_model': evac_model, 'evac_config': evac_cfg,
+        'fk': fk, 'planner_left': planner_l, 'planner_right': planner_r,
+    }
+
+def forward_pass(data, policy):
+    image_data, qpos_data, action_data, is_pad = data[0], data[1], data[2], data[3]
+    return policy(qpos_data, image_data, action_data, is_pad)
+
+def train_bc(train_dataloader, config, corr_train_dataloader=None):
+    _r = int(os.environ.get("RANK", -1))
+    _lr = int(os.environ.get("LOCAL_RANK", -1))
+    num_epochs = config["num_epochs"]
+    ckpt_dir = config["ckpt_dir"]
+    seed = config["seed"]
+    policy_class = config["policy_class"]
+    policy_config = config["policy_config"]
+    enable_wm = bool(config["enable_wm_correction"])
+
+    # Accelerate: prepare model, optimizer, dataloader
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+
+    # Set seed after Accelerator init so each process gets proper seed offset
+    set_seed(seed)
+
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before make_policy")
+    _t_make_policy = time.time()
+    policy = make_policy(policy_class, policy_config)
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after make_policy | elapsed={time.time() - _t_make_policy:.2f}s")
+
+    if config.get('act_init_ckpt'):
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before load_act_init_ckpt")
+        _t_load_act = time.time()
+        ckpt = torch.load(config['act_init_ckpt'], map_location='cpu')
+        policy.load_state_dict(ckpt)
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after load_act_init_ckpt | elapsed={time.time() - _t_load_act:.2f}s")
+        print(f"Loaded ACT init weights from {config['act_init_ckpt']}")
+
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before make_optimizer")
+    _t_make_opt = time.time()
+    optimizer = make_optimizer(policy_class, policy)
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after make_optimizer | elapsed={time.time() - _t_make_opt:.2f}s")
+    print(f"[train_bc][rank={_r} local_rank={_lr}] before accelerator.prepare")
+    _t_prepare = time.time()
+    if corr_train_dataloader is None:
+        policy, optimizer, train_dataloader = accelerator.prepare(
+            policy, optimizer, train_dataloader
+        )
+    else:
+        policy, optimizer, train_dataloader, corr_train_dataloader = accelerator.prepare(
+            policy, optimizer, train_dataloader, corr_train_dataloader
+        )
+    print(f"[train_bc][rank={_r} local_rank={_lr}] after accelerator.prepare | elapsed={time.time() - _t_prepare:.2f}s")
+
+    correction_modules = None
+    debug_wm = config.get('debug_wm_correction', False)
+    debug_loss_batch_projection = bool(config.get('debug_loss_batch_projection', False))
+    debug_wm_dir = os.path.join(ckpt_dir, 'debug_wm') if debug_wm else None
+    if debug_wm_dir and accelerator.is_main_process:
+        os.makedirs(debug_wm_dir, exist_ok=True)
+    # correction statistics tracker
+    _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
+                   'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
+                   'n_fallback': 0}
+    if enable_wm:
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
+        _t_init_corr = time.time()
+        correction_modules = init_correction(config['wm_args'], accelerator.device)
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after init_correction | elapsed={time.time() - _t_init_corr:.2f}s")
+        norm_stats = config['norm_stats']
+        correction_cfg = config['correction_cfg']
+        raw_data_dir = config['raw_data_dir']
+        export_corr = bool(correction_cfg.get('export_correction_dataset', False))
+        export_corr_dir = str(correction_cfg.get('export_correction_dir', '')).strip()
+        if export_corr and export_corr_dir == '':
+            export_corr_dir = os.path.join(ckpt_dir, 'correction_dataset')
+        export_next_id = 0
+        if export_corr and accelerator.is_main_process:
+            os.makedirs(export_corr_dir, exist_ok=True)
+            export_next_id = _init_export_episode_id(export_corr_dir)
+            print(f"[train_bc] correction export enabled: {export_corr_dir}, next_episode_id={export_next_id}")
+
+    train_history = []
+
+    # TensorBoard (only on main process)
+    writer = None
+    if accelerator.is_main_process:
+        tb_log_dir = os.path.join(ckpt_dir, 'tb_logs')
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        print(f'TensorBoard log dir: {tb_log_dir}')
+    global_step = 0
+
+    for epoch in tqdm(range(num_epochs), disable=not accelerator.is_main_process):
+        if accelerator.is_main_process:
+            print(f"\nEpoch {epoch}")
+        corr_iter = iter(corr_train_dataloader) if corr_train_dataloader is not None else None
+
+        # training
+        policy.train()
+        optimizer.zero_grad()
+        for batch_idx, data in enumerate(train_dataloader):
+            apply_wm = enable_wm and correction_modules is not None
+            if not apply_wm:
+                forward_dict = forward_pass(data, policy)
+                loss = forward_dict["loss"]
+            else:
+                try:
+                    corr_source = data
+                    if corr_iter is not None:
+                        try:
+                            corr_source = next(corr_iter)
+                        except StopIteration:
+                            corr_iter = iter(corr_train_dataloader)
+                            corr_source = next(corr_iter)
+                    bs = int(corr_source[0].shape[0])
+                    bs_base = int(data[0].shape[0])
+                    corr_images, corr_qpos, corr_actions, corr_pads = [], [], [], []
+                    corr_mask = []
+                    # per-step debug dir (only on main process, only every 100 steps)
+                    _step_dbg = None
+                    if debug_wm_dir and accelerator.is_main_process:
+                        _step_dbg = os.path.join(debug_wm_dir, f'step_{global_step:06d}')
+                        os.makedirs(_step_dbg, exist_ok=True)
+                    for bi in range(bs):
+                        ep_id = corr_source[4][bi].item()
+                        raw = load_raw_data(raw_data_dir, ep_id)
+                        _bi_dbg = os.path.join(_step_dbg, f'bi{bi}') if _step_dbg else None
+                        if _bi_dbg:
+                            os.makedirs(_bi_dbg, exist_ok=True)
+                        corr = correction_step(
+                            accelerator.unwrap_model(policy),
+                            corr_source[0][bi], corr_source[1][bi], raw,
+                            norm_stats, correction_modules, correction_cfg,
+                            accelerator.device, debug_dir=_bi_dbg,
+                            start_ts=corr_source[5][bi].item(),
+                            pregrasp_seg_start=(corr_source[6][bi].item() if len(corr_source) > 6 else None),
+                            pregrasp_seg_end=(corr_source[7][bi].item() if len(corr_source) > 7 else None),
+                        )
+                        _corr_stats['n_triggered'] += 1
+                        if corr is not None:
+                            if isinstance(corr, (tuple, list)) and len(corr) >= 5:
+                                ci, cq, ca, cp, cmeta = corr
+                            else:
+                                ci, cq, ca, cp = corr
+                                cmeta = {}
+                            corr_images.append(ci)
+                            corr_qpos.append(cq)
+                            corr_actions.append(ca)
+                            corr_pads.append(cp)
+                            corr_mask.append(1.0)
+                            _corr_stats['n_success'] += 1
+                            if isinstance(cmeta, dict):
+                                if bool(cmeta.get('closed_loop_fallback_used', False)):
+                                    _corr_stats['n_fallback'] += 1
+                            if enable_wm and export_corr and accelerator.is_main_process:
+                                _export_correction_sample_as_episode(
+                                    export_corr_dir,
+                                    export_next_id,
+                                    config['camera_names'],
+                                    ci,
+                                    cq,
+                                    ca,
+                                    cp,
+                                    norm_stats,
+                                )
+                                export_next_id += 1
+                        else:
+                            _corr_stats['n_skipped'] += 1
+                            # dummy data to keep batch size consistent across ranks
+                            corr_images.append(corr_source[0][bi].to(accelerator.device))
+                            corr_qpos.append(corr_source[1][bi].to(accelerator.device))
+                            corr_actions.append(corr_source[2][bi].to(accelerator.device))
+                            corr_pads.append(corr_source[3][bi].to(accelerator.device))
+                            corr_mask.append(0.0)
+
+                    # Build a fixed-size mixed batch: [base bs] + [correction bs].
+                    ci_b = torch.stack(corr_images, dim=0)
+                    cq_b = torch.stack(corr_qpos, dim=0)
+                    ca_b = torch.stack(corr_actions, dim=0)
+                    cp_b = torch.stack(corr_pads, dim=0)
+
+                    base_images = data[0].to(accelerator.device)
+                    base_qpos = data[1].to(accelerator.device)
+                    base_actions = data[2].to(accelerator.device)
+                    base_pads = data[3].to(accelerator.device)
+
+                    mixed_images = torch.cat([base_images, ci_b], dim=0)
+                    mixed_qpos = torch.cat([base_qpos, cq_b], dim=0)
+                    mixed_actions = torch.cat([base_actions, ca_b], dim=0)
+                    mixed_pads = torch.cat([base_pads, cp_b], dim=0)
+                    if debug_loss_batch_projection and _step_dbg is not None:
+                        _loss_dbg = os.path.join(_step_dbg, 'loss_batch_projection')
+                        os.makedirs(_loss_dbg, exist_ok=True)
+                        _raw_cache = {}
+
+                        def _get_raw(ep_id_i):
+                            _k = int(ep_id_i)
+                            if _k not in _raw_cache:
+                                _raw_cache[_k] = load_raw_data(raw_data_dir, _k)
+                            return _raw_cache[_k]
+
+                        for i in range(bs_base):
+                            ep_i = int(data[4][i].item())
+                            st_i = int(data[5][i].item())
+                            _sdir = os.path.join(_loss_dbg, f'base_{i:03d}_ep{ep_i}_ts{st_i:04d}')
+                            _save_loss_batch_projection(
+                                _sdir,
+                                mixed_images[i][0],
+                                mixed_actions[i],
+                                mixed_pads[i],
+                                _get_raw(ep_i),
+                                correction_modules['fk'],
+                                norm_stats,
+                                meta={'sample_type': 'base', 'episode_id': ep_i, 'start_ts': st_i},
+                            )
+                        for j in range(bs):
+                            k = bs_base + j
+                            ep_j = int(corr_source[4][j].item())
+                            st_j = int(corr_source[5][j].item())
+                            _sdir = os.path.join(_loss_dbg, f'corr_{j:03d}_ep{ep_j}_ts{st_j:04d}')
+                            _save_loss_batch_projection(
+                                _sdir,
+                                mixed_images[k][0],
+                                mixed_actions[k],
+                                mixed_pads[k],
+                                _get_raw(ep_j),
+                                correction_modules['fk'],
+                                norm_stats,
+                                meta={
+                                    'sample_type': 'correction',
+                                    'episode_id': ep_j,
+                                    'start_ts': st_j,
+                                    'correction_generated': bool(corr_mask[j] > 0.5),
+                                },
+                            )
+
+                    mixed_dict = policy(
+                        mixed_qpos,
+                        mixed_images,
+                        mixed_actions,
+                        mixed_pads,
+                        return_per_sample=True,
+                    )
+
+                    per_sample_loss = mixed_dict['loss_per_sample']
+                    mask_t = torch.tensor(corr_mask, device=accelerator.device, dtype=per_sample_loss.dtype)
+                    n_corr = int(mask_t.sum().item())
+
+                    base_weight = torch.ones(bs_base, device=accelerator.device, dtype=per_sample_loss.dtype)
+                    sample_weight = torch.cat([base_weight, mask_t], dim=0)
+                    loss = (per_sample_loss * sample_weight).sum() / (bs_base + n_corr)
+                    forward_dict = {"loss": loss}
+
+                    if accelerator.is_main_process and writer is not None:
+                        if n_corr > 0:
+                            corr_loss = (per_sample_loss[bs_base:] * mask_t).sum() / mask_t.sum()
+                        else:
+                            corr_loss = torch.tensor(0.0, device=accelerator.device, dtype=per_sample_loss.dtype)
+                        writer.add_scalar('train/correction_loss', corr_loss.item(), global_step)
+                        writer.add_scalar('train/n_correction_samples', n_corr, global_step)
+                except Exception as exc:
+                    _corr_stats['n_error'] += 1
+                    if accelerator.is_main_process:
+                        import traceback
+                        print(f'[WM correction] step {global_step} error: {exc}')
+                        traceback.print_exc()
+                    forward_dict = forward_pass(data, policy)
+                    loss = forward_dict["loss"]
+
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+            train_history.append(detach_dict(forward_dict))
+            if accelerator.is_main_process and writer is not None:
+                writer.add_scalar('train/loss_step', forward_dict['loss'].item(), global_step)
+                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
+            global_step += 1
+        epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
+        # TensorBoard: log epoch-level metrics
+        if accelerator.is_main_process and writer is not None:
+            for k, v in epoch_summary.items():
+                writer.add_scalar(f'train/{k}_epoch', v.item(), epoch)
+            # log correction statistics
+            if enable_wm:
+                writer.add_scalar('correction/n_triggered', _corr_stats['n_triggered'], epoch)
+                writer.add_scalar('correction/n_success', _corr_stats['n_success'], epoch)
+                writer.add_scalar('correction/n_skipped', _corr_stats['n_skipped'], epoch)
+                writer.add_scalar('correction/n_error', _corr_stats['n_error'], epoch)
+                writer.add_scalar('correction/fallback_count', _corr_stats['n_fallback'], epoch)
+                _total = _corr_stats['n_triggered'] or 1
+                writer.add_scalar('correction/success_rate', _corr_stats['n_success'] / _total, epoch)
+                _succ = _corr_stats['n_success'] or 1
+                writer.add_scalar('correction/fallback_rate', _corr_stats['n_fallback'] / _succ, epoch)
+                print(f'  [Correction] triggered={_corr_stats["n_triggered"]} '
+                      f'success={_corr_stats["n_success"]} '
+                      f'skipped={_corr_stats["n_skipped"]} '
+                      f'error={_corr_stats["n_error"]} '
+                      f'fallback={_corr_stats["n_fallback"]} '
+                      f'rate={_corr_stats["n_success"]/_total:.2%}')
+                # reset per-epoch
+                _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
+                               'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
+                               'n_fallback': 0}
+
+        if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
+            ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            torch.save(unwrapped_policy.state_dict(), ckpt_path)
+
+    if accelerator.is_main_process:
+        if writer is not None:
+            writer.close()
+
+        ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
+        unwrapped_policy = accelerator.unwrap_model(policy)
+        torch.save(unwrapped_policy.state_dict(), ckpt_path)
+
+    print(f"Training finished: Seed {seed}")

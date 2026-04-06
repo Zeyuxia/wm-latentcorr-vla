@@ -3,7 +3,7 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader, ConcatDataset, WeightedRandomSampler
-from phase_utils import infer_phase_key_from_gt_window
+from imitate_episodes_pkg.utils import infer_phase_key_from_gt_window
 
 import IPython
 
@@ -17,7 +17,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                  sample_skip_head_ratio=None,
                  sample_pregrasp_bias_enable=False,
                  sample_pregrasp_prob=0.0,
-                 sample_pregrasp_phase_window_len=16,
+                 sample_phase_window_len=16,
                  sample_pregrasp_keep_start_ratio=0.0,
                  sample_pregrasp_keep_end_ratio=0.5,
                  sample_pregrasp_close_offset_steps=None):
@@ -34,7 +34,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             self.sample_skip_head_ratio = float(np.clip(self.sample_skip_head_ratio, 0.0, 0.99))
         self.sample_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
         self.sample_pregrasp_prob = float(np.clip(sample_pregrasp_prob, 0.0, 1.0))
-        self.sample_pregrasp_phase_window_len = max(1, int(sample_pregrasp_phase_window_len))
+        self.sample_phase_window_len = max(1, int(sample_phase_window_len))
         self.sample_pregrasp_keep_start_ratio = float(np.clip(sample_pregrasp_keep_start_ratio, 0.0, 1.0))
         self.sample_pregrasp_keep_end_ratio = float(np.clip(sample_pregrasp_keep_end_ratio, 0.0, 1.0))
         if self.sample_pregrasp_keep_end_ratio < self.sample_pregrasp_keep_start_ratio:
@@ -76,7 +76,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     ph = infer_phase_key_from_gt_window(
                         lg[ts:],
                         rg[ts:],
-                        self.sample_pregrasp_phase_window_len,
+                        self.sample_phase_window_len,
                     )
                     if ph != "approach":
                         first_non_approach = ts
@@ -117,7 +117,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 ph = infer_phase_key_from_gt_window(
                     lg[ts:],
                     rg[ts:],
-                    self.sample_pregrasp_phase_window_len,
+                    self.sample_phase_window_len,
                 )
                 if ph == "pregrasp":
                     candidates.append(int(ts))
@@ -381,7 +381,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               raw_data_dir=None, start_margin=0, sample_skip_head_ratio=None,
               sample_pregrasp_bias_enable=False,
               sample_pregrasp_prob=0.0,
-              sample_pregrasp_phase_window_len=16,
+              sample_phase_window_len=16,
               sample_pregrasp_keep_start_ratio=0.0,
               sample_pregrasp_keep_end_ratio=0.5,
               sample_pregrasp_close_offset_steps=None,
@@ -468,7 +468,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                         sample_skip_head_ratio=sample_skip_head_ratio,
                                         sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
                                         sample_pregrasp_prob=sample_pregrasp_prob,
-                                        sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
+                                        sample_phase_window_len=sample_phase_window_len,
                                         sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
                                         sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
                                         sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
@@ -501,7 +501,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                              sample_skip_head_ratio=sample_skip_head_ratio,
                              sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
                              sample_pregrasp_prob=sample_pregrasp_prob,
-                             sample_pregrasp_phase_window_len=sample_pregrasp_phase_window_len,
+                             sample_phase_window_len=sample_phase_window_len,
                              sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
                              sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
                              sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
