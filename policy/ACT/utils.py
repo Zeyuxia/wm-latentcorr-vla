@@ -1,13 +1,24 @@
 import numpy as np
 import torch
 import os
+import json
 import h5py
 from torch.utils.data import TensorDataset, DataLoader, ConcatDataset, WeightedRandomSampler
-from imitate_episodes_pkg.utils import infer_phase_key_from_gt_window, phase_key_to_id
+from imitate_episodes_pkg.utils import (
+    infer_phase_key_from_gt_window,
+    phase_key_to_id,
+    phase_id_to_key,
+    error_mode_key_to_id,
+    active_arm_pattern_key_to_id,
+    normalize_error_mode_dir_mag_bins,
+    get_failure_param_bins,
+)
 
 import IPython
 
 e = IPython.embed
+
+_FAILURE_ERROR_MODES = ("translation", "rotation", "gripper_close")
 
 
 class EpisodicDataset(torch.utils.data.Dataset):
@@ -20,7 +31,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
                  sample_phase_window_len=16,
                  sample_pregrasp_keep_start_ratio=0.0,
                  sample_pregrasp_keep_end_ratio=0.5,
-                 sample_pregrasp_close_offset_steps=None):
+                 sample_pregrasp_close_offset_steps=None,
+                 failure_mode="off",
+                 failure_table_path="",
+                 failure_phase_bins=5):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -44,17 +58,284 @@ class EpisodicDataset(torch.utils.data.Dataset):
             s = int(sample_pregrasp_close_offset_steps)
             if s > 0:
                 self.sample_pregrasp_close_offset_steps = s
+        self.failure_mode = str(failure_mode).strip().lower()
+        if self.failure_mode not in {"off", "explore", "train"}:
+            raise ValueError(f"Invalid failure_mode={failure_mode!r}, expected off|explore|train")
+        self.failure_table_path = str(failure_table_path).strip()
+        self.failure_phase_bins = int(max(1, int(failure_phase_bins)))
         self._pregrasp_start_cache = {}
+        self._phase_scan_cache = {}
         self._first_stage_len_cache = {}
+        self._failure_entries = []
+        self._failure_rr_idx = 0
+        self._explore_units = []
         self._strict_pregrasp_calls = 0
         self._strict_pregrasp_skipped_total = 0
         self._strict_pregrasp_skipped_max = 0
         self._strict_pregrasp_log_every = 100
+        self._init_failure_units()
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
         return len(self.episode_ids)
+
+    def _init_failure_units(self):
+        if self.failure_mode == "off":
+            return
+        if self.failure_mode == "explore":
+            units = []
+            bin_cfg = get_failure_param_bins()
+            trans_dir_bins = int(max(1, bin_cfg["translation_dir_bins"]))
+            trans_mag_bins = int(max(1, bin_cfg["translation_mag_bins"]))
+            rot_dir_bins = int(max(1, bin_cfg["rotation_dir_bins"]))
+            rot_mag_bins = int(max(1, bin_cfg["rotation_mag_bins"]))
+            for phase_id in range(4):
+                phase_key = phase_id_to_key(phase_id)
+                for bin_id in range(self.failure_phase_bins):
+                    for mode in _FAILURE_ERROR_MODES:
+                        if mode == "translation":
+                            for dir_bin_id in range(trans_dir_bins):
+                                for mag_bin_id in range(trans_mag_bins):
+                                    units.append(
+                                        {
+                                            "phase_key": phase_key,
+                                            "phase_instance_idx": None,
+                                            "phase_bin_id": int(bin_id),
+                                            "error_mode": mode,
+                                            "active_arm_pattern": None,
+                                            "dir_bin_id": int(dir_bin_id),
+                                            "mag_bin_id": int(mag_bin_id),
+                                            "weight": 1.0,
+                                        }
+                                    )
+                        elif mode == "rotation":
+                            for dir_bin_id in range(rot_dir_bins):
+                                for mag_bin_id in range(rot_mag_bins):
+                                    units.append(
+                                        {
+                                            "phase_key": phase_key,
+                                            "phase_instance_idx": None,
+                                            "phase_bin_id": int(bin_id),
+                                            "error_mode": mode,
+                                            "active_arm_pattern": None,
+                                            "dir_bin_id": int(dir_bin_id),
+                                            "mag_bin_id": int(mag_bin_id),
+                                            "weight": 1.0,
+                                        }
+                                    )
+                        else:
+                            units.append(
+                                {
+                                    "phase_key": phase_key,
+                                    "phase_instance_idx": None,
+                                    "phase_bin_id": int(bin_id),
+                                    "error_mode": mode,
+                                    "active_arm_pattern": None,
+                                    "dir_bin_id": -1,
+                                    "mag_bin_id": -1,
+                                    "weight": 1.0,
+                                }
+                            )
+            self._explore_units = units
+            return
+        if self.failure_mode == "train":
+            if not self.failure_table_path:
+                raise ValueError("failure_mode=train requires failure_table_path")
+            with open(self.failure_table_path, "r") as f:
+                table = json.load(f)
+            entries = table.get("entries", [])
+            if not isinstance(entries, list) or len(entries) == 0:
+                raise ValueError(f"failure_table has no entries: {self.failure_table_path}")
+            parsed = []
+            for it in entries:
+                try:
+                    mode = str(it["error_mode"]).strip().lower()
+                    if mode not in _FAILURE_ERROR_MODES:
+                        continue
+                    phase_key = str(it["phase_key"]).strip().lower()
+                    phase_key_to_id(phase_key)
+                    if "phase_instance_idx" not in it:
+                        continue
+                    phase_instance_idx = int(it["phase_instance_idx"])
+                    if phase_instance_idx < 1:
+                        continue
+                    bin_id = int(np.clip(int(it["phase_bin_id"]), 0, self.failure_phase_bins - 1))
+                    if "active_arm_pattern" not in it:
+                        continue
+                    active_pattern = str(it["active_arm_pattern"]).strip().lower()
+                    if active_pattern not in {"left_only", "right_only", "both"}:
+                        continue
+                    weight = float(it.get("weight", it.get("fail_rate", 1.0)))
+                    if not np.isfinite(weight) or weight <= 0.0:
+                        weight = 1.0
+                    if mode in {"translation", "rotation"}:
+                        if ("dir_bin_id" not in it) or ("mag_bin_id" not in it):
+                            continue
+                    dir_bin_id, mag_bin_id = normalize_error_mode_dir_mag_bins(
+                        mode,
+                        int(it.get("dir_bin_id", -1)),
+                        int(it.get("mag_bin_id", -1)),
+                    )
+                    parsed.append(
+                        {
+                            "phase_key": phase_key,
+                            "phase_instance_idx": int(phase_instance_idx),
+                            "phase_bin_id": int(bin_id),
+                            "error_mode": mode,
+                            "active_arm_pattern": active_pattern,
+                            "dir_bin_id": int(dir_bin_id),
+                            "mag_bin_id": int(mag_bin_id),
+                            "weight": float(weight),
+                        }
+                    )
+                except Exception:
+                    continue
+            if len(parsed) == 0:
+                raise ValueError(f"No valid entries in failure_table: {self.failure_table_path}")
+            self._failure_entries = parsed
+
+    def _infer_active_arm_pattern_from_action_window(self, action, ts, joint_delta_thresh=0.02):
+        a = np.asarray(action, dtype=np.float32)
+        if a.ndim != 2 or a.shape[0] <= 1 or a.shape[1] < 14:
+            return "both"
+        s = int(np.clip(int(ts), 0, a.shape[0] - 1))
+        e = int(np.clip(s + max(2, int(self.sample_phase_window_len)), s + 1, a.shape[0]))
+        seg = a[s:e]
+        if seg.shape[0] <= 1:
+            return "both"
+        dleft = np.diff(seg[:, 0:6], axis=0)
+        dright = np.diff(seg[:, 7:13], axis=0)
+        left_score = float(np.max(np.linalg.norm(dleft, axis=1))) if dleft.shape[0] > 0 else 0.0
+        right_score = float(np.max(np.linalg.norm(dright, axis=1))) if dright.shape[0] > 0 else 0.0
+        left_on = bool(left_score >= float(joint_delta_thresh))
+        right_on = bool(right_score >= float(joint_delta_thresh))
+        if left_on and right_on:
+            return "both"
+        if left_on:
+            return "left_only"
+        if right_on:
+            return "right_only"
+        return "both"
+
+    def _scan_phase_bins(self, episode_id, min_start, max_start):
+        key = (int(episode_id), int(min_start), int(max_start), int(self.failure_phase_bins))
+        if key in self._phase_scan_cache:
+            return self._phase_scan_cache[key]
+        info = {}
+        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
+        with h5py.File(dataset_path, "r") as root:
+            action = root["/action"][()]
+        lg = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
+        rg = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
+        ts_list = list(range(int(min_start), int(max_start) + 1))
+        phase_list = []
+        for ts in ts_list:
+            phase_list.append(
+                infer_phase_key_from_gt_window(
+                    lg[ts:],
+                    rg[ts:],
+                    self.sample_phase_window_len,
+                )
+            )
+        i = 0
+        n = len(ts_list)
+        phase_instance_cnt = {}
+        while i < n:
+            j = i
+            phase_key = str(phase_list[i]).strip().lower()
+            while j + 1 < n and str(phase_list[j + 1]).strip().lower() == phase_key:
+                j += 1
+            seg = ts_list[i:j + 1]
+            seg_len = len(seg)
+            phase_instance_cnt[phase_key] = int(phase_instance_cnt.get(phase_key, 0)) + 1
+            phase_instance_idx = int(phase_instance_cnt[phase_key])
+            for k, ts in enumerate(seg):
+                if seg_len <= 1:
+                    bin_id = 0
+                else:
+                    progress = float(k) / float(seg_len - 1)
+                    bin_id = int(np.floor(progress * float(self.failure_phase_bins)))
+                    bin_id = int(np.clip(bin_id, 0, self.failure_phase_bins - 1))
+                active_pattern = self._infer_active_arm_pattern_from_action_window(action, ts)
+                info[int(ts)] = {
+                    "phase_key": phase_key,
+                    "phase_instance_idx": int(phase_instance_idx),
+                    "phase_bin_id": int(bin_id),
+                    "seg_start": int(seg[0]),
+                    "seg_end": int(seg[-1]),
+                    "active_arm_pattern": active_pattern,
+                }
+            i = j + 1
+        self._phase_scan_cache[key] = info
+        return info
+
+    def _select_failure_unit(self):
+        if self.failure_mode == "explore":
+            if len(self._explore_units) == 0:
+                raise RuntimeError("explore mode has no units")
+            unit = self._explore_units[self._failure_rr_idx % len(self._explore_units)]
+            self._failure_rr_idx += 1
+            return dict(unit)
+        if self.failure_mode == "train":
+            if len(self._failure_entries) == 0:
+                raise RuntimeError("train mode has empty failure entries")
+            w = np.asarray([float(x.get("weight", 1.0)) for x in self._failure_entries], dtype=np.float64)
+            if not np.all(np.isfinite(w)) or float(np.sum(w)) <= 1e-12:
+                w = np.ones(len(self._failure_entries), dtype=np.float64)
+            w = w / np.sum(w)
+            idx = int(np.random.choice(len(self._failure_entries), p=w))
+            return dict(self._failure_entries[idx])
+        return None
+
+    def _sample_start_ts_from_failure_unit(self, base_index):
+        unit = self._select_failure_unit()
+        if unit is None:
+            return None
+        n_ep = len(self.episode_ids)
+        for ofs in range(n_ep):
+            ep = int(self.episode_ids[(int(base_index) + ofs) % n_ep])
+            dataset_path = os.path.join(self.dataset_dir, f"episode_{ep}.hdf5")
+            with h5py.File(dataset_path, "r") as root:
+                ep_len = int(root["/action"].shape[0])
+            max_start = max(0, ep_len - 1 - self.start_margin)
+            min_start = self._resolve_min_start(ep, max_start)
+            scan = self._scan_phase_bins(ep, min_start, max_start)
+            cand = []
+            for ts, m in scan.items():
+                if str(m["phase_key"]) != str(unit["phase_key"]):
+                    continue
+                target_phase_inst = unit.get("phase_instance_idx", None)
+                if target_phase_inst is not None:
+                    if int(m.get("phase_instance_idx", -1)) != int(target_phase_inst):
+                        continue
+                if int(m["phase_bin_id"]) != int(unit["phase_bin_id"]):
+                    continue
+                target_pat = unit.get("active_arm_pattern", None)
+                if target_pat is not None and str(m["active_arm_pattern"]) != str(target_pat):
+                    continue
+                cand.append(int(ts))
+            if len(cand) == 0:
+                continue
+            ts = int(np.random.choice(cand))
+            meta = scan.get(ts, {})
+            return {
+                "episode_id": int(ep),
+                "start_ts": int(ts),
+                "seg_start": int(meta.get("seg_start", -1)),
+                "seg_end": int(meta.get("seg_end", -1)),
+                "phase_key": str(meta.get("phase_key", unit["phase_key"])),
+                "phase_instance_idx": int(meta.get("phase_instance_idx", -1)),
+                "phase_bin_id": int(meta.get("phase_bin_id", unit["phase_bin_id"])),
+                "active_arm_pattern": str(meta.get("active_arm_pattern", "both")),
+                "error_mode": str(unit["error_mode"]),
+                "dir_bin_id": int(unit.get("dir_bin_id", -1)),
+                "mag_bin_id": int(unit.get("mag_bin_id", -1)),
+            }
+        raise RuntimeError(
+            "Failed to sample start_ts for failure unit: "
+            f"{unit} (dataset={self.dataset_dir})"
+        )
 
     def _get_first_stage_len(self, episode_id, max_start):
         key = (int(episode_id), int(max_start))
@@ -192,6 +473,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
         sample_full_episode = False
 
         episode_id = self.episode_ids[index]
+        sampled_phase_bin_id = -1
+        sampled_phase_instance_idx = -1
+        forced_error_mode_key = None
+        sampled_active_arm_pattern = "both"
+        forced_dir_bin_id = -1
+        forced_mag_bin_id = -1
         sample_pregrasp = False
         if self.sample_pregrasp_bias_enable and self.sample_pregrasp_prob > 0.0:
             sample_pregrasp = (np.random.rand() < self.sample_pregrasp_prob)
@@ -201,7 +488,18 @@ class EpisodicDataset(torch.utils.data.Dataset):
         # do not fall back to random start_ts; resample across episodes instead.
         forced_start_ts = None
         forced_cand = None
-        if (not sample_full_episode) and strict_pregrasp:
+        failure_sampled = None
+        if (not sample_full_episode) and self.failure_mode in {"explore", "train"}:
+            failure_sampled = self._sample_start_ts_from_failure_unit(index)
+            episode_id = int(failure_sampled["episode_id"])
+            forced_start_ts = int(failure_sampled["start_ts"])
+            forced_error_mode_key = str(failure_sampled["error_mode"])
+            sampled_phase_bin_id = int(failure_sampled["phase_bin_id"])
+            sampled_phase_instance_idx = int(failure_sampled.get("phase_instance_idx", -1))
+            sampled_active_arm_pattern = str(failure_sampled.get("active_arm_pattern", "both"))
+            forced_dir_bin_id = int(failure_sampled.get("dir_bin_id", -1))
+            forced_mag_bin_id = int(failure_sampled.get("mag_bin_id", -1))
+        if (not sample_full_episode) and strict_pregrasp and (failure_sampled is None):
             n_ep = len(self.episode_ids)
             found = False
             skipped_before_found = 0
@@ -253,10 +551,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 min_start = self._resolve_min_start(episode_id, max_start)
                 if forced_start_ts is not None:
                     start_ts = int(np.clip(forced_start_ts, min_start, max_start))
-                    cand_full = self._get_pregrasp_start_candidates(
-                        episode_id, min_start, max_start, apply_keep_ratio=False
-                    )
-                    pregrasp_seg_start, pregrasp_seg_end = self._find_candidate_segment_bounds(cand_full, start_ts)
+                    if failure_sampled is not None:
+                        pregrasp_seg_start = int(failure_sampled.get("seg_start", -1))
+                        pregrasp_seg_end = int(failure_sampled.get("seg_end", -1))
+                    else:
+                        cand_full = self._get_pregrasp_start_candidates(
+                            episode_id, min_start, max_start, apply_keep_ratio=False
+                        )
+                        pregrasp_seg_start, pregrasp_seg_end = self._find_candidate_segment_bounds(cand_full, start_ts)
                 else:
                     start_ts = np.random.randint(min_start, max_start + 1)
                     pregrasp_seg_start = -1
@@ -275,6 +577,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
             for cam_name in self.camera_names:
                 image_dict[cam_name] = root[f"/observations/images/{cam_name}"][start_ts]
             # Keep action and qpos on the same timestamp origin.
+            action_full = None
+            if self.failure_mode in {"explore", "train"}:
+                action_full = root["/action"][()]
             action = root["/action"][start_ts:]
             action_len = episode_len - start_ts
 
@@ -284,6 +589,20 @@ class EpisodicDataset(torch.utils.data.Dataset):
             self.sample_phase_window_len,
         )
         sampled_phase_id = phase_key_to_id(sampled_phase)
+        if sampled_phase_bin_id < 0:
+            if episode_len <= 1:
+                sampled_phase_bin_id = 0
+            else:
+                progress = float(start_ts) / float(max(1, episode_len - 1))
+                sampled_phase_bin_id = int(np.floor(progress * float(self.failure_phase_bins)))
+                sampled_phase_bin_id = int(np.clip(sampled_phase_bin_id, 0, self.failure_phase_bins - 1))
+        if sampled_phase_instance_idx < 0:
+            sampled_phase_instance_idx = 1
+        if self.failure_mode in {"explore", "train"}:
+            sampled_active_arm_pattern = self._infer_active_arm_pattern_from_action_window(
+                action_full,
+                int(start_ts),
+            )
 
         self.is_sim = is_sim
 
@@ -313,6 +632,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
         if self.raw_data_dir is not None:
+            if forced_error_mode_key is None:
+                forced_error_mode_id = -1
+            else:
+                forced_error_mode_id = error_mode_key_to_id(forced_error_mode_key)
+            sampled_active_arm_pattern_id = active_arm_pattern_key_to_id(sampled_active_arm_pattern)
             return (
                 image_data,
                 qpos_data,
@@ -323,6 +647,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 torch.tensor(sampled_phase_id),
                 torch.tensor(pregrasp_seg_start),
                 torch.tensor(pregrasp_seg_end),
+                torch.tensor(sampled_phase_bin_id),
+                torch.tensor(sampled_phase_instance_idx),
+                torch.tensor(forced_error_mode_id),
+                torch.tensor(sampled_active_arm_pattern_id),
+                torch.tensor(forced_dir_bin_id),
+                torch.tensor(forced_mag_bin_id),
             )
 
         return image_data, qpos_data, action_data, is_pad
@@ -393,6 +723,9 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
               sample_pregrasp_keep_start_ratio=0.0,
               sample_pregrasp_keep_end_ratio=0.5,
               sample_pregrasp_close_offset_steps=None,
+              failure_mode="off",
+              failure_table_path="",
+              failure_phase_bins=5,
               dataset_dirs=None,
               num_episodes_list=None,
               task_weights=None):
@@ -479,7 +812,10 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                         sample_phase_window_len=sample_phase_window_len,
                                         sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
                                         sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-                                        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
+                                        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+                                        failure_mode=failure_mode,
+                                        failure_table_path=failure_table_path,
+                                        failure_phase_bins=failure_phase_bins)
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=batch_size_train,
@@ -512,7 +848,10 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                              sample_phase_window_len=sample_phase_window_len,
                              sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
                              sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-                             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps)
+                             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+                             failure_mode=failure_mode,
+                             failure_table_path=failure_table_path,
+                             failure_phase_bins=failure_phase_bins)
         sub_datasets.append(ds)
 
     train_dataset = ConcatDataset(sub_datasets)

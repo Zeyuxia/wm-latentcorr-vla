@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import pickle
+import json
 
 import numpy as np
 import torch
@@ -22,7 +23,13 @@ from imitate_episodes_pkg.correction import (
     correction_step,
     load_raw_data,
 )
-from imitate_episodes_pkg.utils import build_evac_infer_kwargs
+from imitate_episodes_pkg.utils import (
+    build_evac_infer_kwargs,
+    phase_id_to_key,
+    error_mode_id_to_key,
+    active_arm_pattern_id_to_key,
+    set_failure_param_bins,
+)
 
 def main(args):
     set_seed(int(args["seed"]))
@@ -144,6 +151,23 @@ def main(args):
     sample_phase_window_len = int(args['sample_phase_window_len'])
     sample_pregrasp_keep_start_ratio = float(args['sample_pregrasp_keep_start_ratio'])
     sample_pregrasp_keep_end_ratio = float(args['sample_pregrasp_keep_end_ratio'])
+    failure_mode = str(args.get('failure_mode', 'off')).strip().lower()
+    if failure_mode not in {'off', 'explore', 'train'}:
+        raise ValueError(f"Invalid failure_mode={failure_mode!r}, expected off|explore|train")
+    failure_table_path = str(args.get('failure_table_path', '')).strip()
+    failure_phase_bins = int(max(1, int(args.get('failure_phase_bins', 5))))
+    failure_translation_dir_bins = int(max(1, int(args.get('failure_translation_dir_bins', 5))))
+    failure_translation_mag_bins = int(max(1, int(args.get('failure_translation_mag_bins', 3))))
+    failure_rotation_dir_bins = int(max(1, int(args.get('failure_rotation_dir_bins', 6))))
+    failure_rotation_mag_bins = int(max(1, int(args.get('failure_rotation_mag_bins', 3))))
+    failure_corr_batch_ratio = float(max(0.0, args.get('failure_corr_batch_ratio', 0.5)))
+    failure_param_cfg = set_failure_param_bins(
+        translation_dir_bins=failure_translation_dir_bins,
+        translation_mag_bins=failure_translation_mag_bins,
+        rotation_dir_bins=failure_rotation_dir_bins,
+        rotation_mag_bins=failure_rotation_mag_bins,
+    )
+    print(f"[main][rank={_rank}] failure_param_bins={failure_param_cfg}")
     wm_corr_pregrasp_extra_enable = bool(args['wm_corr_pregrasp_extra_enable'])
     wm_corr_pregrasp_extra_ratio = float(np.clip(args['wm_corr_pregrasp_extra_ratio'], 0.0, 1.0))
     sample_pregrasp_close_offset_steps = None
@@ -160,6 +184,8 @@ def main(args):
         wm_corr_pregrasp_extra_enable = False
         wm_corr_pregrasp_extra_ratio = 0.0
         sample_pregrasp_close_offset_steps = None
+        if failure_mode in {'explore', 'train'}:
+            raise ValueError("failure_mode requires --enable_wm_correction")
     if enable_wm:
         if use_multi_task:
             raise ValueError("enable_wm_correction currently does not support multi-task training")
@@ -178,6 +204,7 @@ def main(args):
     raw_data_dir = args['raw_data_dir'] if enable_wm else None
     print(f"[main][rank={_rank}] before load_data | dataset_dir={dataset_dir} | num_episodes={num_episodes} | start_margin={start_margin}")
     _t_load = time.time()
+    use_failure_corr_loader = bool(enable_wm and failure_mode in {'explore', 'train'})
     use_extra_pregrasp_corr = bool(enable_wm and wm_corr_pregrasp_extra_enable and wm_corr_pregrasp_extra_ratio > 0.0)
     base_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
     base_pregrasp_prob = float(sample_pregrasp_prob)
@@ -202,12 +229,46 @@ def main(args):
         sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
         sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
         sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+        failure_mode='off',
+        failure_table_path='',
+        failure_phase_bins=failure_phase_bins,
         dataset_dirs=dataset_dirs,
         num_episodes_list=num_episodes_list,
         task_weights=multi_task_weights,
     )
     corr_train_dataloader = None
-    if use_extra_pregrasp_corr:
+    if use_failure_corr_loader:
+        if failure_mode == 'explore':
+            corr_batch_size = int(max(1, int(batch_size_train)))
+        else:
+            corr_batch_size = int(max(1, round(float(batch_size_train) * float(failure_corr_batch_ratio))))
+        corr_train_dataloader, _, _, _, _ = load_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            corr_batch_size,
+            corr_batch_size,
+            raw_data_dir=raw_data_dir,
+            start_margin=start_margin,
+            sample_skip_head_ratio=sample_skip_head_ratio,
+            sample_pregrasp_bias_enable=False,
+            sample_pregrasp_prob=0.0,
+            sample_phase_window_len=sample_phase_window_len,
+            sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
+            sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
+            sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+            failure_mode=failure_mode,
+            failure_table_path=failure_table_path,
+            failure_phase_bins=failure_phase_bins,
+            dataset_dirs=dataset_dirs,
+            num_episodes_list=num_episodes_list,
+            task_weights=multi_task_weights,
+        )
+        print(
+            f"[main][rank={_rank}] failure-mode correction dataloader enabled | "
+            f"mode={failure_mode} | corr_batch_size={corr_batch_size}"
+        )
+    elif use_extra_pregrasp_corr:
         corr_batch_size = int(max(1, round(float(batch_size_train) * float(wm_corr_pregrasp_extra_ratio))))
         corr_train_dataloader, _, _, _, _ = load_data(
             dataset_dir,
@@ -224,6 +285,9 @@ def main(args):
             sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
             sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
+            failure_mode='off',
+            failure_table_path='',
+            failure_phase_bins=failure_phase_bins,
             dataset_dirs=dataset_dirs,
             num_episodes_list=num_episodes_list,
             task_weights=multi_task_weights,
@@ -239,6 +303,16 @@ def main(args):
         pickle.dump(stats, f)
 
     config['enable_wm_correction'] = enable_wm
+    config['failure_mode'] = failure_mode
+    config['failure_phase_bins'] = failure_phase_bins
+    config['failure_translation_dir_bins'] = failure_translation_dir_bins
+    config['failure_translation_mag_bins'] = failure_translation_mag_bins
+    config['failure_rotation_dir_bins'] = failure_rotation_dir_bins
+    config['failure_rotation_mag_bins'] = failure_rotation_mag_bins
+    config['failure_table_path'] = failure_table_path
+    config['failure_table_dir'] = str(args.get('failure_table_dir', '')).strip()
+    config['failure_explore_k'] = int(max(1, int(args.get('failure_explore_k', 3))))
+    config['failure_fail_recover_rate_thresh'] = float(args.get('failure_fail_recover_rate_thresh', 0.5))
     if enable_wm:
         config['wm_args'] = args
         config['raw_data_dir'] = raw_data_dir
@@ -273,14 +347,15 @@ def main(args):
             'perturb_open_laptop_pregrasp_rotation_prob': args['perturb_open_laptop_pregrasp_rotation_prob'],
             'perturb_eef_fail_gain': args['perturb_eef_fail_gain'],
             'perturb_rot_max_deg': args['perturb_rot_max_deg'],
-            'perturb_mag_random': args['perturb_mag_random'],
-            'perturb_mag_rand_min': args['perturb_mag_rand_min'],
-            'perturb_mag_rand_max': args['perturb_mag_rand_max'],
             'perturb_active_joint_delta_thresh': args['perturb_active_joint_delta_thresh'],
             'perturb_active_gripper_delta_thresh': args['perturb_active_gripper_delta_thresh'],
+            'failure_mode': failure_mode,
             'export_correction_dataset': args['export_correction_dataset'],
             'export_correction_dir': args['export_correction_dir'],
         }
+        if failure_mode == 'explore':
+            config['correction_cfg']['recover_eval_enable'] = True
+            config['correction_cfg']['recover_eval_use_for_trigger'] = False
     config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
     config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
@@ -362,6 +437,13 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     policy_class = config["policy_class"]
     policy_config = config["policy_config"]
     enable_wm = bool(config["enable_wm_correction"])
+    failure_mode = str(config.get("failure_mode", "off")).strip().lower()
+    failure_explore_mode = bool(failure_mode == "explore")
+    failure_explore_k = int(max(1, int(config.get("failure_explore_k", 3))))
+    failure_fail_thresh = float(config.get("failure_fail_recover_rate_thresh", 0.5))
+    failure_table_dir = str(config.get("failure_table_dir", "")).strip()
+    if failure_table_dir == "":
+        failure_table_dir = os.path.join(ckpt_dir, "failure_explore")
 
     # Accelerate: prepare model, optimizer, dataloader
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -409,6 +491,8 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
                    'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
                    'n_fallback': 0}
+    _failure_trials = []
+    _failure_stats = {}
     if enable_wm:
         print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
         _t_init_corr = time.time()
@@ -435,6 +519,8 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         tb_log_dir = os.path.join(ckpt_dir, 'tb_logs')
         writer = SummaryWriter(log_dir=tb_log_dir)
         print(f'TensorBoard log dir: {tb_log_dir}')
+        if failure_explore_mode:
+            os.makedirs(failure_table_dir, exist_ok=True)
     global_step = 0
 
     for epoch in tqdm(range(num_epochs), disable=not accelerator.is_main_process):
@@ -483,6 +569,24 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             sampled_phase_id=corr_source[6][bi].item(),
                             pregrasp_seg_start=corr_source[7][bi].item(),
                             pregrasp_seg_end=corr_source[8][bi].item(),
+                            sampled_phase_bin_id=(
+                                None if len(corr_source) <= 9 else corr_source[9][bi].item()
+                            ),
+                            sampled_phase_instance_id=(
+                                None if len(corr_source) <= 10 else corr_source[10][bi].item()
+                            ),
+                            forced_error_mode_id=(
+                                None if len(corr_source) <= 11 else corr_source[11][bi].item()
+                            ),
+                            sampled_active_arm_pattern_id=(
+                                None if len(corr_source) <= 12 else corr_source[12][bi].item()
+                            ),
+                            forced_dir_bin_id=(
+                                None if len(corr_source) <= 13 else corr_source[13][bi].item()
+                            ),
+                            forced_mag_bin_id=(
+                                None if len(corr_source) <= 14 else corr_source[14][bi].item()
+                            ),
                         )
                         _corr_stats['n_triggered'] += 1
                         if corr is not None:
@@ -500,6 +604,54 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             if isinstance(cmeta, dict):
                                 if bool(cmeta.get('closed_loop_fallback_used', False)):
                                     _corr_stats['n_fallback'] += 1
+                                if failure_explore_mode:
+                                    phase_key = phase_id_to_key(int(corr_source[6][bi].item()))
+                                    phase_bin_id = int(corr_source[9][bi].item()) if len(corr_source) > 9 else -1
+                                    phase_instance_idx = int(corr_source[10][bi].item()) if len(corr_source) > 10 else -1
+                                    forced_mode_id = int(corr_source[11][bi].item()) if len(corr_source) > 11 else -1
+                                    active_pattern_id = int(corr_source[12][bi].item()) if len(corr_source) > 12 else -1
+                                    dir_bin_id = int(corr_source[13][bi].item()) if len(corr_source) > 13 else -1
+                                    mag_bin_id = int(corr_source[14][bi].item()) if len(corr_source) > 14 else -1
+                                    forced_mode_key = None
+                                    if forced_mode_id >= 0:
+                                        forced_mode_key = error_mode_id_to_key(forced_mode_id)
+                                    active_pattern_key = "both"
+                                    if active_pattern_id >= 0:
+                                        active_pattern_key = active_arm_pattern_id_to_key(active_pattern_id)
+                                    recover_eval_last = cmeta.get("recover_eval_last", {})
+                                    recoverable = bool(recover_eval_last.get("recoverable", False))
+                                    trial = {
+                                        "epoch": int(epoch),
+                                        "global_step": int(global_step),
+                                        "episode_id": int(ep_id),
+                                        "start_ts": int(corr_source[5][bi].item()),
+                                        "phase_key": str(phase_key),
+                                        "phase_instance_idx": int(phase_instance_idx),
+                                        "phase_bin_id": int(phase_bin_id),
+                                        "error_mode": str(forced_mode_key or cmeta.get("sampled_error_mode")),
+                                        "active_arm_pattern": str(active_pattern_key),
+                                        "dir_bin_id": int(dir_bin_id),
+                                        "mag_bin_id": int(mag_bin_id),
+                                        "recoverable": bool(recoverable),
+                                        "recover_eval_mode": recover_eval_last.get("mode"),
+                                        "recover_eval_metric_name": recover_eval_last.get("metric_name"),
+                                        "recover_eval_metric": recover_eval_last.get("metric"),
+                                        "recover_eval_threshold": recover_eval_last.get("threshold"),
+                                    }
+                                    _failure_trials.append(trial)
+                                    key = (
+                                        str(trial["phase_key"]),
+                                        int(trial["phase_instance_idx"]),
+                                        int(trial["phase_bin_id"]),
+                                        str(trial["error_mode"]),
+                                        str(trial["active_arm_pattern"]),
+                                        int(trial["dir_bin_id"]),
+                                        int(trial["mag_bin_id"]),
+                                    )
+                                    if key not in _failure_stats:
+                                        _failure_stats[key] = {"n": 0, "n_recover": 0}
+                                    _failure_stats[key]["n"] += 1
+                                    _failure_stats[key]["n_recover"] += int(recoverable)
                             if enable_wm and export_corr and accelerator.is_main_process:
                                 _export_correction_sample_as_episode(
                                     export_corr_dir,
@@ -520,6 +672,10 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             corr_actions.append(corr_source[2][bi].to(accelerator.device))
                             corr_pads.append(corr_source[3][bi].to(accelerator.device))
                             corr_mask.append(0.0)
+
+                    if failure_explore_mode:
+                        global_step += 1
+                        continue
 
                     # Build a fixed-size mixed batch: [base bs] + [correction bs].
                     ci_b = torch.stack(corr_images, dim=0)
@@ -615,6 +771,10 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                     forward_dict = forward_pass(data, policy)
                     loss = forward_dict["loss"]
 
+            if failure_explore_mode:
+                global_step += 1
+                continue
+
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
@@ -623,7 +783,10 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                 writer.add_scalar('train/loss_step', forward_dict['loss'].item(), global_step)
                 writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
             global_step += 1
-        epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
+        if failure_explore_mode:
+            epoch_summary = {}
+        else:
+            epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
         # TensorBoard: log epoch-level metrics
         if accelerator.is_main_process and writer is not None:
             for k, v in epoch_summary.items():
@@ -649,6 +812,60 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                 _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
                                'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
                                'n_fallback': 0}
+
+        if failure_explore_mode and accelerator.is_main_process:
+            trials_path = os.path.join(failure_table_dir, f'failure_trials_epoch_{epoch + 1:04d}.json')
+            with open(trials_path, 'w') as f:
+                json.dump(_failure_trials, f, indent=2)
+
+            entries = []
+            for key, st in sorted(_failure_stats.items()):
+                phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
+                n = int(st.get("n", 0))
+                if n < failure_explore_k:
+                    continue
+                n_recover = int(st.get("n_recover", 0))
+                recover_rate = float(n_recover) / float(max(1, n))
+                fail_flag = bool(recover_rate <= float(failure_fail_thresh))
+                if not fail_flag:
+                    continue
+                entries.append(
+                    {
+                        "phase_key": str(phase_key),
+                        "phase_instance_idx": int(phase_instance_idx),
+                        "phase_bin_id": int(phase_bin_id),
+                        "error_mode": str(error_mode),
+                        "active_arm_pattern": str(active_arm_pattern),
+                        "dir_bin_id": int(dir_bin_id),
+                        "mag_bin_id": int(mag_bin_id),
+                        "n_trials": int(n),
+                        "n_recover": int(n_recover),
+                        "recover_rate": float(recover_rate),
+                        "fail_rate": float(1.0 - recover_rate),
+                        "weight": float(max(1e-6, 1.0 - recover_rate)),
+                    }
+                )
+
+            table = {
+                "version": 3,
+                "mode": "explore",
+                "epoch": int(epoch + 1),
+                "failure_phase_bins": int(config.get("failure_phase_bins", 5)),
+                "failure_translation_dir_bins": int(config.get("failure_translation_dir_bins", 5)),
+                "failure_translation_mag_bins": int(config.get("failure_translation_mag_bins", 3)),
+                "failure_rotation_dir_bins": int(config.get("failure_rotation_dir_bins", 6)),
+                "failure_rotation_mag_bins": int(config.get("failure_rotation_mag_bins", 3)),
+                "failure_explore_k": int(failure_explore_k),
+                "failure_fail_recover_rate_thresh": float(failure_fail_thresh),
+                "entries": entries,
+            }
+            table_path = os.path.join(failure_table_dir, 'failure_table.json')
+            with open(table_path, 'w') as f:
+                json.dump(table, f, indent=2)
+            print(
+                f"[failure_explore] epoch={epoch + 1} trials={len(_failure_trials)} "
+                f"failure_entries={len(entries)} table={table_path}"
+            )
 
         if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")

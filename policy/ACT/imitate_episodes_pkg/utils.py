@@ -7,6 +7,52 @@ PHASE_KEYS = ("approach", "pregrasp", "transport", "place")
 PHASE_KEY_TO_ID = {k: i for i, k in enumerate(PHASE_KEYS)}
 PHASE_ID_TO_KEY = {i: k for i, k in enumerate(PHASE_KEYS)}
 
+ERROR_MODE_KEYS = ("translation", "rotation", "gripper_close")
+ERROR_MODE_KEY_TO_ID = {k: i for i, k in enumerate(ERROR_MODE_KEYS)}
+ERROR_MODE_ID_TO_KEY = {i: k for i, k in enumerate(ERROR_MODE_KEYS)}
+
+ACTIVE_ARM_PATTERN_KEYS = ("left_only", "right_only", "both")
+ACTIVE_ARM_PATTERN_KEY_TO_ID = {k: i for i, k in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
+ACTIVE_ARM_PATTERN_ID_TO_KEY = {i: k for i, k in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
+
+FAILURE_TRANSLATION_DIR_BINS = 5
+FAILURE_TRANSLATION_MAG_BINS = 3
+FAILURE_ROTATION_DIR_BINS = 6
+FAILURE_ROTATION_MAG_BINS = 3
+
+
+def set_failure_param_bins(
+    translation_dir_bins=None,
+    translation_mag_bins=None,
+    rotation_dir_bins=None,
+    rotation_mag_bins=None,
+):
+    global FAILURE_TRANSLATION_DIR_BINS, FAILURE_TRANSLATION_MAG_BINS
+    global FAILURE_ROTATION_DIR_BINS, FAILURE_ROTATION_MAG_BINS
+    if translation_dir_bins is not None:
+        FAILURE_TRANSLATION_DIR_BINS = int(max(1, int(translation_dir_bins)))
+    if translation_mag_bins is not None:
+        FAILURE_TRANSLATION_MAG_BINS = int(max(1, int(translation_mag_bins)))
+    if rotation_dir_bins is not None:
+        FAILURE_ROTATION_DIR_BINS = int(max(1, int(rotation_dir_bins)))
+    if rotation_mag_bins is not None:
+        FAILURE_ROTATION_MAG_BINS = int(max(1, int(rotation_mag_bins)))
+    return {
+        "translation_dir_bins": int(FAILURE_TRANSLATION_DIR_BINS),
+        "translation_mag_bins": int(FAILURE_TRANSLATION_MAG_BINS),
+        "rotation_dir_bins": int(FAILURE_ROTATION_DIR_BINS),
+        "rotation_mag_bins": int(FAILURE_ROTATION_MAG_BINS),
+    }
+
+
+def get_failure_param_bins():
+    return {
+        "translation_dir_bins": int(FAILURE_TRANSLATION_DIR_BINS),
+        "translation_mag_bins": int(FAILURE_TRANSLATION_MAG_BINS),
+        "rotation_dir_bins": int(FAILURE_ROTATION_DIR_BINS),
+        "rotation_mag_bins": int(FAILURE_ROTATION_MAG_BINS),
+    }
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -113,6 +159,70 @@ def phase_id_to_key(phase_id):
     return str(PHASE_ID_TO_KEY[idx])
 
 
+def error_mode_key_to_id(error_mode_key):
+    key = str(error_mode_key).strip().lower()
+    if key not in ERROR_MODE_KEY_TO_ID:
+        raise ValueError(
+            f"Invalid error_mode_key={error_mode_key!r}. "
+            f"Expected one of {list(ERROR_MODE_KEY_TO_ID.keys())}."
+        )
+    return int(ERROR_MODE_KEY_TO_ID[key])
+
+
+def error_mode_id_to_key(error_mode_id):
+    idx = int(error_mode_id)
+    if idx not in ERROR_MODE_ID_TO_KEY:
+        raise ValueError(
+            f"Invalid error_mode_id={error_mode_id!r}. "
+            f"Expected one of {list(ERROR_MODE_ID_TO_KEY.keys())}."
+        )
+    return str(ERROR_MODE_ID_TO_KEY[idx])
+
+
+def active_arm_pattern_key_to_id(active_arm_pattern_key):
+    key = str(active_arm_pattern_key).strip().lower()
+    if key not in ACTIVE_ARM_PATTERN_KEY_TO_ID:
+        raise ValueError(
+            f"Invalid active_arm_pattern_key={active_arm_pattern_key!r}. "
+            f"Expected one of {list(ACTIVE_ARM_PATTERN_KEY_TO_ID.keys())}."
+        )
+    return int(ACTIVE_ARM_PATTERN_KEY_TO_ID[key])
+
+
+def active_arm_pattern_id_to_key(active_arm_pattern_id):
+    idx = int(active_arm_pattern_id)
+    if idx not in ACTIVE_ARM_PATTERN_ID_TO_KEY:
+        raise ValueError(
+            f"Invalid active_arm_pattern_id={active_arm_pattern_id!r}. "
+            f"Expected one of {list(ACTIVE_ARM_PATTERN_ID_TO_KEY.keys())}."
+        )
+    return str(ACTIVE_ARM_PATTERN_ID_TO_KEY[idx])
+
+
+def error_mode_bin_counts(error_mode_key):
+    mode = str(error_mode_key).strip().lower()
+    if mode == "translation":
+        return int(FAILURE_TRANSLATION_DIR_BINS), int(FAILURE_TRANSLATION_MAG_BINS)
+    if mode == "rotation":
+        return int(FAILURE_ROTATION_DIR_BINS), int(FAILURE_ROTATION_MAG_BINS)
+    if mode == "gripper_close":
+        return 0, 0
+    raise ValueError(
+        f"Invalid error_mode_key={error_mode_key!r}. "
+        f"Expected one of {list(ERROR_MODE_KEY_TO_ID.keys())}."
+    )
+
+
+def normalize_error_mode_dir_mag_bins(error_mode_key, dir_bin_id, mag_bin_id):
+    mode = str(error_mode_key).strip().lower()
+    if mode == "gripper_close":
+        return -1, -1
+    n_dir, n_mag = error_mode_bin_counts(mode)
+    d = int(np.clip(int(dir_bin_id), 0, max(0, n_dir - 1)))
+    m = int(np.clip(int(mag_bin_id), 0, max(0, n_mag - 1)))
+    return d, m
+
+
 def build_parser() -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser()
 
@@ -167,6 +277,28 @@ def build_parser() -> argparse.ArgumentParser:
                             help="If true, use an extra pregrasp-only dataloader for WM correction samples")
         parser.add_argument("--wm_corr_pregrasp_extra_ratio", type=float, default=0.5,
                             help="Extra pregrasp dataloader batch ratio relative to base batch_size")
+        parser.add_argument("--failure_mode", type=str, default="off",
+                            help="Failure pipeline mode: off|explore|train")
+        parser.add_argument("--failure_table_path", type=str, default="",
+                            help="Path to failure_table.json (required in failure_mode=train)")
+        parser.add_argument("--failure_table_dir", type=str, default="",
+                            help="Directory for explore outputs (default: ckpt_dir/failure_explore)")
+        parser.add_argument("--failure_phase_bins", type=int, default=5,
+                            help="Number of bins per phase for failure sampling")
+        parser.add_argument("--failure_translation_dir_bins", type=int, default=5,
+                            help="Number of translation direction bins for failure exploration")
+        parser.add_argument("--failure_translation_mag_bins", type=int, default=3,
+                            help="Number of translation magnitude bins for failure exploration")
+        parser.add_argument("--failure_rotation_dir_bins", type=int, default=6,
+                            help="Number of rotation direction bins for failure exploration")
+        parser.add_argument("--failure_rotation_mag_bins", type=int, default=3,
+                            help="Number of rotation magnitude bins for failure exploration")
+        parser.add_argument("--failure_corr_batch_ratio", type=float, default=0.5,
+                            help="Correction dataloader batch ratio relative to base batch size in failure_mode")
+        parser.add_argument("--failure_explore_k", type=int, default=3,
+                            help="Required trials per failure unit before writing it to failure_table in explore mode")
+        parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5,
+                            help="Mark a unit as failure when recover_rate <= this threshold")
 
         # Online perturbation
         parser.add_argument("--enable_perturb", type=str2bool, default=False,
@@ -185,12 +317,6 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Directional EEF perturbation magnitude in meters")
         parser.add_argument("--perturb_rot_max_deg", type=float, default=15.0,
                             help="Max EEF rotation perturbation angle in degrees")
-        parser.add_argument("--perturb_mag_random", type=str2bool, default=False,
-                            help="Randomize perturbation magnitude per rollout chunk")
-        parser.add_argument("--perturb_mag_rand_min", type=float, default=0.8,
-                            help="Minimum random magnitude scale")
-        parser.add_argument("--perturb_mag_rand_max", type=float, default=1.2,
-                            help="Maximum random magnitude scale")
         parser.add_argument("--perturb_active_joint_delta_thresh", type=float, default=0.02,
                             help="GT joint delta threshold (rad) to mark an arm as active")
         parser.add_argument("--perturb_active_gripper_delta_thresh", type=float, default=0.05,

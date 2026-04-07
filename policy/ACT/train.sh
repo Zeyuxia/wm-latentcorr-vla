@@ -2,7 +2,7 @@
 cd /data/zhenyangfan/RoboTwin/policy/ACT
 
 # Base training parameters
-train_tag="open_laptop_recover_transaltion_test"
+train_tag="open_laptop_recover_gripper_close_test"
 gpu_ids=4
 main_process_port=29500
 
@@ -63,8 +63,8 @@ export_correction_dir=
 enable_perturb=true
 perturb_prob=1.0
 perturb_error_mode=open_laptop_pregrasp
-perturb_open_laptop_pregrasp_close_prob=0.0
-perturb_open_laptop_pregrasp_translation_prob=1.0
+perturb_open_laptop_pregrasp_close_prob=1.0
+perturb_open_laptop_pregrasp_translation_prob=0.0
 perturb_open_laptop_pregrasp_rotation_prob=0.0
 sample_pregrasp_bias_enable=true
 sample_pregrasp_prob=1.0
@@ -76,11 +76,21 @@ wm_corr_pregrasp_extra_enable=true
 wm_corr_pregrasp_extra_ratio=0.5
 perturb_eef_fail_gain=0.10
 perturb_rot_max_deg=15
-perturb_mag_random=true
-perturb_mag_rand_min=1.00
-perturb_mag_rand_max=1.40
 perturb_active_joint_delta_thresh=0.01
 perturb_active_gripper_delta_thresh=0.05
+
+# Failure-mode options (off | explore | train)
+failure_mode=off
+failure_table_path=
+failure_table_dir=
+failure_phase_bins=5
+failure_translation_dir_bins=5
+failure_translation_mag_bins=3
+failure_rotation_dir_bins=6
+failure_rotation_mag_bins=3
+failure_corr_batch_ratio=0.5
+failure_explore_k=3
+failure_fail_recover_rate_thresh=0.5
 
 # Build saving dirs
 timestamp=$(date +"%Y%m%d_%H%M%S")
@@ -149,9 +159,6 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --perturb_open_laptop_pregrasp_rotation_prob ${perturb_open_laptop_pregrasp_rotation_prob} \
 --perturb_eef_fail_gain ${perturb_eef_fail_gain} \
 --perturb_rot_max_deg ${perturb_rot_max_deg} \
---perturb_mag_random ${perturb_mag_random} \
---perturb_mag_rand_min ${perturb_mag_rand_min} \
---perturb_mag_rand_max ${perturb_mag_rand_max} \
 --perturb_active_joint_delta_thresh ${perturb_active_joint_delta_thresh} \
 --perturb_active_gripper_delta_thresh ${perturb_active_gripper_delta_thresh} \
 --sample_pregrasp_bias_enable ${sample_pregrasp_bias_enable} \
@@ -162,6 +169,24 @@ perturb_flags="--enable_perturb ${enable_perturb} \
 --wm_corr_pregrasp_extra_enable ${wm_corr_pregrasp_extra_enable} \
 --wm_corr_pregrasp_extra_ratio ${wm_corr_pregrasp_extra_ratio} \
 "
+
+# Build failure-mode flags
+failure_flags="--failure_mode ${failure_mode} \
+--failure_phase_bins ${failure_phase_bins} \
+--failure_translation_dir_bins ${failure_translation_dir_bins} \
+--failure_translation_mag_bins ${failure_translation_mag_bins} \
+--failure_rotation_dir_bins ${failure_rotation_dir_bins} \
+--failure_rotation_mag_bins ${failure_rotation_mag_bins} \
+--failure_corr_batch_ratio ${failure_corr_batch_ratio} \
+--failure_explore_k ${failure_explore_k} \
+--failure_fail_recover_rate_thresh ${failure_fail_recover_rate_thresh} \
+"
+if [ -n "${failure_table_path}" ]; then
+    failure_flags="${failure_flags} --failure_table_path ${failure_table_path}"
+fi
+if [ -n "${failure_table_dir}" ]; then
+    failure_flags="${failure_flags} --failure_table_dir ${failure_table_dir}"
+fi
 
 # Build ACT training flags
 train_flags="--task_name sim-${task_name}-${task_config}-${expert_data_num} \
@@ -193,4 +218,5 @@ CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     imitate_episodes.py \
     ${train_flags} \
     ${perturb_flags} \
+    ${failure_flags} \
     ${wm_flags}

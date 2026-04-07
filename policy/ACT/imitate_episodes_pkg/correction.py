@@ -6,7 +6,12 @@ import re
 import numpy as np
 import torch
 
-from imitate_episodes_pkg.utils import phase_id_to_key, resample_trajectory
+from imitate_episodes_pkg.utils import (
+    phase_id_to_key,
+    error_mode_id_to_key,
+    active_arm_pattern_id_to_key,
+    resample_trajectory,
+)
 from imitate_episodes_pkg.perturbation import (
     _infer_active_arms_from_gt_window,
     _infer_phase_key_from_gt_window,
@@ -254,7 +259,10 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
 
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     norm_stats, modules, cfg, device, debug_dir=None, start_ts=0,
-                    sampled_phase_id=None, pregrasp_seg_start=None, pregrasp_seg_end=None):
+                    sampled_phase_id=None, pregrasp_seg_start=None, pregrasp_seg_end=None,
+                    sampled_phase_bin_id=None, sampled_phase_instance_id=None, forced_error_mode_id=None,
+                    sampled_active_arm_pattern_id=None, forced_dir_bin_id=None,
+                    forced_mag_bin_id=None):
     fk = modules['fk']
     evac_model = modules['evac_model']
     evac_cfg = modules['evac_config']
@@ -287,6 +295,16 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             "Dataloader must provide sampled_phase_id for each sample."
         )
     phase_key_fixed = phase_id_to_key(int(sampled_phase_id))
+    phase_bin_fixed = (None if sampled_phase_bin_id is None else int(sampled_phase_bin_id))
+    phase_instance_fixed = (None if sampled_phase_instance_id is None else int(sampled_phase_instance_id))
+    forced_error_mode_key = None
+    if forced_error_mode_id is not None and int(forced_error_mode_id) >= 0:
+        forced_error_mode_key = error_mode_id_to_key(int(forced_error_mode_id))
+    sampled_active_arm_pattern_key = None
+    if sampled_active_arm_pattern_id is not None and int(sampled_active_arm_pattern_id) >= 0:
+        sampled_active_arm_pattern_key = active_arm_pattern_id_to_key(int(sampled_active_arm_pattern_id))
+    forced_dir_bin_fixed = (None if forced_dir_bin_id is None else int(forced_dir_bin_id))
+    forced_mag_bin_fixed = (None if forced_mag_bin_id is None else int(forced_mag_bin_id))
     phase_window_len = int(cfg['sample_phase_window_len'])
 
     qpos_raw = qpos_data_s.cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
@@ -314,22 +332,52 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     }
     recover_eval_plot_last = None
 
-    active_info_fixed = _infer_active_arms_from_gt_window(
-        raw_data.get('gt_left_arm'),
-        raw_data.get('gt_right_arm'),
-        raw_data.get('left_gripper'),
-        raw_data.get('right_gripper'),
-        t_idx=start_ts,
-        window_len=rollout_exec_steps,
-        joint_delta_thresh=float(cfg['perturb_active_joint_delta_thresh']),
-        gripper_delta_thresh=float(cfg['perturb_active_gripper_delta_thresh']),
-    )
-    left_side_active = bool(active_info_fixed['left_arm'] or active_info_fixed['left_gripper'])
-    right_side_active = bool(active_info_fixed['right_arm'] or active_info_fixed['right_gripper'])
-    active_info_fixed['left_arm'] = left_side_active
-    active_info_fixed['right_arm'] = right_side_active
-    active_info_fixed['left_gripper'] = left_side_active
-    active_info_fixed['right_gripper'] = right_side_active
+    failure_mode_key = str(cfg.get('failure_mode', 'off')).strip().lower()
+    if failure_mode_key in {'explore', 'train'}:
+        if sampled_active_arm_pattern_key is None:
+            raise RuntimeError(
+                "Missing sampled_active_arm_pattern in failure_mode. "
+                "Dataloader must provide active_arm_pattern for each sample."
+            )
+        _pat = str(sampled_active_arm_pattern_key).strip().lower()
+        if _pat == "left_only":
+            left_side_active, right_side_active = True, False
+        elif _pat == "right_only":
+            left_side_active, right_side_active = False, True
+        elif _pat == "both":
+            left_side_active, right_side_active = True, True
+        else:
+            raise RuntimeError(
+                f"Invalid sampled_active_arm_pattern={sampled_active_arm_pattern_key!r} "
+                "in failure_mode. Expected left_only/right_only/both."
+            )
+        active_info_fixed = {
+            "left_arm": bool(left_side_active),
+            "right_arm": bool(right_side_active),
+            "left_gripper": bool(left_side_active),
+            "right_gripper": bool(right_side_active),
+            "left_arm_score": 0.0,
+            "right_arm_score": 0.0,
+            "left_gripper_score": 0.0,
+            "right_gripper_score": 0.0,
+        }
+    else:
+        active_info_fixed = _infer_active_arms_from_gt_window(
+            raw_data.get('gt_left_arm'),
+            raw_data.get('gt_right_arm'),
+            raw_data.get('left_gripper'),
+            raw_data.get('right_gripper'),
+            t_idx=start_ts,
+            window_len=rollout_exec_steps,
+            joint_delta_thresh=float(cfg['perturb_active_joint_delta_thresh']),
+            gripper_delta_thresh=float(cfg['perturb_active_gripper_delta_thresh']),
+        )
+        left_side_active = bool(active_info_fixed['left_arm'] or active_info_fixed['left_gripper'])
+        right_side_active = bool(active_info_fixed['right_arm'] or active_info_fixed['right_gripper'])
+        active_info_fixed['left_arm'] = left_side_active
+        active_info_fixed['right_arm'] = right_side_active
+        active_info_fixed['left_gripper'] = left_side_active
+        active_info_fixed['right_gripper'] = right_side_active
 
     max_steps_eff = max_steps
 
@@ -383,6 +431,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             left_ep=left_ep, right_ep=right_ep,
             left_grip_traj=left_grip_traj, right_grip_traj=right_grip_traj,
             t_star=int(t_star), rollout_exec_steps=int(rollout_exec_steps),
+            forced_error_mode=forced_error_mode_key,
+            forced_dir_bin_id=forced_dir_bin_fixed,
+            forced_mag_bin_id=forced_mag_bin_fixed,
         )
 
         fk_poses = [(lp.copy(), lq.copy(), rp.copy(), rq.copy())]  # current state
@@ -1745,6 +1796,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "closed_loop_fallback_used": bool(force_generate_correction),
         "correction_branch": correction_branch,
         "sampled_error_mode": sampled_error_mode,
+        "forced_error_mode": forced_error_mode_key,
+        "sampled_phase_bin_id": phase_bin_fixed,
+        "sampled_phase_instance_idx": phase_instance_fixed,
+        "sampled_active_arm_pattern": sampled_active_arm_pattern_key,
+        "forced_dir_bin_id": forced_dir_bin_fixed,
+        "forced_mag_bin_id": forced_mag_bin_fixed,
         "nearest_mode": nearest_mode,
         "rollout_exec_steps": int(rollout_exec_steps),
         "t_star": int(t_star),
