@@ -26,15 +26,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
                  raw_data_dir=None, start_margin=0,
                  sample_skip_head_ratio=None,
-                 sample_pregrasp_bias_enable=False,
-                 sample_pregrasp_prob=0.0,
                  sample_phase_window_len=16,
-                 sample_pregrasp_keep_start_ratio=0.0,
-                 sample_pregrasp_keep_end_ratio=0.5,
-                 sample_pregrasp_close_offset_steps=None,
                  failure_mode="off",
                  failure_table_path="",
-                 failure_phase_bins=5):
+                 failure_phase_bins=5,
+                 failure_explore_k=1):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -46,33 +42,24 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.sample_skip_head_ratio = None if sample_skip_head_ratio is None else float(sample_skip_head_ratio)
         if self.sample_skip_head_ratio is not None:
             self.sample_skip_head_ratio = float(np.clip(self.sample_skip_head_ratio, 0.0, 0.99))
-        self.sample_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
-        self.sample_pregrasp_prob = float(np.clip(sample_pregrasp_prob, 0.0, 1.0))
         self.sample_phase_window_len = max(1, int(sample_phase_window_len))
-        self.sample_pregrasp_keep_start_ratio = float(np.clip(sample_pregrasp_keep_start_ratio, 0.0, 1.0))
-        self.sample_pregrasp_keep_end_ratio = float(np.clip(sample_pregrasp_keep_end_ratio, 0.0, 1.0))
-        if self.sample_pregrasp_keep_end_ratio < self.sample_pregrasp_keep_start_ratio:
-            self.sample_pregrasp_keep_end_ratio = self.sample_pregrasp_keep_start_ratio
-        self.sample_pregrasp_close_offset_steps = None
-        if sample_pregrasp_close_offset_steps is not None:
-            s = int(sample_pregrasp_close_offset_steps)
-            if s > 0:
-                self.sample_pregrasp_close_offset_steps = s
         self.failure_mode = str(failure_mode).strip().lower()
         if self.failure_mode not in {"off", "explore", "train"}:
             raise ValueError(f"Invalid failure_mode={failure_mode!r}, expected off|explore|train")
         self.failure_table_path = str(failure_table_path).strip()
         self.failure_phase_bins = int(max(1, int(failure_phase_bins)))
-        self._pregrasp_start_cache = {}
+        self.failure_explore_k = int(max(1, int(failure_explore_k)))
+        self.failure_skip_approach_bins = 0
+        if self.failure_mode == "explore":
+            # In explore mode, skip early bins of the first stage directly in bin space
+            # (instead of time-ratio min_start truncation).
+            skip_bins = int(np.floor(float(self.sample_skip_head_ratio or 0.0) * float(self.failure_phase_bins)))
+            self.failure_skip_approach_bins = int(np.clip(skip_bins, 0, self.failure_phase_bins))
         self._phase_scan_cache = {}
         self._first_stage_len_cache = {}
         self._failure_entries = []
-        self._failure_rr_idx = 0
         self._explore_units = []
-        self._strict_pregrasp_calls = 0
-        self._strict_pregrasp_skipped_total = 0
-        self._strict_pregrasp_skipped_max = 0
-        self._strict_pregrasp_log_every = 100
+        self._explore_curr_unit_idx = 0
         self._init_failure_units()
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
@@ -93,6 +80,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
             for phase_id in range(4):
                 phase_key = phase_id_to_key(phase_id)
                 for bin_id in range(self.failure_phase_bins):
+                    if phase_key == "approach" and int(bin_id) < int(self.failure_skip_approach_bins):
+                        continue
                     for mode in _FAILURE_ERROR_MODES:
                         if mode == "translation":
                             for dir_bin_id in range(trans_dir_bins):
@@ -142,9 +131,35 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if self.failure_mode == "train":
             if not self.failure_table_path:
                 raise ValueError("failure_mode=train requires failure_table_path")
-            with open(self.failure_table_path, "r") as f:
-                table = json.load(f)
-            entries = table.get("entries", [])
+            entries = []
+            if os.path.isdir(self.failure_table_path):
+                preferred_files = [
+                    "failure_table_translation.json",
+                    "failure_table_rotation.json",
+                    "failure_table_gripper_close.json",
+                ]
+                loaded_any = False
+                for name in preferred_files:
+                    path_i = os.path.join(self.failure_table_path, name)
+                    if not os.path.isfile(path_i):
+                        continue
+                    with open(path_i, "r") as f:
+                        table_i = json.load(f)
+                    entries.extend(table_i.get("entries", []))
+                    loaded_any = True
+                if not loaded_any:
+                    path_i = os.path.join(self.failure_table_path, "failure_table.json")
+                    if not os.path.isfile(path_i):
+                        raise ValueError(
+                            f"failure_mode=train expected table file(s) under directory: {self.failure_table_path}"
+                        )
+                    with open(path_i, "r") as f:
+                        table_i = json.load(f)
+                    entries = table_i.get("entries", [])
+            else:
+                with open(self.failure_table_path, "r") as f:
+                    table = json.load(f)
+                entries = table.get("entries", [])
             if not isinstance(entries, list) or len(entries) == 0:
                 raise ValueError(f"failure_table has no entries: {self.failure_table_path}")
             parsed = []
@@ -270,13 +285,24 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self._phase_scan_cache[key] = info
         return info
 
+    def _advance_explore_unit(self):
+        if len(self._explore_units) == 0:
+            return
+        self._explore_curr_unit_idx = (int(self._explore_curr_unit_idx) + 1) % int(len(self._explore_units))
+
+    def set_explore_unit_idx(self, unit_idx):
+        if len(self._explore_units) == 0:
+            self._explore_curr_unit_idx = 0
+            return
+        self._explore_curr_unit_idx = int(np.clip(int(unit_idx), 0, len(self._explore_units) - 1))
+
     def _select_failure_unit(self):
         if self.failure_mode == "explore":
             if len(self._explore_units) == 0:
                 raise RuntimeError("explore mode has no units")
-            unit = self._explore_units[self._failure_rr_idx % len(self._explore_units)]
-            self._failure_rr_idx += 1
-            return dict(unit)
+            unit_idx = int(self._explore_curr_unit_idx) % int(len(self._explore_units))
+            unit = self._explore_units[unit_idx]
+            return dict(unit), int(unit_idx)
         if self.failure_mode == "train":
             if len(self._failure_entries) == 0:
                 raise RuntimeError("train mode has empty failure entries")
@@ -285,56 +311,75 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 w = np.ones(len(self._failure_entries), dtype=np.float64)
             w = w / np.sum(w)
             idx = int(np.random.choice(len(self._failure_entries), p=w))
-            return dict(self._failure_entries[idx])
+            return dict(self._failure_entries[idx]), int(idx)
         return None
 
     def _sample_start_ts_from_failure_unit(self, base_index):
-        unit = self._select_failure_unit()
-        if unit is None:
-            return None
-        n_ep = len(self.episode_ids)
-        for ofs in range(n_ep):
-            ep = int(self.episode_ids[(int(base_index) + ofs) % n_ep])
-            dataset_path = os.path.join(self.dataset_dir, f"episode_{ep}.hdf5")
-            with h5py.File(dataset_path, "r") as root:
-                ep_len = int(root["/action"].shape[0])
-            max_start = max(0, ep_len - 1 - self.start_margin)
-            min_start = self._resolve_min_start(ep, max_start)
-            scan = self._scan_phase_bins(ep, min_start, max_start)
-            cand = []
-            for ts, m in scan.items():
-                if str(m["phase_key"]) != str(unit["phase_key"]):
-                    continue
-                target_phase_inst = unit.get("phase_instance_idx", None)
-                if target_phase_inst is not None:
-                    if int(m.get("phase_instance_idx", -1)) != int(target_phase_inst):
+        if self.failure_mode == "explore":
+            if len(self._explore_units) == 0:
+                return None
+            n_unit_try = int(len(self._explore_units))
+        else:
+            n_unit_try = 1
+
+        for _u_try in range(n_unit_try):
+            out = self._select_failure_unit()
+            if out is None:
+                return None
+            unit, unit_idx = out
+            n_ep = len(self.episode_ids)
+            for ofs in range(n_ep):
+                ep = int(self.episode_ids[(int(base_index) + ofs) % n_ep])
+                dataset_path = os.path.join(self.dataset_dir, f"episode_{ep}.hdf5")
+                with h5py.File(dataset_path, "r") as root:
+                    ep_len = int(root["/action"].shape[0])
+                max_start = max(0, ep_len - 1 - self.start_margin)
+                if self.failure_mode == "explore":
+                    min_start = 0
+                else:
+                    min_start = self._resolve_min_start(ep, max_start)
+                scan = self._scan_phase_bins(ep, min_start, max_start)
+                cand = []
+                for ts, m in scan.items():
+                    if str(m["phase_key"]) != str(unit["phase_key"]):
                         continue
-                if int(m["phase_bin_id"]) != int(unit["phase_bin_id"]):
+                    target_phase_inst = unit.get("phase_instance_idx", None)
+                    if target_phase_inst is not None:
+                        if int(m.get("phase_instance_idx", -1)) != int(target_phase_inst):
+                            continue
+                    if int(m["phase_bin_id"]) != int(unit["phase_bin_id"]):
+                        continue
+                    target_pat = unit.get("active_arm_pattern", None)
+                    if target_pat is not None and str(m["active_arm_pattern"]) != str(target_pat):
+                        continue
+                    cand.append(int(ts))
+                if len(cand) == 0:
                     continue
-                target_pat = unit.get("active_arm_pattern", None)
-                if target_pat is not None and str(m["active_arm_pattern"]) != str(target_pat):
-                    continue
-                cand.append(int(ts))
-            if len(cand) == 0:
-                continue
-            ts = int(np.random.choice(cand))
-            meta = scan.get(ts, {})
-            return {
-                "episode_id": int(ep),
-                "start_ts": int(ts),
-                "seg_start": int(meta.get("seg_start", -1)),
-                "seg_end": int(meta.get("seg_end", -1)),
-                "phase_key": str(meta.get("phase_key", unit["phase_key"])),
-                "phase_instance_idx": int(meta.get("phase_instance_idx", -1)),
-                "phase_bin_id": int(meta.get("phase_bin_id", unit["phase_bin_id"])),
-                "active_arm_pattern": str(meta.get("active_arm_pattern", "both")),
-                "error_mode": str(unit["error_mode"]),
-                "dir_bin_id": int(unit.get("dir_bin_id", -1)),
-                "mag_bin_id": int(unit.get("mag_bin_id", -1)),
-            }
+
+                ts = int(np.random.choice(cand))
+                meta = scan.get(ts, {})
+                return {
+                    "episode_id": int(ep),
+                    "start_ts": int(ts),
+                    "seg_start": int(meta.get("seg_start", -1)),
+                    "seg_end": int(meta.get("seg_end", -1)),
+                    "phase_key": str(meta.get("phase_key", unit["phase_key"])),
+                    "phase_instance_idx": int(meta.get("phase_instance_idx", -1)),
+                    "phase_bin_id": int(meta.get("phase_bin_id", unit["phase_bin_id"])),
+                    "active_arm_pattern": str(meta.get("active_arm_pattern", "both")),
+                    "error_mode": str(unit["error_mode"]),
+                    "dir_bin_id": int(unit.get("dir_bin_id", -1)),
+                    "mag_bin_id": int(unit.get("mag_bin_id", -1)),
+                    "explore_unit_idx": int(unit_idx) if self.failure_mode == "explore" else -1,
+                }
+
+            if self.failure_mode == "explore":
+                # Current unit has no valid candidate in this dataset. Skip it.
+                self._advance_explore_unit()
+
         raise RuntimeError(
             "Failed to sample start_ts for failure unit: "
-            f"{unit} (dataset={self.dataset_dir})"
+            f"{unit if 'unit' in locals() else None} (dataset={self.dataset_dir})"
         )
 
     def _get_first_stage_len(self, episode_id, max_start):
@@ -378,97 +423,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
         min_start_ratio = int(np.floor(float(first_stage_len) * float(self.sample_skip_head_ratio)))
         return int(np.clip(min_start_ratio, 0, max_start))
 
-    def _get_pregrasp_start_candidates(self, episode_id, min_start, max_start, apply_keep_ratio=True):
-        key = (int(episode_id), int(min_start), int(max_start), bool(apply_keep_ratio))
-        if key in self._pregrasp_start_cache:
-            return self._pregrasp_start_cache[key]
-
-        candidates = []
-        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
-        try:
-            with h5py.File(dataset_path, "r") as root:
-                action = root["/action"][()]
-            if action.ndim != 2 or action.shape[1] < 14 or action.shape[0] <= 1:
-                self._pregrasp_start_cache[key] = candidates
-                return candidates
-
-            lg = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
-            rg = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
-            for ts in range(int(min_start), int(max_start) + 1):
-                ph = infer_phase_key_from_gt_window(
-                    lg[ts:],
-                    rg[ts:],
-                    self.sample_phase_window_len,
-                )
-                if ph == "pregrasp":
-                    candidates.append(int(ts))
-            # Keep a configurable ratio-range from each contiguous pregrasp segment.
-            # Example: [0.0, 0.5] means keep front half only.
-            if apply_keep_ratio and len(candidates) > 0:
-                kept = []
-                seg_start = 0
-                n = len(candidates)
-                while seg_start < n:
-                    seg_end = seg_start
-                    while seg_end + 1 < n and candidates[seg_end + 1] == candidates[seg_end] + 1:
-                        seg_end += 1
-                    seg = candidates[seg_start:seg_end + 1]
-                    seg_len = len(seg)
-                    if self.sample_pregrasp_close_offset_steps is not None:
-                        # Use a fixed-length pregrasp window before close transition:
-                        # end   = close_idx - rollout_exec_steps
-                        # start = end - rollout_exec_steps
-                        # (both inclusive, clipped to current pregrasp segment)
-                        close_idx = None
-                        l_bin = (lg > 0.5).astype(np.int32)
-                        r_bin = (rg > 0.5).astype(np.int32)
-                        scan_start = int(np.clip(seg[0] + 1, 1, len(l_bin) - 1))
-                        for t in range(scan_start, len(l_bin)):
-                            l_close = bool(l_bin[t - 1] == 1 and l_bin[t] == 0)
-                            r_close = bool(r_bin[t - 1] == 1 and r_bin[t] == 0)
-                            if l_close or r_close:
-                                close_idx = int(t)
-                                break
-                        if close_idx is None:
-                            close_idx = int(seg[-1])
-                        off = int(self.sample_pregrasp_close_offset_steps)
-                        keep_end_abs = int(close_idx - off)
-                        keep_start_abs = int(keep_end_abs - off)
-                        keep_start_abs = int(np.clip(keep_start_abs, seg[0], seg[-1]))
-                        keep_end_abs = int(np.clip(keep_end_abs, keep_start_abs, seg[-1]))
-                        keep_l = int(keep_start_abs - seg[0])
-                        keep_r = int(keep_end_abs - seg[0] + 1)  # slice end (exclusive)
-                    else:
-                        keep_l = int(np.floor(seg_len * self.sample_pregrasp_keep_start_ratio))
-                        keep_l = int(np.clip(keep_l, 0, max(0, seg_len - 1)))
-                        keep_r = int(np.ceil(seg_len * self.sample_pregrasp_keep_end_ratio))
-                        keep_r = int(np.clip(keep_r, keep_l + 1, seg_len))
-                    kept.extend(seg[keep_l:keep_r])
-                    seg_start = seg_end + 1
-                candidates = [int(ts) for ts in kept]
-        except Exception:
-            candidates = []
-
-        self._pregrasp_start_cache[key] = candidates
-        return candidates
-
-    def _find_candidate_segment_bounds(self, candidates, ts):
-        if candidates is None or len(candidates) == 0:
-            return -1, -1
-        arr = [int(x) for x in candidates]
-        t = int(ts)
-        try:
-            pos = arr.index(t)
-        except ValueError:
-            return -1, -1
-        l = pos
-        r = pos
-        while l - 1 >= 0 and arr[l - 1] == arr[l] - 1:
-            l -= 1
-        while r + 1 < len(arr) and arr[r + 1] == arr[r] + 1:
-            r += 1
-        return int(arr[l]), int(arr[r])
-
     def __getitem__(self, index):
         sample_full_episode = False
 
@@ -479,15 +433,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
         sampled_active_arm_pattern = "both"
         forced_dir_bin_id = -1
         forced_mag_bin_id = -1
-        sample_pregrasp = False
-        if self.sample_pregrasp_bias_enable and self.sample_pregrasp_prob > 0.0:
-            sample_pregrasp = (np.random.rand() < self.sample_pregrasp_prob)
-        strict_pregrasp = bool(sample_pregrasp and self.sample_pregrasp_prob >= (1.0 - 1e-8))
-
-        # Strict mode: when pregrasp sampling is effectively mandatory (prob=1),
-        # do not fall back to random start_ts; resample across episodes instead.
+        sampled_explore_unit_idx = -1
         forced_start_ts = None
-        forced_cand = None
         failure_sampled = None
         if (not sample_full_episode) and self.failure_mode in {"explore", "train"}:
             failure_sampled = self._sample_start_ts_from_failure_unit(index)
@@ -499,41 +446,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             sampled_active_arm_pattern = str(failure_sampled.get("active_arm_pattern", "both"))
             forced_dir_bin_id = int(failure_sampled.get("dir_bin_id", -1))
             forced_mag_bin_id = int(failure_sampled.get("mag_bin_id", -1))
-        if (not sample_full_episode) and strict_pregrasp and (failure_sampled is None):
-            n_ep = len(self.episode_ids)
-            found = False
-            skipped_before_found = 0
-            for ofs in range(n_ep):
-                ep_try = self.episode_ids[(index + ofs) % n_ep]
-                path_try = os.path.join(self.dataset_dir, f"episode_{ep_try}.hdf5")
-                with h5py.File(path_try, "r") as root_try:
-                    ep_len_try = int(root_try["/action"].shape[0])
-                max_start_try = max(0, ep_len_try - 1 - self.start_margin)
-                min_start_try = self._resolve_min_start(ep_try, max_start_try)
-                cand_try = self._get_pregrasp_start_candidates(ep_try, min_start_try, max_start_try, apply_keep_ratio=True)
-                if len(cand_try) > 0:
-                    episode_id = ep_try
-                    forced_cand = cand_try
-                    forced_start_ts = int(np.random.choice(cand_try))
-                    skipped_before_found = int(ofs)
-                    found = True
-                    break
-            self._strict_pregrasp_calls += 1
-            self._strict_pregrasp_skipped_total += int(skipped_before_found)
-            self._strict_pregrasp_skipped_max = max(self._strict_pregrasp_skipped_max, int(skipped_before_found))
-            if self._strict_pregrasp_calls % self._strict_pregrasp_log_every == 0:
-                avg_skip = float(self._strict_pregrasp_skipped_total) / float(max(1, self._strict_pregrasp_calls))
-                print(
-                    "[EpisodicDataset] strict pregrasp resample stats: "
-                    f"calls={self._strict_pregrasp_calls}, "
-                    f"avg_skipped={avg_skip:.2f}, "
-                    f"max_skipped={self._strict_pregrasp_skipped_max}"
-                )
-            if not found:
-                raise RuntimeError(
-                    "Strict pregrasp sampling enabled (sample_pregrasp_prob=1.0), "
-                    "but no pregrasp candidates were found in any episode."
-                )
+            sampled_explore_unit_idx = int(failure_sampled.get("explore_unit_idx", -1))
 
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
@@ -551,26 +464,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 min_start = self._resolve_min_start(episode_id, max_start)
                 if forced_start_ts is not None:
                     start_ts = int(np.clip(forced_start_ts, min_start, max_start))
-                    if failure_sampled is not None:
-                        pregrasp_seg_start = int(failure_sampled.get("seg_start", -1))
-                        pregrasp_seg_end = int(failure_sampled.get("seg_end", -1))
-                    else:
-                        cand_full = self._get_pregrasp_start_candidates(
-                            episode_id, min_start, max_start, apply_keep_ratio=False
-                        )
-                        pregrasp_seg_start, pregrasp_seg_end = self._find_candidate_segment_bounds(cand_full, start_ts)
+                    pregrasp_seg_start = int(failure_sampled.get("seg_start", -1)) if failure_sampled is not None else -1
+                    pregrasp_seg_end = int(failure_sampled.get("seg_end", -1)) if failure_sampled is not None else -1
                 else:
                     start_ts = np.random.randint(min_start, max_start + 1)
                     pregrasp_seg_start = -1
                     pregrasp_seg_end = -1
-                    if sample_pregrasp:
-                        cand = self._get_pregrasp_start_candidates(episode_id, min_start, max_start, apply_keep_ratio=True)
-                        if len(cand) > 0:
-                            start_ts = int(np.random.choice(cand))
-                            cand_full = self._get_pregrasp_start_candidates(
-                                episode_id, min_start, max_start, apply_keep_ratio=False
-                            )
-                            pregrasp_seg_start, pregrasp_seg_end = self._find_candidate_segment_bounds(cand_full, start_ts)
             # get observation at start_ts only
             qpos = root["/observations/qpos"][start_ts]
             image_dict = dict()
@@ -653,6 +552,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 torch.tensor(sampled_active_arm_pattern_id),
                 torch.tensor(forced_dir_bin_id),
                 torch.tensor(forced_mag_bin_id),
+                torch.tensor(sampled_explore_unit_idx),
             )
 
         return image_data, qpos_data, action_data, is_pad
@@ -717,15 +617,11 @@ def get_norm_stats(dataset_dir, num_episodes):
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
               raw_data_dir=None, start_margin=0, sample_skip_head_ratio=None,
-              sample_pregrasp_bias_enable=False,
-              sample_pregrasp_prob=0.0,
               sample_phase_window_len=16,
-              sample_pregrasp_keep_start_ratio=0.0,
-              sample_pregrasp_keep_end_ratio=0.5,
-              sample_pregrasp_close_offset_steps=None,
               failure_mode="off",
               failure_table_path="",
               failure_phase_bins=5,
+              failure_explore_k=1,
               dataset_dirs=None,
               num_episodes_list=None,
               task_weights=None):
@@ -807,23 +703,21 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
         train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
                                         raw_data_dir=raw_data_dir, start_margin=start_margin,
                                         sample_skip_head_ratio=sample_skip_head_ratio,
-                                        sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
-                                        sample_pregrasp_prob=sample_pregrasp_prob,
                                         sample_phase_window_len=sample_phase_window_len,
-                                        sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-                                        sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-                                        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
                                         failure_mode=failure_mode,
                                         failure_table_path=failure_table_path,
-                                        failure_phase_bins=failure_phase_bins)
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=batch_size_train,
-            shuffle=True,
-            pin_memory=True,
-            num_workers=1,
-            prefetch_factor=1,
-        )
+                                        failure_phase_bins=failure_phase_bins,
+                                        failure_explore_k=failure_explore_k)
+        _num_workers = 0 if str(failure_mode).strip().lower() == "explore" else 1
+        _loader_kwargs = {
+            "batch_size": batch_size_train,
+            "shuffle": True,
+            "pin_memory": True,
+            "num_workers": _num_workers,
+        }
+        if _num_workers > 0:
+            _loader_kwargs["prefetch_factor"] = 1
+        train_dataloader = DataLoader(train_dataset, **_loader_kwargs)
         return train_dataloader, None, norm_stats, train_dataset.is_sim, max_action_len
 
     if raw_data_dir is not None:
@@ -843,15 +737,11 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
         ds = EpisodicDataset(train_indices, ds_dir, camera_names, norm_stats, max_action_len,
                              raw_data_dir=None, start_margin=start_margin,
                              sample_skip_head_ratio=sample_skip_head_ratio,
-                             sample_pregrasp_bias_enable=sample_pregrasp_bias_enable,
-                             sample_pregrasp_prob=sample_pregrasp_prob,
                              sample_phase_window_len=sample_phase_window_len,
-                             sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-                             sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-                             sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
                              failure_mode=failure_mode,
                              failure_table_path=failure_table_path,
-                             failure_phase_bins=failure_phase_bins)
+                             failure_phase_bins=failure_phase_bins,
+                             failure_explore_k=failure_explore_k)
         sub_datasets.append(ds)
 
     train_dataset = ConcatDataset(sub_datasets)
@@ -869,15 +759,17 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
             replacement=True,
         )
 
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size_train,
-        shuffle=(sampler is None),
-        sampler=sampler,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
-    )
+    _num_workers_mt = 0 if str(failure_mode).strip().lower() == "explore" else 1
+    _loader_kwargs_mt = {
+        "batch_size": batch_size_train,
+        "shuffle": (sampler is None),
+        "sampler": sampler,
+        "pin_memory": True,
+        "num_workers": _num_workers_mt,
+    }
+    if _num_workers_mt > 0:
+        _loader_kwargs_mt["prefetch_factor"] = 1
+    train_dataloader = DataLoader(train_dataset, **_loader_kwargs_mt)
 
     is_sim = sub_datasets[0].is_sim if len(sub_datasets) > 0 else True
     return train_dataloader, None, norm_stats, is_sim, max_action_len

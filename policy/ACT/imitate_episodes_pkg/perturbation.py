@@ -183,50 +183,6 @@ def _rotation_axis_from_bin(quat_wxyz, dir_bin_id):
     n = int(max(1, get_failure_param_bins()["rotation_dir_bins"]))
     return _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir=n, theta_deg=60.0)
 
-def _sample_error_mode(phase_key, cfg):
-    req = str(cfg.get("perturb_error_mode", "legacy")).strip().lower()
-    phase = str(phase_key).strip().lower()
-
-    # 1) Task-specific stage-gated sampling.
-    if req == "open_laptop_pregrasp":
-        if phase != "pregrasp":
-            return None
-        names = ["gripper_close", "translation", "rotation"]
-        probs = np.array(
-            [
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_close_prob", 0.8))),
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_translation_prob", 0.1))),
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_rotation_prob", 0.1))),
-            ],
-            dtype=np.float64,
-        )
-        if float(np.sum(probs)) <= 1e-12:
-            probs = np.array([0.8, 0.1, 0.1], dtype=np.float64)
-        probs = probs / np.sum(probs)
-        return np.random.choice(names, p=probs).item()
-
-    # 2) Fixed mode.
-    if req in {"translation", "rotation", "gripper_close"}:
-        return req
-
-    # 3) Unsupported/disabled mode.
-    return None
-
-def _gate_gripper_error_mode(
-    selected_mode, init_left_grip, init_right_grip, cfg,
-    active_left_gripper=True, active_right_gripper=True
-):
-    # Guard gripper_close only when both sides are effectively not open.
-    # "active_*_gripper" is no longer required here.
-    mode = str(selected_mode).strip().lower() if selected_mode is not None else None
-    if mode == "gripper_close":
-        close_min = float(np.clip(cfg.get("perturb_gripper_close_min", 0.10), 0.0, 1.0))
-        l_open = bool(float(np.clip(init_left_grip, 0.0, 1.0)) > close_min)
-        r_open = bool(float(np.clip(init_right_grip, 0.0, 1.0)) > close_min)
-        if not (l_open or r_open):
-            return "translation"
-    return selected_mode
-
 def _perturb_action_chunk_target_pose(
     act_raw, cfg, fk, planner_l, planner_r,
     curr_left_q, curr_right_q, init_left_grip, init_right_grip,
@@ -441,13 +397,10 @@ def perturb_action_chunk_online(
 ):
     """
     Apply forced perturbation mode/dir-bin/mag-bin on action chunk.
-    In failure explore/train, mode and bins are provided by dataloader.
+    In failure train, mode and bins are provided by dataloader.
     """
     if not cfg.get("enable_perturb", False):
         return act_raw, False, "disabled", dyn_state
-    prob = float(cfg.get("perturb_prob", 0.0))
-    if prob <= 0.0 or np.random.rand() >= prob:
-        return act_raw, False, "skip_prob", dyn_state
 
     del phase_key
     selected_mode = None if forced_error_mode is None else str(forced_error_mode).strip().lower()

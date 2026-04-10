@@ -17,7 +17,9 @@ task_config/
 policy/weights/
 policy/ACT/evac*
 policy/ACT_LatentCorr
+policy/PI0_LatentCorr
 act-*
+wandb
 
 # Environment-specific generated content
 envs/curobo/

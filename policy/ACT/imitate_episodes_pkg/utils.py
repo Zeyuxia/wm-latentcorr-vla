@@ -263,20 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
         # Dataloader sampling bias
         parser.add_argument("--sample_skip_head_ratio", type=float, default=0.25,
                             help="Skip first ratio of first-stage(approach) length when sampling start_ts")
-        parser.add_argument("--sample_pregrasp_bias_enable", type=str2bool, default=False,
-                            help="Bias dataloader start_ts sampling towards pregrasp candidates")
-        parser.add_argument("--sample_pregrasp_prob", type=float, default=0.0,
-                            help="When pregrasp bias is enabled, probability of sampling from pregrasp candidates")
         parser.add_argument("--sample_phase_window_len", type=int, default=16,
                             help="Window length used by shared phase inference during start_ts sampling")
-        parser.add_argument("--sample_pregrasp_keep_start_ratio", type=float, default=0.0,
-                            help="Start ratio (inclusive) of each pregrasp segment to keep for sampling")
-        parser.add_argument("--sample_pregrasp_keep_end_ratio", type=float, default=0.5,
-                            help="End ratio (exclusive) of each pregrasp segment to keep for sampling")
-        parser.add_argument("--wm_corr_pregrasp_extra_enable", type=str2bool, default=False,
-                            help="If true, use an extra pregrasp-only dataloader for WM correction samples")
-        parser.add_argument("--wm_corr_pregrasp_extra_ratio", type=float, default=0.5,
-                            help="Extra pregrasp dataloader batch ratio relative to base batch_size")
         parser.add_argument("--failure_mode", type=str, default="off",
                             help="Failure pipeline mode: off|explore|train")
         parser.add_argument("--failure_table_path", type=str, default="",
@@ -296,23 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--failure_corr_batch_ratio", type=float, default=0.5,
                             help="Correction dataloader batch ratio relative to base batch size in failure_mode")
         parser.add_argument("--failure_explore_k", type=int, default=3,
-                            help="Required trials per failure unit before writing it to failure_table in explore mode")
+                            help="Required unique samples (episode_id,start_ts) per failure unit before writing it to failure_table in explore mode")
         parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5,
                             help="Mark a unit as failure when recover_rate <= this threshold")
 
         # Online perturbation
-        parser.add_argument("--enable_perturb", type=str2bool, default=False,
-                            help="Enable online rollout action perturbation in WM correction")
-        parser.add_argument("--perturb_prob", type=float, default=1.0,
-                            help="Probability to apply online perturbation per rollout chunk")
-        parser.add_argument("--perturb_error_mode", type=str, default="legacy",
-                            help="Error mode: legacy|auto|open_laptop_pregrasp|translation|rotation|gripper_close")
-        parser.add_argument("--perturb_open_laptop_pregrasp_close_prob", type=float, default=0.8,
-                            help="When perturb_error_mode=open_laptop_pregrasp, probability of gripper_close in pregrasp")
-        parser.add_argument("--perturb_open_laptop_pregrasp_translation_prob", type=float, default=0.1,
-                            help="When perturb_error_mode=open_laptop_pregrasp, probability of translation in pregrasp")
-        parser.add_argument("--perturb_open_laptop_pregrasp_rotation_prob", type=float, default=0.1,
-                            help="When perturb_error_mode=open_laptop_pregrasp, probability of rotation in pregrasp")
         parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.03,
                             help="Directional EEF perturbation magnitude in meters")
         parser.add_argument("--perturb_rot_max_deg", type=float, default=15.0,
@@ -341,16 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Path to ACT initial checkpoint")
         parser.add_argument("--max_rollout_steps", type=int,
                             help="Max rollout steps for correction")
-        parser.add_argument("--correction_force_generate", type=str2bool, default=False,
-                            help="If true, always generate correction trajectory after rollout")
         parser.add_argument("--debug_correction_evac_rollout", type=str2bool, default=False,
                             help="If true, run EVAC once on final generated correction trajectory and save outputs.mp4")
         parser.add_argument("--rollout_exec_steps", type=int, default=None,
                             help="Number of actions executed per rollout step (prefix of chunk)")
         parser.add_argument("--recover_eval_enable", type=str2bool, default=False,
                             help="Evaluate if ACT can recover from perturbed observation at each rollout step")
-        parser.add_argument("--recover_eval_use_for_trigger", type=str2bool, default=False,
-                            help="If true, skip correction generation when recover_eval marks recoverable")
         parser.add_argument("--recover_eval_save_video", type=str2bool, default=False,
                             help="If true, save EVAC rollout video for ACT recover-eval action sequence at each rollout step")
         parser.add_argument("--recover_eval_gripper_open_thresh", type=float, default=0.8,

@@ -257,6 +257,207 @@ def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_dat
     last_bgr = last_rgb[:, :, ::-1].copy()
     return torch.from_numpy(last_bgr).float().permute(2, 0, 1) / 255.0
 
+
+def _shared_phase_color(phase_key):
+    k = str(phase_key).strip().lower()
+    cmap = {
+        "approach": (255, 120, 0),
+        "pregrasp": (0, 165, 255),
+        "transport": (0, 255, 255),
+        "place": (255, 0, 255),
+    }
+    return cmap.get(k, (180, 180, 180))
+
+
+def _shared_draw_phase_polyline(img, seq, phase_seq, width=1):
+    import cv2
+
+    prev = None
+    for i, pt in enumerate(seq):
+        if pt is None:
+            prev = None
+            continue
+        if prev is not None:
+            c = _shared_phase_color(phase_seq[i] if i < len(phase_seq) else "unknown")
+            cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), c, width, cv2.LINE_AA)
+        prev = pt
+
+
+def _shared_draw_phase_legend(img):
+    import cv2
+
+    rows = [
+        ("approach", _shared_phase_color("approach")),
+        ("pregrasp", _shared_phase_color("pregrasp")),
+        ("transport", _shared_phase_color("transport")),
+        ("place", _shared_phase_color("place")),
+    ]
+    x0, y0 = 10, 62
+    row_h = 18
+    w = 150
+    h = 8 + row_h * len(rows) + 8
+    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
+    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
+    for i, (name, color) in enumerate(rows):
+        y = y0 + 18 + i * row_h
+        cv2.circle(img, (x0 + 10, y - 4), 4, color, -1, cv2.LINE_AA)
+        cv2.putText(img, name, (x0 + 20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+
+
+def _shared_build_pose_np_from_raw_indices(raw_data, raw_idx_list):
+    pose_list = []
+    for gi in raw_idx_list:
+        lp_gt = raw_data['left_endpose'][gi, :3].astype(np.float32)
+        lq_gt_wxyz = raw_data['left_endpose'][gi, 3:7].astype(np.float32)
+        rp_gt = raw_data['right_endpose'][gi, :3].astype(np.float32)
+        rq_gt_wxyz = raw_data['right_endpose'][gi, 3:7].astype(np.float32)
+        lq_gt_xyzw = np.array([lq_gt_wxyz[1], lq_gt_wxyz[2], lq_gt_wxyz[3], lq_gt_wxyz[0]], dtype=np.float32)
+        rq_gt_xyzw = np.array([rq_gt_wxyz[1], rq_gt_wxyz[2], rq_gt_wxyz[3], rq_gt_wxyz[0]], dtype=np.float32)
+        if lq_gt_xyzw[3] < 0:
+            lq_gt_xyzw = -lq_gt_xyzw
+        if rq_gt_xyzw[3] < 0:
+            rq_gt_xyzw = -rq_gt_xyzw
+        lg_gt = float(np.clip(raw_data['left_gripper'][gi], 0.0, 1.0)) * 120.0
+        rg_gt = float(np.clip(raw_data['right_gripper'][gi], 0.0, 1.0)) * 120.0
+        pose_list.append(
+            np.concatenate([lp_gt, lq_gt_xyzw, [lg_gt], rp_gt, rq_gt_xyzw, [rg_gt]], axis=0).astype(np.float32)
+        )
+    if len(pose_list) == 0:
+        return None
+    return np.stack(pose_list, axis=0)
+
+
+def _shared_project_base_uv_from_pose_np(pose_arr, K, E):
+    import evac.lvdm.models.ddpm3d as ddpm3d_mod
+
+    w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
+    intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
+    cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+    ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+
+    pose_t = torch.from_numpy(pose_arr).float()
+    pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
+    pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
+    ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
+    ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
+    pts_l = torch.matmul(ee2cam_l, ee_key_pts)
+    pts_r = torch.matmul(ee2cam_r, ee_key_pts)
+    uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
+    uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
+    uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+    uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+    return uvs_l, uvs_r, pts_l, pts_r
+
+
+def _shared_extract_base_uv(uvs, pts):
+    out = []
+    n = int(uvs.shape[0])
+    for i in range(n):
+        try:
+            z = float(pts[0, i, 2, 0].item())
+            u = int(uvs[i, 0, 0])
+            v = int(uvs[i, 0, 1])
+        except Exception:
+            out.append(None)
+            continue
+        if z > 1e-6 and np.isfinite(uvs[i, 0, :]).all():
+            out.append((u, v))
+        else:
+            out.append(None)
+    return out
+
+
+def _shared_compute_phase_projection(raw_data, phase_window_len, K, E):
+    n_ep_total = int(raw_data['left_endpose'].shape[0])
+    full_left_grip = np.asarray(raw_data['left_gripper'], dtype=np.float32).reshape(-1)
+    full_right_grip = np.asarray(raw_data['right_gripper'], dtype=np.float32).reshape(-1)
+    phase_raw_idx = []
+    phase_seq = []
+    if n_ep_total <= 1:
+        return None, None, None
+    stride = int(max(1, n_ep_total // 240))
+    for raw_idx in range(0, n_ep_total, stride):
+        ph = _infer_phase_key_from_gt_window(
+            full_left_grip[raw_idx:],
+            full_right_grip[raw_idx:],
+            phase_window_len,
+        )
+        phase_raw_idx.append(raw_idx)
+        phase_seq.append(ph)
+    if len(phase_raw_idx) < 2:
+        return None, None, None
+    phase_pose_np = _shared_build_pose_np_from_raw_indices(raw_data, phase_raw_idx)
+    if phase_pose_np is None:
+        return None, None, None
+    p_uvs_l, p_uvs_r, p_pts_l, p_pts_r = _shared_project_base_uv_from_pose_np(phase_pose_np, K, E)
+    p_l_seq = _shared_extract_base_uv(p_uvs_l, p_pts_l.reshape(1, p_pts_l.shape[1], 4, 4))
+    p_r_seq = _shared_extract_base_uv(p_uvs_r, p_pts_r.reshape(1, p_pts_r.shape[1], 4, 4))
+    return p_l_seq, p_r_seq, phase_seq
+
+
+def _save_gt_projection_on_original(
+    debug_corr_dir,
+    image_data_s,
+    raw_data,
+    start_ts,
+    rollout_steps_total,
+    phase_window_len,
+):
+    import cv2
+
+    try:
+        _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+        try:
+            ep_path = raw_data.get('episode_path', None)
+            if ep_path is not None and os.path.isfile(ep_path):
+                import h5py
+                with h5py.File(ep_path, 'r') as _f_gt:
+                    _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
+                _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
+                if _gt is not None and _gt.size > 0:
+                    _oimg = _gt
+        except Exception:
+            pass
+
+        K = raw_data['intrinsic_cv'].astype(np.float32).copy()
+        E = np.eye(4, dtype=np.float32)
+        E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
+        h_native, w_native = raw_data.get('native_resolution', (_oimg.shape[0], _oimg.shape[1]))
+        h_img, w_img = _oimg.shape[:2]
+        if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
+            sx = float(w_img) / float(w_native)
+            sy = float(h_img) / float(h_native)
+            K[0, 0] *= sx
+            K[0, 2] *= sx
+            K[1, 1] *= sy
+            K[1, 2] *= sy
+        _ = np.linalg.inv(E).astype(np.float32)
+
+        _overlay_gt = _oimg.copy()
+        p_l_seq, p_r_seq, phase_seq = _shared_compute_phase_projection(raw_data, phase_window_len, K, E)
+        if p_l_seq is not None and p_r_seq is not None and phase_seq is not None:
+            _shared_draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
+            _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
+            _shared_draw_phase_legend(_overlay_gt)
+
+        out_path = os.path.join(debug_corr_dir, 'gt_projection_on_original.png')
+        cv2.imwrite(out_path, _overlay_gt)
+        return {
+            'path': out_path,
+            'exists': bool(os.path.exists(out_path)),
+            'gt_ref_idx': int(gt_ref_idx),
+        }
+    except Exception:
+        try:
+            import traceback
+            with open(os.path.join(debug_corr_dir, 'gt_projection_on_original_error.txt'), 'w') as _f:
+                _f.write(traceback.format_exc())
+        except Exception:
+            pass
+        return None
+
+
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     norm_stats, modules, cfg, device, debug_dir=None, start_ts=0,
                     sampled_phase_id=None, pregrasp_seg_start=None, pregrasp_seg_end=None,
@@ -281,7 +482,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     orient_weight = float(cfg['orient_weight'])
     gripper_penalty = float(cfg['gripper_penalty'])
     recover_eval_enable = bool(cfg.get('recover_eval_enable', False))
-    recover_eval_use_for_trigger = bool(cfg.get('recover_eval_use_for_trigger', False))
     recover_eval_save_video = bool(cfg.get('recover_eval_save_video', False))
     recover_eval_gripper_open_thresh = float(cfg.get('recover_eval_gripper_open_thresh', 0.8))
     recover_eval_pos_thresh_m = float(cfg.get('recover_eval_pos_thresh_m', 0.03))
@@ -306,6 +506,17 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     forced_dir_bin_fixed = (None if forced_dir_bin_id is None else int(forced_dir_bin_id))
     forced_mag_bin_fixed = (None if forced_mag_bin_id is None else int(forced_mag_bin_id))
     phase_window_len = int(cfg['sample_phase_window_len'])
+    sampled_unit = {
+        "phase_key": str(phase_key_fixed),
+        "phase_bin_id": (None if phase_bin_fixed is None else int(phase_bin_fixed)),
+        "phase_instance_idx": (None if phase_instance_fixed is None else int(phase_instance_fixed)),
+        "error_mode": (None if forced_error_mode_key is None else str(forced_error_mode_key)),
+        "active_arm_pattern": (
+            None if sampled_active_arm_pattern_key is None else str(sampled_active_arm_pattern_key)
+        ),
+        "dir_bin_id": (None if forced_dir_bin_fixed is None else int(forced_dir_bin_fixed)),
+        "mag_bin_id": (None if forced_mag_bin_fixed is None else int(forced_mag_bin_fixed)),
+    }
 
     qpos_raw = qpos_data_s.cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
     curr_image = image_data_s.clone()
@@ -317,10 +528,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     min_dist = 0.0
     _dbg_rollout = []  # collect per-step debug info
     dyn_state = None
+    act_raw = None
     rollout_steps_total = 0
     evac_rollout_videos = []
-    recover_eval_any = False
-    recover_eval_first_step = None
+    recover_eval_any_unrecoverable = False
+    recover_eval_first_unrecoverable_step = None
     recover_eval_last = {
         'recoverable': False,
         'mode': None,
@@ -356,10 +568,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             "right_arm": bool(right_side_active),
             "left_gripper": bool(left_side_active),
             "right_gripper": bool(right_side_active),
-            "left_arm_score": 0.0,
-            "right_arm_score": 0.0,
-            "left_gripper_score": 0.0,
-            "right_gripper_score": 0.0,
         }
     else:
         active_info_fixed = _infer_active_arms_from_gt_window(
@@ -398,7 +606,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             window_start=max(0, expected_idx - near_w),
             window_end=min(len(left_ep), expected_idx + near_w + 1),
         )
-        min_dist_start = float(min_dist)
 
         qn = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
         qt = torch.from_numpy(qn).float().unsqueeze(0).to(device)
@@ -485,7 +692,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         lp_e, lq_e = fk_r_e['left']
         rp_e, rq_e = fk_r_e['right']
         sampled_error_mode = None
-        perturb_mag_scale = None
+        perturb_dir_bin_id = None
+        perturb_mag_bin_id = None
+        perturb_axis_bin_id = None
         perturb_translation_gain_m = None
         perturb_rotation_deg = None
         perturb_dir_left = None
@@ -494,7 +703,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         perturb_axis_right = None
         if isinstance(dyn_state, dict):
             sampled_error_mode = dyn_state.get('error_mode')
-            perturb_mag_scale = dyn_state.get('perturb_mag_scale')
+            perturb_dir_bin_id = dyn_state.get('dir_bin_id')
+            perturb_mag_bin_id = dyn_state.get('mag_bin_id')
+            perturb_axis_bin_id = dyn_state.get('axis_bin_id')
             perturb_translation_gain_m = dyn_state.get('perturb_translation_gain_m')
             perturb_rotation_deg = dyn_state.get('perturb_rotation_deg')
             perturb_dir_left = dyn_state.get('perturb_dir_left')
@@ -509,7 +720,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         recover_eval_threshold = None
         recover_eval_horizon = None
         recover_eval_gt_ref_idx = None
-        recover_eval_nearest_idx = None
         recover_eval_nearest_dist = None
         recover_eval_window_start = None
         recover_eval_window_end = None
@@ -677,7 +887,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         window_start=ws,
                         window_end=we,
                     )
-                    recover_eval_nearest_idx = int(nidx_abs)
                     recover_eval_nearest_dist = float(ndist)
                     recover_eval_window_start = int(ws)
                     recover_eval_window_end = int(we)
@@ -722,7 +931,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         window_start=ws,
                         window_end=we,
                     )
-                    recover_eval_nearest_idx = int(nidx_abs)
                     recover_eval_nearest_dist = float(ndist)
                     recover_eval_window_start = int(ws)
                     recover_eval_window_end = int(we)
@@ -746,7 +954,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         float(recover_eval_metric) <= float(recover_eval_threshold)
                     )
                 else:
-                    recover_eval_recoverable = False
+                    recover_eval_recoverable = None
 
                 if recover_eval_gt_ref_idx is not None:
                     recover_eval_plot_last = {
@@ -762,15 +970,15 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         'active_right_arm': bool(active_info.get('right_arm', True)),
                     }
             except Exception as exc:
-                recover_eval_recoverable = False
+                recover_eval_recoverable = None
                 recover_eval_error = str(exc)
 
-            if bool(recover_eval_recoverable):
-                recover_eval_any = True
-                if recover_eval_first_step is None:
-                    recover_eval_first_step = int(step)
+            if recover_eval_recoverable is False:
+                recover_eval_any_unrecoverable = True
+                if recover_eval_first_unrecoverable_step is None:
+                    recover_eval_first_unrecoverable_step = int(step)
             recover_eval_last = {
-                'recoverable': bool(recover_eval_recoverable),
+                'recoverable': (None if recover_eval_recoverable is None else bool(recover_eval_recoverable)),
                 'mode': recover_eval_mode,
                 'metric_name': recover_eval_metric_name,
                 'metric': (None if recover_eval_metric is None else float(recover_eval_metric)),
@@ -783,21 +991,24 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         if debug_dir is not None:
             _dbg_rollout.append({
                 'step': step, 't_star': int(t_star), 'min_dist': float(min_dist),
-                'min_dist_start': float(min_dist_start),
                 'progress': float(progress), 'phase_key': phase_key,
                 'active_left_arm': bool(active_info.get('left_arm', True)),
                 'active_right_arm': bool(active_info.get('right_arm', True)),
                 'active_left_gripper': bool(active_info.get('left_gripper', True)),
                 'active_right_gripper': bool(active_info.get('right_gripper', True)),
-                'active_left_arm_score': float(active_info.get('left_arm_score', 0.0)),
-                'active_right_arm_score': float(active_info.get('right_arm_score', 0.0)),
                 'fk_left_pos': lp.tolist(), 'fk_right_pos': rp.tolist(),
                 'left_grip': float(left_grip), 'right_grip': float(right_grip),
                 'action_perturbed': bool(perturbed),
                 'perturb_mode': pert_mode,
                 'sampled_error_mode': sampled_error_mode,
-                'perturb_mag_scale': (
-                    None if perturb_mag_scale is None else float(perturb_mag_scale)
+                'perturb_dir_bin_id': (
+                    None if perturb_dir_bin_id is None else int(perturb_dir_bin_id)
+                ),
+                'perturb_mag_bin_id': (
+                    None if perturb_mag_bin_id is None else int(perturb_mag_bin_id)
+                ),
+                'perturb_axis_bin_id': (
+                    None if perturb_axis_bin_id is None else int(perturb_axis_bin_id)
                 ),
                 'perturb_translation_gain_m': (
                     None if perturb_translation_gain_m is None else float(perturb_translation_gain_m)
@@ -809,8 +1020,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'perturb_dir_right': perturb_dir_right,
                 'perturb_axis_left': perturb_axis_left,
                 'perturb_axis_right': perturb_axis_right,
-                'act_chunk_raw_first': act_raw[0].tolist(),
-                'act_chunk_raw_last': act_raw[-1].tolist(),
                 'rollout_exec_len': int(len(act_raw)),
                 'recover_eval_enable': bool(recover_eval_enable),
                 'recover_eval_mode': recover_eval_mode,
@@ -829,9 +1038,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 ),
                 'recover_eval_gt_ref_idx': (
                     None if recover_eval_gt_ref_idx is None else int(recover_eval_gt_ref_idx)
-                ),
-                'recover_eval_nearest_idx': (
-                    None if recover_eval_nearest_idx is None else int(recover_eval_nearest_idx)
                 ),
                 'recover_eval_nearest_dist': (
                     None if recover_eval_nearest_dist is None else float(recover_eval_nearest_dist)
@@ -855,17 +1061,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'reason': 'correction_force_generate',
                 'max_rollout_steps': int(max_steps),
             })
-    if recover_eval_enable and recover_eval_use_for_trigger and recover_eval_any:
-        force_generate_correction = False
-        if debug_dir is not None:
-            _dbg_rollout.append({
-                'step': int(max_steps_eff),
-                'reason': 'recover_eval_skip_correction',
-                'recover_eval_first_step': (
-                    None if recover_eval_first_step is None else int(recover_eval_first_step)
-                ),
-            })
-
     # IMPORTANT: correction planning must start from post-rollout state.
     # `left_q/right_q` inside rollout loop are sampled before executing act_raw,
     # so refresh them from `curr_qpos_raw` here.
@@ -889,24 +1084,103 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             os.makedirs(_dbg_corr, exist_ok=True)
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                 _skip_reason = (
-                    'recover_eval_recoverable'
-                    if (recover_eval_enable and recover_eval_use_for_trigger and recover_eval_any)
-                    else 'correction_not_forced'
+                    'correction_not_forced'
+                )
+                def _fmt_vec3(v):
+                    if v is None:
+                        return "None"
+                    arr = np.asarray(v, dtype=np.float32).reshape(-1)
+                    if arr.size < 3:
+                        return "None"
+                    return f"({arr[0]:+.3f}, {arr[1]:+.3f}, {arr[2]:+.3f})"
+
+                def _mk_perturb_nl(_r):
+                    mode = _r.get('sampled_error_mode')
+                    if mode is None:
+                        return "未施加扰动（sampled_error_mode=None）"
+                    mode = str(mode)
+                    if mode == 'translation':
+                        return (
+                            f"平移扰动: gain={_r.get('perturb_translation_gain_m')} m, "
+                            f"left_dir={_fmt_vec3(_r.get('perturb_dir_left'))}, "
+                            f"right_dir={_fmt_vec3(_r.get('perturb_dir_right'))}"
+                        )
+                    if mode == 'rotation':
+                        return (
+                            f"旋转扰动: angle={_r.get('perturb_rotation_deg')} deg, "
+                            f"left_axis={_fmt_vec3(_r.get('perturb_axis_left'))}, "
+                            f"right_axis={_fmt_vec3(_r.get('perturb_axis_right'))}"
+                        )
+                    if mode == 'gripper_close':
+                        return "夹爪闭合扰动（arm 保持当前关节，夹爪向 0 收拢）"
+                    return f"扰动模式={mode}"
+
+                _rollout_skip = []
+                for _r in _dbg_rollout:
+                    _rr = dict(_r)
+                    _rr.pop('perturb_dir_bin_id', None)
+                    _rr.pop('perturb_mag_bin_id', None)
+                    _rr.pop('perturb_axis_bin_id', None)
+                    _rr['perturb_nl'] = _mk_perturb_nl(_rr)
+                    _rollout_skip.append(_rr)
+                gt_projection_meta = _save_gt_projection_on_original(
+                    _dbg_corr,
+                    image_data_s,
+                    raw_data,
+                    start_ts,
+                    rollout_steps_total,
+                    phase_window_len,
                 )
                 json.dump({
                     'reason': _skip_reason,
+                    'sampled_unit': sampled_unit,
                     'min_dist': float(min_dist),
-                    'threshold': None,
                     'recover_eval_enable': bool(recover_eval_enable),
-                    'recover_eval_use_for_trigger': bool(recover_eval_use_for_trigger),
-                    'recover_eval_any': bool(recover_eval_any),
-                    'recover_eval_first_step': (
-                        None if recover_eval_first_step is None else int(recover_eval_first_step)
+                    'recover_eval_any_unrecoverable': bool(recover_eval_any_unrecoverable),
+                    'recover_eval_first_unrecoverable_step': (
+                        None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
                     ),
                     'recover_eval_last': recover_eval_last,
-                    'rollout': _dbg_rollout
+                    'gt_projection_on_original': gt_projection_meta,
+                    'rollout': _rollout_skip
                 }, _f, indent=2)
-        return None
+        if nearest_mode == "gripper_close":
+            correction_branch = "gripper_close"
+        elif nearest_mode == "translation":
+            correction_branch = "translation"
+        elif nearest_mode == "rotation":
+            correction_branch = "rotation"
+        else:
+            correction_branch = "unsupported"
+
+        sampled_error_mode = None
+        if isinstance(dyn_state, dict):
+            sampled_error_mode = dyn_state.get("error_mode")
+        error_action_prefix_raw = None if act_raw is None else np.asarray(act_raw, dtype=np.float32).copy()
+        corr_meta = {
+            "correction_generated": False,
+            "closed_loop_fallback_used": False,
+            "correction_branch": correction_branch,
+            "sampled_error_mode": sampled_error_mode,
+            "forced_error_mode": forced_error_mode_key,
+            "sampled_phase_bin_id": phase_bin_fixed,
+            "sampled_phase_instance_idx": phase_instance_fixed,
+            "sampled_active_arm_pattern": sampled_active_arm_pattern_key,
+            "forced_dir_bin_id": forced_dir_bin_fixed,
+            "forced_mag_bin_id": forced_mag_bin_fixed,
+            "nearest_mode": nearest_mode,
+            "rollout_exec_steps": int(rollout_exec_steps),
+            "t_star": int(t_star),
+            "min_dist": float(min_dist),
+            "recover_eval_enable": bool(recover_eval_enable),
+            "recover_eval_any_unrecoverable": bool(recover_eval_any_unrecoverable),
+            "recover_eval_first_unrecoverable_step": (
+                None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
+            ),
+            "recover_eval_last": recover_eval_last,
+            "error_action_prefix_raw": error_action_prefix_raw,
+        }
+        return (None, None, None, None, corr_meta)
 
     gt_left_arm = raw_data.get('gt_left_arm', None)
     gt_right_arm = raw_data.get('gt_right_arm', None)
@@ -1042,6 +1316,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                         json.dump({
                             'reason': f'{_recover_mode}_recover_planner_exception_left',
+                            'sampled_unit': sampled_unit,
                             'error': str(exc),
                             't_star': int(t_star),
                             'min_dist': float(min_dist),
@@ -1056,6 +1331,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                         json.dump({
                             'reason': f'{_recover_mode}_recover_planner_status_fail_left',
+                            'sampled_unit': sampled_unit,
                             'planner_left_status': res_l.get('status'),
                             't_star': int(t_star),
                             'min_dist': float(min_dist),
@@ -1077,6 +1353,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                         json.dump({
                             'reason': f'{_recover_mode}_recover_planner_exception_right',
+                            'sampled_unit': sampled_unit,
                             'error': str(exc),
                             't_star': int(t_star),
                             'min_dist': float(min_dist),
@@ -1091,6 +1368,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                         json.dump({
                             'reason': f'{_recover_mode}_recover_planner_status_fail_right',
+                            'sampled_unit': sampled_unit,
                             'planner_right_status': res_r.get('status'),
                             't_star': int(t_star),
                             'min_dist': float(min_dist),
@@ -1133,6 +1411,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
                 json.dump({
                     'reason': 'unsupported_nearest_mode',
+                    'sampled_unit': sampled_unit,
                     'nearest_mode': str(nearest_mode),
                     't_star': int(t_star),
                     'min_dist': float(min_dist),
@@ -1482,34 +1761,14 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     return None
                 return np.stack(pose_list, axis=0)
 
-            # Phase-colored GT trajectory projection (reuse current phase judging logic).
-            # Draw downsampled GT path on the full episode timeline.
-            n_ep_total = int(raw_data['left_endpose'].shape[0])
-            full_left_grip = np.asarray(raw_data['left_gripper'], dtype=np.float32).reshape(-1)
-            full_right_grip = np.asarray(raw_data['right_gripper'], dtype=np.float32).reshape(-1)
-            phase_raw_idx = []
-            phase_seq = []
-            if n_ep_total > 1:
-                stride = int(max(1, n_ep_total // 240))
-                for raw_idx in range(0, n_ep_total, stride):
-                    ph = _infer_phase_key_from_gt_window(
-                        full_left_grip[raw_idx:],
-                        full_right_grip[raw_idx:],
-                        phase_window_len,
-                    )
-                    phase_raw_idx.append(raw_idx)
-                    phase_seq.append(ph)
-                if len(phase_raw_idx) >= 2:
-                    phase_pose_np = _build_pose_np_from_raw_indices(phase_raw_idx)
-                    if phase_pose_np is not None:
-                        p_uvs_l, p_uvs_r, p_pts_l, p_pts_r = _project_base_uv_from_pose_np(phase_pose_np)
-                        p_l_seq = _extract_base_uv(p_uvs_l, p_pts_l.reshape(1, p_pts_l.shape[1], 4, 4))
-                        p_r_seq = _extract_base_uv(p_uvs_r, p_pts_r.reshape(1, p_pts_r.shape[1], 4, 4))
-                        _draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
-                        _draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
-                        _draw_phase_polyline(_overlay_c, p_l_seq, phase_seq, width=1)
-                        _draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
-                        _draw_phase_legend(_overlay_gt)
+            # Phase-colored GT trajectory projection (shared with skip/debug path).
+            p_l_seq, p_r_seq, phase_seq = _shared_compute_phase_projection(raw_data, phase_window_len, K, E)
+            if p_l_seq is not None and p_r_seq is not None and phase_seq is not None:
+                _shared_draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
+                _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
+                _shared_draw_phase_polyline(_overlay_c, p_l_seq, phase_seq, width=1)
+                _shared_draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
+                _shared_draw_phase_legend(_overlay_gt)
 
             # Corrected overlay: keep only correction trajectories + phase-colored GT path.
             _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
@@ -1621,12 +1880,17 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'step': (None if _step is None else int(_step)),
                 't_star': (None if _r.get('t_star') is None else int(_r.get('t_star'))),
                 'min_dist': (None if _r.get('min_dist') is None else float(_r.get('min_dist'))),
-                'min_dist_start': (None if _r.get('min_dist_start') is None else float(_r.get('min_dist_start'))),
                 'phase_key': _r.get('phase_key'),
                 'perturb_mode': _r.get('perturb_mode'),
                 'sampled_error_mode': _r.get('sampled_error_mode'),
-                'perturb_mag_scale': (
-                    None if _r.get('perturb_mag_scale') is None else float(_r.get('perturb_mag_scale'))
+                'perturb_dir_bin_id': (
+                    None if _r.get('perturb_dir_bin_id') is None else int(_r.get('perturb_dir_bin_id'))
+                ),
+                'perturb_mag_bin_id': (
+                    None if _r.get('perturb_mag_bin_id') is None else int(_r.get('perturb_mag_bin_id'))
+                ),
+                'perturb_axis_bin_id': (
+                    None if _r.get('perturb_axis_bin_id') is None else int(_r.get('perturb_axis_bin_id'))
                 ),
                 'perturb_translation_gain_m': (
                     None if _r.get('perturb_translation_gain_m') is None else float(_r.get('perturb_translation_gain_m'))
@@ -1642,8 +1906,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'active_right_arm': bool(_r.get('active_right_arm', True)),
                 'active_left_gripper': bool(_r.get('active_left_gripper', True)),
                 'active_right_gripper': bool(_r.get('active_right_gripper', True)),
-                'active_left_arm_score': (None if _r.get('active_left_arm_score') is None else float(_r.get('active_left_arm_score'))),
-                'active_right_arm_score': (None if _r.get('active_right_arm_score') is None else float(_r.get('active_right_arm_score'))),
                 'action_perturbed': bool(_r.get('action_perturbed', False)),
                 'left_grip': (None if _r.get('left_grip') is None else float(_r.get('left_grip'))),
                 'right_grip': (None if _r.get('right_grip') is None else float(_r.get('right_grip'))),
@@ -1665,9 +1927,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 ),
                 'recover_eval_gt_ref_idx': (
                     None if _r.get('recover_eval_gt_ref_idx') is None else int(_r.get('recover_eval_gt_ref_idx'))
-                ),
-                'recover_eval_nearest_idx': (
-                    None if _r.get('recover_eval_nearest_idx') is None else int(_r.get('recover_eval_nearest_idx'))
                 ),
                 'recover_eval_nearest_dist': (
                     None if _r.get('recover_eval_nearest_dist') is None else float(_r.get('recover_eval_nearest_dist'))
@@ -1695,10 +1954,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             },
             'recover_eval_summary': {
                 'enable': bool(recover_eval_enable),
-                'use_for_trigger': bool(recover_eval_use_for_trigger),
-                'any_recoverable': bool(recover_eval_any),
-                'first_recoverable_step': (
-                    None if recover_eval_first_step is None else int(recover_eval_first_step)
+                'any_unrecoverable': bool(recover_eval_any_unrecoverable),
+                'first_unrecoverable_step': (
+                    None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
                 ),
                 'last': recover_eval_last,
                 'projection_on_corrected': recover_eval_proj_meta,
@@ -1733,7 +1991,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'action_perturbed': _r.get('action_perturbed'),
                 'perturb_mode': _r.get('perturb_mode'),
                 'sampled_error_mode': _r.get('sampled_error_mode'),
-                'perturb_mag_scale': _r.get('perturb_mag_scale'),
+                'perturb_dir_bin_id': _r.get('perturb_dir_bin_id'),
+                'perturb_mag_bin_id': _r.get('perturb_mag_bin_id'),
+                'perturb_axis_bin_id': _r.get('perturb_axis_bin_id'),
                 'perturb_translation_gain_m': _r.get('perturb_translation_gain_m'),
                 'perturb_rotation_deg': _r.get('perturb_rotation_deg'),
                 'perturb_dir_left': _r.get('perturb_dir_left'),
@@ -1746,7 +2006,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'recover_eval_metric': _r.get('recover_eval_metric'),
                 'recover_eval_threshold': _r.get('recover_eval_threshold'),
                 'recover_eval_gt_ref_idx': _r.get('recover_eval_gt_ref_idx'),
-                'recover_eval_nearest_idx': _r.get('recover_eval_nearest_idx'),
                 'recover_eval_nearest_dist': _r.get('recover_eval_nearest_dist'),
                 'recover_eval_window_start': _r.get('recover_eval_window_start'),
                 'recover_eval_window_end': _r.get('recover_eval_window_end'),
@@ -1765,10 +2024,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             },
             'recover_eval_summary': {
                 'enable': bool(recover_eval_enable),
-                'use_for_trigger': bool(recover_eval_use_for_trigger),
-                'any_recoverable': bool(recover_eval_any),
-                'first_recoverable_step': (
-                    None if recover_eval_first_step is None else int(recover_eval_first_step)
+                'any_unrecoverable': bool(recover_eval_any_unrecoverable),
+                'first_unrecoverable_step': (
+                    None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
                 ),
                 'last': recover_eval_last,
             },
@@ -1807,10 +2065,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "t_star": int(t_star),
         "min_dist": float(min_dist),
         "recover_eval_enable": bool(recover_eval_enable),
-        "recover_eval_use_for_trigger": bool(recover_eval_use_for_trigger),
-        "recover_eval_any": bool(recover_eval_any),
-        "recover_eval_first_step": (
-            None if recover_eval_first_step is None else int(recover_eval_first_step)
+        "recover_eval_any_unrecoverable": bool(recover_eval_any_unrecoverable),
+        "recover_eval_first_unrecoverable_step": (
+            None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
         ),
         "recover_eval_last": recover_eval_last,
         "error_action_prefix_raw": error_action_prefix_raw,

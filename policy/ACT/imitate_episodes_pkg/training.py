@@ -8,6 +8,7 @@ import json
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from torch.utils.tensorboard import SummaryWriter
@@ -146,11 +147,7 @@ def main(args):
     enable_wm = args['enable_wm_correction']
     start_margin = 0
     sample_skip_head_ratio = float(args['sample_skip_head_ratio'])
-    sample_pregrasp_bias_enable = bool(args['sample_pregrasp_bias_enable'])
-    sample_pregrasp_prob = float(args['sample_pregrasp_prob'])
     sample_phase_window_len = int(args['sample_phase_window_len'])
-    sample_pregrasp_keep_start_ratio = float(args['sample_pregrasp_keep_start_ratio'])
-    sample_pregrasp_keep_end_ratio = float(args['sample_pregrasp_keep_end_ratio'])
     failure_mode = str(args.get('failure_mode', 'off')).strip().lower()
     if failure_mode not in {'off', 'explore', 'train'}:
         raise ValueError(f"Invalid failure_mode={failure_mode!r}, expected off|explore|train")
@@ -160,6 +157,7 @@ def main(args):
     failure_translation_mag_bins = int(max(1, int(args.get('failure_translation_mag_bins', 3))))
     failure_rotation_dir_bins = int(max(1, int(args.get('failure_rotation_dir_bins', 6))))
     failure_rotation_mag_bins = int(max(1, int(args.get('failure_rotation_mag_bins', 3))))
+    failure_explore_k = int(max(1, int(args.get('failure_explore_k', 3))))
     failure_corr_batch_ratio = float(max(0.0, args.get('failure_corr_batch_ratio', 0.5)))
     failure_param_cfg = set_failure_param_bins(
         translation_dir_bins=failure_translation_dir_bins,
@@ -168,22 +166,10 @@ def main(args):
         rotation_mag_bins=failure_rotation_mag_bins,
     )
     print(f"[main][rank={_rank}] failure_param_bins={failure_param_cfg}")
-    wm_corr_pregrasp_extra_enable = bool(args['wm_corr_pregrasp_extra_enable'])
-    wm_corr_pregrasp_extra_ratio = float(np.clip(args['wm_corr_pregrasp_extra_ratio'], 0.0, 1.0))
-    sample_pregrasp_close_offset_steps = None
-    if args.get('rollout_exec_steps', None) is not None:
-        _off = int(args['rollout_exec_steps'])
-        if _off > 0:
-            sample_pregrasp_close_offset_steps = _off
-    # Keep pregrasp-biased sampling strictly behind the WM switch.
-    # When WM is disabled, training should follow plain random start sampling.
+    # Legacy pregrasp-bias / extra-pregrasp-correction path is retired.
+    # Sampling is driven by failure table (explore/train) or plain random sampling (off).
     if not enable_wm:
         sample_skip_head_ratio = 0.0
-        sample_pregrasp_bias_enable = False
-        sample_pregrasp_prob = 0.0
-        wm_corr_pregrasp_extra_enable = False
-        wm_corr_pregrasp_extra_ratio = 0.0
-        sample_pregrasp_close_offset_steps = None
         if failure_mode in {'explore', 'train'}:
             raise ValueError("failure_mode requires --enable_wm_correction")
     if enable_wm:
@@ -204,44 +190,56 @@ def main(args):
     raw_data_dir = args['raw_data_dir'] if enable_wm else None
     print(f"[main][rank={_rank}] before load_data | dataset_dir={dataset_dir} | num_episodes={num_episodes} | start_margin={start_margin}")
     _t_load = time.time()
-    use_failure_corr_loader = bool(enable_wm and failure_mode in {'explore', 'train'})
-    use_extra_pregrasp_corr = bool(enable_wm and wm_corr_pregrasp_extra_enable and wm_corr_pregrasp_extra_ratio > 0.0)
-    base_pregrasp_bias_enable = bool(sample_pregrasp_bias_enable)
-    base_pregrasp_prob = float(sample_pregrasp_prob)
+    use_failure_explore_loader = bool(enable_wm and failure_mode == 'explore')
+    use_failure_corr_loader = bool(enable_wm and failure_mode == 'train')
     base_sample_skip_head_ratio = 0.0 if enable_wm else float(sample_skip_head_ratio)
-    if use_extra_pregrasp_corr:
-        # Main batch follows normal sampling (same as no-WM), correction batch is separate.
-        base_pregrasp_bias_enable = False
-        base_pregrasp_prob = 0.0
 
-    train_dataloader, _, stats, _, max_action_len = load_data(
-        dataset_dir,
-        num_episodes,
-        camera_names,
-        batch_size_train,
-        batch_size_train,
-        raw_data_dir=raw_data_dir,
-        start_margin=start_margin,
-        sample_skip_head_ratio=base_sample_skip_head_ratio,
-        sample_pregrasp_bias_enable=base_pregrasp_bias_enable,
-        sample_pregrasp_prob=base_pregrasp_prob,
-        sample_phase_window_len=sample_phase_window_len,
-        sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-        sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-        sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
-        failure_mode='off',
-        failure_table_path='',
-        failure_phase_bins=failure_phase_bins,
-        dataset_dirs=dataset_dirs,
-        num_episodes_list=num_episodes_list,
-        task_weights=multi_task_weights,
-    )
     corr_train_dataloader = None
+    if use_failure_explore_loader:
+        explore_batch_size = int(max(1, int(batch_size_train)))
+        train_dataloader, _, stats, _, max_action_len = load_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            explore_batch_size,
+            explore_batch_size,
+            raw_data_dir=raw_data_dir,
+            start_margin=start_margin,
+            sample_skip_head_ratio=sample_skip_head_ratio,
+            sample_phase_window_len=sample_phase_window_len,
+            failure_mode=failure_mode,
+            failure_table_path=failure_table_path,
+            failure_phase_bins=failure_phase_bins,
+            failure_explore_k=failure_explore_k,
+            dataset_dirs=dataset_dirs,
+            num_episodes_list=num_episodes_list,
+            task_weights=multi_task_weights,
+        )
+        print(
+            f"[main][rank={_rank}] failure explore mode enabled (single explore loader) | "
+            f"batch_size={explore_batch_size}"
+        )
+    else:
+        train_dataloader, _, stats, _, max_action_len = load_data(
+            dataset_dir,
+            num_episodes,
+            camera_names,
+            batch_size_train,
+            batch_size_train,
+            raw_data_dir=raw_data_dir,
+            start_margin=start_margin,
+            sample_skip_head_ratio=base_sample_skip_head_ratio,
+            sample_phase_window_len=sample_phase_window_len,
+            failure_mode='off',
+            failure_table_path='',
+            failure_phase_bins=failure_phase_bins,
+            failure_explore_k=failure_explore_k,
+            dataset_dirs=dataset_dirs,
+            num_episodes_list=num_episodes_list,
+            task_weights=multi_task_weights,
+        )
     if use_failure_corr_loader:
-        if failure_mode == 'explore':
-            corr_batch_size = int(max(1, int(batch_size_train)))
-        else:
-            corr_batch_size = int(max(1, round(float(batch_size_train) * float(failure_corr_batch_ratio))))
+        corr_batch_size = int(max(1, round(float(batch_size_train) * float(failure_corr_batch_ratio))))
         corr_train_dataloader, _, _, _, _ = load_data(
             dataset_dir,
             num_episodes,
@@ -251,15 +249,11 @@ def main(args):
             raw_data_dir=raw_data_dir,
             start_margin=start_margin,
             sample_skip_head_ratio=sample_skip_head_ratio,
-            sample_pregrasp_bias_enable=False,
-            sample_pregrasp_prob=0.0,
             sample_phase_window_len=sample_phase_window_len,
-            sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-            sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-            sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
             failure_mode=failure_mode,
             failure_table_path=failure_table_path,
             failure_phase_bins=failure_phase_bins,
+            failure_explore_k=failure_explore_k,
             dataset_dirs=dataset_dirs,
             num_episodes_list=num_episodes_list,
             task_weights=multi_task_weights,
@@ -268,31 +262,6 @@ def main(args):
             f"[main][rank={_rank}] failure-mode correction dataloader enabled | "
             f"mode={failure_mode} | corr_batch_size={corr_batch_size}"
         )
-    elif use_extra_pregrasp_corr:
-        corr_batch_size = int(max(1, round(float(batch_size_train) * float(wm_corr_pregrasp_extra_ratio))))
-        corr_train_dataloader, _, _, _, _ = load_data(
-            dataset_dir,
-            num_episodes,
-            camera_names,
-            corr_batch_size,
-            corr_batch_size,
-            raw_data_dir=raw_data_dir,
-            start_margin=start_margin,
-            sample_skip_head_ratio=sample_skip_head_ratio,
-            sample_pregrasp_bias_enable=True,
-            sample_pregrasp_prob=1.0,
-            sample_phase_window_len=sample_phase_window_len,
-            sample_pregrasp_keep_start_ratio=sample_pregrasp_keep_start_ratio,
-            sample_pregrasp_keep_end_ratio=sample_pregrasp_keep_end_ratio,
-            sample_pregrasp_close_offset_steps=sample_pregrasp_close_offset_steps,
-            failure_mode='off',
-            failure_table_path='',
-            failure_phase_bins=failure_phase_bins,
-            dataset_dirs=dataset_dirs,
-            num_episodes_list=num_episodes_list,
-            task_weights=multi_task_weights,
-        )
-        print(f"[main][rank={_rank}] extra pregrasp correction dataloader enabled | corr_batch_size={corr_batch_size}")
     print(f"[main][rank={_rank}] after load_data | elapsed={time.time() - _t_load:.2f}s | max_action_len={max_action_len}")
 
     # save dataset stats
@@ -323,11 +292,10 @@ def main(args):
             rollout_exec_steps = int(args['chunk_size'])
         config['correction_cfg'] = {
             'max_rollout_steps': args['max_rollout_steps'],
-            'correction_force_generate': args['correction_force_generate'],
+            'correction_force_generate': bool(failure_mode == 'train'),
             'debug_correction_evac_rollout': args.get('debug_correction_evac_rollout', False),
             'rollout_exec_steps': int(rollout_exec_steps),
             'recover_eval_enable': bool(args.get('recover_eval_enable', False)),
-            'recover_eval_use_for_trigger': bool(args.get('recover_eval_use_for_trigger', False)),
             'recover_eval_save_video': bool(args.get('recover_eval_save_video', False)),
             'recover_eval_gripper_open_thresh': float(args.get('recover_eval_gripper_open_thresh', 0.8)),
             'recover_eval_pos_thresh_m': float(args.get('recover_eval_pos_thresh_m', 0.03)),
@@ -339,12 +307,8 @@ def main(args):
             'orient_weight': args['orient_weight'],
             'gripper_penalty': args['gripper_penalty'],
             'evac_infer_kwargs': build_evac_infer_kwargs(args),
-            'enable_perturb': args['enable_perturb'],
-            'perturb_prob': args['perturb_prob'],
-            'perturb_error_mode': args['perturb_error_mode'],
-            'perturb_open_laptop_pregrasp_close_prob': args['perturb_open_laptop_pregrasp_close_prob'],
-            'perturb_open_laptop_pregrasp_translation_prob': args['perturb_open_laptop_pregrasp_translation_prob'],
-            'perturb_open_laptop_pregrasp_rotation_prob': args['perturb_open_laptop_pregrasp_rotation_prob'],
+            # Perturbation is driven by failure_mode only.
+            'enable_perturb': bool(failure_mode in {'explore', 'train'}),
             'perturb_eef_fail_gain': args['perturb_eef_fail_gain'],
             'perturb_rot_max_deg': args['perturb_rot_max_deg'],
             'perturb_active_joint_delta_thresh': args['perturb_active_joint_delta_thresh'],
@@ -355,7 +319,6 @@ def main(args):
         }
         if failure_mode == 'explore':
             config['correction_cfg']['recover_eval_enable'] = True
-            config['correction_cfg']['recover_eval_use_for_trigger'] = False
     config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
     config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
@@ -444,6 +407,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     failure_table_dir = str(config.get("failure_table_dir", "")).strip()
     if failure_table_dir == "":
         failure_table_dir = os.path.join(ckpt_dir, "failure_explore")
+    failure_live_dump_interval = 20
 
     # Accelerate: prepare model, optimizer, dataloader
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -493,6 +457,149 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                    'n_fallback': 0}
     _failure_trials = []
     _failure_stats = {}
+
+    def _build_failure_entries(trials):
+        stats = {}
+        for t in trials:
+            try:
+                key = (
+                    str(t["phase_key"]),
+                    int(t["phase_instance_idx"]),
+                    int(t["phase_bin_id"]),
+                    str(t["error_mode"]),
+                    str(t["active_arm_pattern"]),
+                    int(t["dir_bin_id"]),
+                    int(t["mag_bin_id"]),
+                )
+                sample_uid = (int(t["episode_id"]), int(t["start_ts"]))
+                recoverable = bool(t.get("recoverable", False))
+            except Exception:
+                continue
+            if key not in stats:
+                stats[key] = {}
+            if sample_uid not in stats[key]:
+                stats[key][sample_uid] = bool(recoverable)
+
+        entries = []
+        for key, sample_map in sorted(stats.items()):
+            phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
+            n = int(len(sample_map))
+            if n < failure_explore_k:
+                continue
+            n_recover = int(sum(1 for _v in sample_map.values() if bool(_v)))
+            recover_rate = float(n_recover) / float(max(1, n))
+            fail_flag = bool(recover_rate <= float(failure_fail_thresh))
+            if not fail_flag:
+                continue
+            entries.append(
+                {
+                    "phase_key": str(phase_key),
+                    "phase_instance_idx": int(phase_instance_idx),
+                    "phase_bin_id": int(phase_bin_id),
+                    "error_mode": str(error_mode),
+                    "active_arm_pattern": str(active_arm_pattern),
+                    "dir_bin_id": int(dir_bin_id),
+                    "mag_bin_id": int(mag_bin_id),
+                    "n_trials": int(n),
+                    "n_recover": int(n_recover),
+                    "recover_rate": float(recover_rate),
+                    "fail_rate": float(1.0 - recover_rate),
+                    "weight": float(max(1e-6, 1.0 - recover_rate)),
+                }
+            )
+        return entries
+
+    def _gather_failure_trials_all_ranks():
+        local_trials = list(_failure_trials)
+        if not (dist.is_available() and dist.is_initialized()):
+            return local_trials
+        ws = int(dist.get_world_size())
+        gathered = [None for _ in range(ws)]
+        dist.all_gather_object(gathered, local_trials)
+        merged = []
+        for g in gathered:
+            if isinstance(g, list):
+                merged.extend(g)
+        return merged
+
+    def _write_failure_tables(epoch_idx, live=False):
+        if not failure_explore_mode:
+            return
+        all_trials = _gather_failure_trials_all_ranks()
+        if not accelerator.is_main_process:
+            return
+        os.makedirs(failure_table_dir, exist_ok=True)
+        trials_path = os.path.join(
+            failure_table_dir,
+            ("failure_trials_live.json" if live else f"failure_trials_epoch_{epoch_idx + 1:04d}.json"),
+        )
+        with open(trials_path, "w") as f:
+            json.dump(all_trials, f, indent=2)
+
+        entries = _build_failure_entries(all_trials)
+        table = {
+            "version": 3,
+            "mode": ("explore_live" if live else "explore"),
+            "epoch": int(epoch_idx + 1),
+            "failure_phase_bins": int(config.get("failure_phase_bins", 5)),
+            "failure_translation_dir_bins": int(config.get("failure_translation_dir_bins", 5)),
+            "failure_translation_mag_bins": int(config.get("failure_translation_mag_bins", 3)),
+            "failure_rotation_dir_bins": int(config.get("failure_rotation_dir_bins", 6)),
+            "failure_rotation_mag_bins": int(config.get("failure_rotation_mag_bins", 3)),
+            "failure_explore_k": int(failure_explore_k),
+            "failure_fail_recover_rate_thresh": float(failure_fail_thresh),
+            "entries": entries,
+        }
+        table_path = os.path.join(
+            failure_table_dir,
+            ("failure_table_live.json" if live else "failure_table.json"),
+        )
+        with open(table_path, "w") as f:
+            json.dump(table, f, indent=2)
+
+        for mode in ("translation", "rotation", "gripper_close"):
+            table_mode = dict(table)
+            table_mode["entries"] = [e for e in entries if str(e.get("error_mode", "")) == mode]
+            mode_path = os.path.join(
+                failure_table_dir,
+                (f"failure_table_live_{mode}.json" if live else f"failure_table_{mode}.json"),
+            )
+            with open(mode_path, "w") as f:
+                json.dump(table_mode, f, indent=2)
+
+        if not live:
+            print(
+                f"[failure_explore] epoch={epoch_idx + 1} trials={len(all_trials)} "
+                f"failure_entries={len(entries)} table={table_path}"
+            )
+
+    def _iter_leaf_datasets(ds):
+        if ds is None:
+            return
+        if hasattr(ds, "datasets"):
+            for _sub in ds.datasets:
+                yield from _iter_leaf_datasets(_sub)
+            return
+        if hasattr(ds, "dataset"):
+            yield from _iter_leaf_datasets(ds.dataset)
+            return
+        yield ds
+
+    def _set_explore_unit_idx_for_loader(loader, unit_idx):
+        if loader is None:
+            return
+        ds = getattr(loader, "dataset", None)
+        for leaf in _iter_leaf_datasets(ds):
+            if hasattr(leaf, "set_explore_unit_idx"):
+                leaf.set_explore_unit_idx(int(unit_idx))
+
+    def _get_explore_num_units(loader):
+        ds = getattr(loader, "dataset", None)
+        for leaf in _iter_leaf_datasets(ds):
+            if hasattr(leaf, "_explore_units"):
+                return int(len(getattr(leaf, "_explore_units")))
+        return 0
+
     if enable_wm:
         print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
         _t_init_corr = time.time()
@@ -522,6 +629,11 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         if failure_explore_mode:
             os.makedirs(failure_table_dir, exist_ok=True)
     global_step = 0
+    explore_unit_idx = 0
+    explore_unit_seen_global = set()
+    explore_num_units = int(_get_explore_num_units(train_dataloader)) if failure_explore_mode else 0
+    if failure_explore_mode and explore_num_units > 0:
+        _set_explore_unit_idx_for_loader(train_dataloader, explore_unit_idx)
 
     for epoch in tqdm(range(num_epochs), disable=not accelerator.is_main_process):
         if accelerator.is_main_process:
@@ -532,6 +644,19 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
+            if failure_explore_mode:
+                # Switch unit at step boundary so logs align with human expectation:
+                # once current unit has enough global unique samples, next step starts with next unit.
+                if accelerator.is_main_process and explore_num_units > 0:
+                    if len(explore_unit_seen_global) >= int(failure_explore_k):
+                        explore_unit_idx = (int(explore_unit_idx) + 1) % int(explore_num_units)
+                        explore_unit_seen_global = set()
+                if dist.is_available() and dist.is_initialized():
+                    _idx_t = torch.tensor([int(explore_unit_idx)], device=accelerator.device, dtype=torch.int64)
+                    dist.broadcast(_idx_t, src=0)
+                    explore_unit_idx = int(_idx_t.item())
+                _set_explore_unit_idx_for_loader(train_dataloader, int(explore_unit_idx))
+
             apply_wm = enable_wm and correction_modules is not None
             if not apply_wm:
                 forward_dict = forward_pass(data, policy)
@@ -549,6 +674,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                     bs_base = int(data[0].shape[0])
                     corr_images, corr_qpos, corr_actions, corr_pads = [], [], [], []
                     corr_mask = []
+                    local_unit_sample_uids = set()
                     # per-step debug dir (only on main process, only every 100 steps)
                     _step_dbg = None
                     if debug_wm_dir and accelerator.is_main_process:
@@ -589,37 +715,46 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             ),
                         )
                         _corr_stats['n_triggered'] += 1
-                        if corr is not None:
-                            if isinstance(corr, (tuple, list)) and len(corr) >= 5:
+                        ci, cq, ca, cp = None, None, None, None
+                        cmeta = {}
+                        if isinstance(corr, (tuple, list)):
+                            if len(corr) >= 5:
                                 ci, cq, ca, cp, cmeta = corr
-                            else:
-                                ci, cq, ca, cp = corr
-                                cmeta = {}
-                            corr_images.append(ci)
-                            corr_qpos.append(cq)
-                            corr_actions.append(ca)
-                            corr_pads.append(cp)
-                            corr_mask.append(1.0)
-                            _corr_stats['n_success'] += 1
-                            if isinstance(cmeta, dict):
-                                if bool(cmeta.get('closed_loop_fallback_used', False)):
-                                    _corr_stats['n_fallback'] += 1
-                                if failure_explore_mode:
-                                    phase_key = phase_id_to_key(int(corr_source[6][bi].item()))
-                                    phase_bin_id = int(corr_source[9][bi].item()) if len(corr_source) > 9 else -1
-                                    phase_instance_idx = int(corr_source[10][bi].item()) if len(corr_source) > 10 else -1
-                                    forced_mode_id = int(corr_source[11][bi].item()) if len(corr_source) > 11 else -1
-                                    active_pattern_id = int(corr_source[12][bi].item()) if len(corr_source) > 12 else -1
-                                    dir_bin_id = int(corr_source[13][bi].item()) if len(corr_source) > 13 else -1
-                                    mag_bin_id = int(corr_source[14][bi].item()) if len(corr_source) > 14 else -1
-                                    forced_mode_key = None
-                                    if forced_mode_id >= 0:
-                                        forced_mode_key = error_mode_id_to_key(forced_mode_id)
-                                    active_pattern_key = "both"
-                                    if active_pattern_id >= 0:
-                                        active_pattern_key = active_arm_pattern_id_to_key(active_pattern_id)
-                                    recover_eval_last = cmeta.get("recover_eval_last", {})
-                                    recoverable = bool(recover_eval_last.get("recoverable", False))
+                            elif len(corr) >= 4:
+                                ci, cq, ca, cp = corr[0], corr[1], corr[2], corr[3]
+                        elif isinstance(corr, dict):
+                            cmeta = corr
+
+                        corr_generated = bool(
+                            (ci is not None) and (cq is not None) and (ca is not None) and (cp is not None)
+                        )
+
+                        if isinstance(cmeta, dict):
+                            if corr_generated and bool(cmeta.get('closed_loop_fallback_used', False)):
+                                _corr_stats['n_fallback'] += 1
+                            if failure_explore_mode:
+                                phase_key = phase_id_to_key(int(corr_source[6][bi].item()))
+                                phase_bin_id = int(corr_source[9][bi].item()) if len(corr_source) > 9 else -1
+                                phase_instance_idx = int(corr_source[10][bi].item()) if len(corr_source) > 10 else -1
+                                forced_mode_id = int(corr_source[11][bi].item()) if len(corr_source) > 11 else -1
+                                active_pattern_id = int(corr_source[12][bi].item()) if len(corr_source) > 12 else -1
+                                dir_bin_id = int(corr_source[13][bi].item()) if len(corr_source) > 13 else -1
+                                mag_bin_id = int(corr_source[14][bi].item()) if len(corr_source) > 14 else -1
+                                forced_mode_key = None
+                                if forced_mode_id >= 0:
+                                    forced_mode_key = error_mode_id_to_key(forced_mode_id)
+                                active_pattern_key = "both"
+                                if active_pattern_id >= 0:
+                                    active_pattern_key = active_arm_pattern_id_to_key(active_pattern_id)
+                                recover_eval_last = cmeta.get("recover_eval_last", {})
+                                recoverable_raw = recover_eval_last.get("recoverable", None)
+                                error_mode_key = str(forced_mode_key or cmeta.get("sampled_error_mode") or "").strip().lower()
+                                if (
+                                    (recoverable_raw is not None)
+                                    and (error_mode_key in {"translation", "rotation", "gripper_close"})
+                                ):
+                                    sample_unit_idx = int(corr_source[15][bi].item()) if len(corr_source) > 15 else -1
+                                    recoverable = bool(recoverable_raw)
                                     trial = {
                                         "epoch": int(epoch),
                                         "global_step": int(global_step),
@@ -628,7 +763,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                                         "phase_key": str(phase_key),
                                         "phase_instance_idx": int(phase_instance_idx),
                                         "phase_bin_id": int(phase_bin_id),
-                                        "error_mode": str(forced_mode_key or cmeta.get("sampled_error_mode")),
+                                        "error_mode": str(error_mode_key),
                                         "active_arm_pattern": str(active_pattern_key),
                                         "dir_bin_id": int(dir_bin_id),
                                         "mag_bin_id": int(mag_bin_id),
@@ -638,7 +773,6 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                                         "recover_eval_metric": recover_eval_last.get("metric"),
                                         "recover_eval_threshold": recover_eval_last.get("threshold"),
                                     }
-                                    _failure_trials.append(trial)
                                     key = (
                                         str(trial["phase_key"]),
                                         int(trial["phase_instance_idx"]),
@@ -649,9 +783,23 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                                         int(trial["mag_bin_id"]),
                                     )
                                     if key not in _failure_stats:
-                                        _failure_stats[key] = {"n": 0, "n_recover": 0}
-                                    _failure_stats[key]["n"] += 1
-                                    _failure_stats[key]["n_recover"] += int(recoverable)
+                                        _failure_stats[key] = {"n": 0, "n_recover": 0, "seen_samples": set()}
+                                    sample_uid = (int(ep_id), int(corr_source[5][bi].item()))
+                                    if sample_uid not in _failure_stats[key]["seen_samples"]:
+                                        _failure_stats[key]["seen_samples"].add(sample_uid)
+                                        _failure_stats[key]["n"] += 1
+                                        _failure_stats[key]["n_recover"] += int(recoverable)
+                                        _failure_trials.append(trial)
+                                        if int(sample_unit_idx) == int(explore_unit_idx):
+                                            local_unit_sample_uids.add(sample_uid)
+
+                        if corr_generated:
+                            corr_images.append(ci)
+                            corr_qpos.append(cq)
+                            corr_actions.append(ca)
+                            corr_pads.append(cp)
+                            corr_mask.append(1.0)
+                            _corr_stats['n_success'] += 1
                             if enable_wm and export_corr and accelerator.is_main_process:
                                 _export_correction_sample_as_episode(
                                     export_corr_dir,
@@ -674,6 +822,25 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             corr_mask.append(0.0)
 
                     if failure_explore_mode:
+                        if dist.is_available() and dist.is_initialized():
+                            ws = int(dist.get_world_size())
+                            gathered_uids = [None for _ in range(ws)]
+                            dist.all_gather_object(gathered_uids, list(local_unit_sample_uids))
+                            if accelerator.is_main_process:
+                                for _uids in gathered_uids:
+                                    if not isinstance(_uids, list):
+                                        continue
+                                    for _uid in _uids:
+                                        try:
+                                            explore_unit_seen_global.add((int(_uid[0]), int(_uid[1])))
+                                        except Exception:
+                                            continue
+                        else:
+                            for _uid in local_unit_sample_uids:
+                                explore_unit_seen_global.add((int(_uid[0]), int(_uid[1])))
+
+                        if global_step % failure_live_dump_interval == 0:
+                            _write_failure_tables(epoch, live=True)
                         global_step += 1
                         continue
 
@@ -813,59 +980,8 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                                'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
                                'n_fallback': 0}
 
-        if failure_explore_mode and accelerator.is_main_process:
-            trials_path = os.path.join(failure_table_dir, f'failure_trials_epoch_{epoch + 1:04d}.json')
-            with open(trials_path, 'w') as f:
-                json.dump(_failure_trials, f, indent=2)
-
-            entries = []
-            for key, st in sorted(_failure_stats.items()):
-                phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
-                n = int(st.get("n", 0))
-                if n < failure_explore_k:
-                    continue
-                n_recover = int(st.get("n_recover", 0))
-                recover_rate = float(n_recover) / float(max(1, n))
-                fail_flag = bool(recover_rate <= float(failure_fail_thresh))
-                if not fail_flag:
-                    continue
-                entries.append(
-                    {
-                        "phase_key": str(phase_key),
-                        "phase_instance_idx": int(phase_instance_idx),
-                        "phase_bin_id": int(phase_bin_id),
-                        "error_mode": str(error_mode),
-                        "active_arm_pattern": str(active_arm_pattern),
-                        "dir_bin_id": int(dir_bin_id),
-                        "mag_bin_id": int(mag_bin_id),
-                        "n_trials": int(n),
-                        "n_recover": int(n_recover),
-                        "recover_rate": float(recover_rate),
-                        "fail_rate": float(1.0 - recover_rate),
-                        "weight": float(max(1e-6, 1.0 - recover_rate)),
-                    }
-                )
-
-            table = {
-                "version": 3,
-                "mode": "explore",
-                "epoch": int(epoch + 1),
-                "failure_phase_bins": int(config.get("failure_phase_bins", 5)),
-                "failure_translation_dir_bins": int(config.get("failure_translation_dir_bins", 5)),
-                "failure_translation_mag_bins": int(config.get("failure_translation_mag_bins", 3)),
-                "failure_rotation_dir_bins": int(config.get("failure_rotation_dir_bins", 6)),
-                "failure_rotation_mag_bins": int(config.get("failure_rotation_mag_bins", 3)),
-                "failure_explore_k": int(failure_explore_k),
-                "failure_fail_recover_rate_thresh": float(failure_fail_thresh),
-                "entries": entries,
-            }
-            table_path = os.path.join(failure_table_dir, 'failure_table.json')
-            with open(table_path, 'w') as f:
-                json.dump(table, f, indent=2)
-            print(
-                f"[failure_explore] epoch={epoch + 1} trials={len(_failure_trials)} "
-                f"failure_entries={len(entries)} table={table_path}"
-            )
+        if failure_explore_mode:
+            _write_failure_tables(epoch, live=False)
 
         if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
