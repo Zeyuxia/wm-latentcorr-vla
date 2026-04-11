@@ -283,6 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Number of rotation magnitude bins for failure exploration")
         parser.add_argument("--failure_corr_batch_ratio", type=float, default=0.5,
                             help="Correction dataloader batch ratio relative to base batch size in failure_mode")
+        parser.add_argument("--failure_explore_card_mode", type=str, default="single",
+                            help="Explore card mode: single|multi. single writes local failure_table; multi writes trials-only for offline merge.")
         parser.add_argument("--failure_explore_k", type=int, default=3,
                             help="Required unique samples (episode_id,start_ts) per failure unit before writing it to failure_table in explore mode")
         parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5,

@@ -4,8 +4,8 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate ACT
 
 # Base training parameters
-train_tag="open_laptop_closed_loop_exploration_test"
-gpu_ids=4
+train_tag="open_laptop_closed_loop_exploration_multigpu_test"
+gpu_ids=0,1,2,3
 main_process_port=29500
 seed=0
 
@@ -95,8 +95,10 @@ cp "$0" ${ckpt_dir}/train.sh
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')
 if [ ${num_gpus} -gt 1 ]; then
     multi_gpu_flag="--multi_gpu"
+    failure_explore_card_mode="multi"
 else
     multi_gpu_flag=""
+    failure_explore_card_mode="single"
 fi
 gpu_flags="${multi_gpu_flag} \
 --num_processes ${num_gpus} \
@@ -153,6 +155,7 @@ failure_flags="--failure_mode ${failure_mode} \
 --failure_rotation_dir_bins ${failure_rotation_dir_bins} \
 --failure_rotation_mag_bins ${failure_rotation_mag_bins} \
 --failure_corr_batch_ratio ${failure_corr_batch_ratio} \
+--failure_explore_card_mode ${failure_explore_card_mode} \
 --failure_explore_k ${failure_explore_k} \
 --failure_fail_recover_rate_thresh ${failure_fail_recover_rate_thresh} \
 "

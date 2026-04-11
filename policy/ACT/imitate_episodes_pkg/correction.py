@@ -292,16 +292,16 @@ def _shared_draw_phase_legend(img):
         ("transport", _shared_phase_color("transport")),
         ("place", _shared_phase_color("place")),
     ]
-    x0, y0 = 10, 62
-    row_h = 18
-    w = 150
-    h = 8 + row_h * len(rows) + 8
+    x0, y0 = 8, 8
+    row_h = 14
+    w = 126
+    h = 6 + row_h * len(rows) + 6
     cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
     cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
     for i, (name, color) in enumerate(rows):
-        y = y0 + 18 + i * row_h
-        cv2.circle(img, (x0 + 10, y - 4), 4, color, -1, cv2.LINE_AA)
-        cv2.putText(img, name, (x0 + 20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+        y = y0 + 14 + i * row_h
+        cv2.circle(img, (x0 + 9, y - 3), 3, color, -1, cv2.LINE_AA)
+        cv2.putText(img, name, (x0 + 17, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
 
 
 def _shared_build_pose_np_from_raw_indices(raw_data, raw_idx_list):
@@ -395,19 +395,102 @@ def _shared_compute_phase_projection(raw_data, phase_window_len, K, E):
     return p_l_seq, p_r_seq, phase_seq
 
 
+def _shared_draw_phase_bin_starts(img, l_seq, r_seq, phase_seq, phase_bins):
+    import cv2
+
+    phase_bins = int(max(1, phase_bins))
+    n = len(phase_seq)
+    if n <= 0:
+        return
+
+    i = 0
+    while i < n:
+        key = str(phase_seq[i])
+        j = i + 1
+        while j < n and str(phase_seq[j]) == key:
+            j += 1
+        seg_len = j - i
+        if seg_len > 0:
+            for b in range(phase_bins):
+                rel = int(np.floor(float(b) * float(seg_len) / float(phase_bins)))
+                idx = i + min(seg_len - 1, max(0, rel))
+
+                # Find a drawable uv near idx.
+                uv_l = None
+                uv_r = None
+                for k in range(idx, j):
+                    if uv_l is None and k < len(l_seq) and l_seq[k] is not None:
+                        uv_l = l_seq[k]
+                    if uv_r is None and k < len(r_seq) and r_seq[k] is not None:
+                        uv_r = r_seq[k]
+                    if uv_l is not None and uv_r is not None:
+                        break
+                if uv_l is None and uv_r is None:
+                    for k in range(idx - 1, i - 1, -1):
+                        if uv_l is None and k < len(l_seq) and l_seq[k] is not None:
+                            uv_l = l_seq[k]
+                        if uv_r is None and k < len(r_seq) and r_seq[k] is not None:
+                            uv_r = r_seq[k]
+                        if uv_l is not None and uv_r is not None:
+                            break
+
+                label_anchor = None
+                if uv_l is not None:
+                    ul, vl = int(uv_l[0]), int(uv_l[1])
+                    cv2.circle(img, (ul, vl), 2, (0, 255, 0), -1, cv2.LINE_AA)
+                    label_anchor = (ul, vl) if label_anchor is None else label_anchor
+                if uv_r is not None:
+                    ur, vr = int(uv_r[0]), int(uv_r[1])
+                    cv2.circle(img, (ur, vr), 2, (0, 0, 255), -1, cv2.LINE_AA)
+                    label_anchor = (ur, vr) if label_anchor is None else label_anchor
+
+                if label_anchor is not None:
+                    _tag_prefix = {
+                        "approach": "A",
+                        "pregrasp": "G",
+                        "transport": "T",
+                        "place": "L",
+                    }.get(key, key[:1].upper() if len(key) > 0 else "?")
+                    tag = f"{_tag_prefix}{b}"
+                    tx, ty = (int(label_anchor[0]) + 4, int(label_anchor[1]) - 4)
+                    cv2.putText(
+                        img,
+                        tag,
+                        (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.30,
+                        (0, 0, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        img,
+                        tag,
+                        (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.30,
+                        (0, 0, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+        i = j
+
+
 def _save_gt_projection_on_original(
     debug_corr_dir,
     image_data_s,
+    curr_image,
     raw_data,
     start_ts,
     rollout_steps_total,
     phase_window_len,
+    phase_bins,
 ):
     import cv2
 
     try:
         _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+        gt_ref_idx = int(np.clip(start_ts, 0, raw_data['left_endpose'].shape[0] - 1))
         try:
             ep_path = raw_data.get('episode_path', None)
             if ep_path is not None and os.path.isfile(ep_path):
@@ -439,6 +522,7 @@ def _save_gt_projection_on_original(
         if p_l_seq is not None and p_r_seq is not None and phase_seq is not None:
             _shared_draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
             _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
+            _shared_draw_phase_bin_starts(_overlay_gt, p_l_seq, p_r_seq, phase_seq, phase_bins)
             _shared_draw_phase_legend(_overlay_gt)
 
         out_path = os.path.join(debug_corr_dir, 'gt_projection_on_original.png')
@@ -452,6 +536,148 @@ def _save_gt_projection_on_original(
         try:
             import traceback
             with open(os.path.join(debug_corr_dir, 'gt_projection_on_original_error.txt'), 'w') as _f:
+                _f.write(traceback.format_exc())
+        except Exception:
+            pass
+        return None
+
+
+def _save_recover_eval_compare_image(
+    debug_corr_dir,
+    raw_data,
+    gt_ref_idx,
+    recover_pred_img,
+    step_idx,
+    mode=None,
+    recoverable=None,
+    metric_name=None,
+    metric=None,
+    threshold=None,
+    nearest_dist=None,
+):
+    import cv2
+
+    def _put_text_hc(img, text, org, scale=0.5):
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), 1, cv2.LINE_AA)
+
+    try:
+        gi = int(np.clip(int(gt_ref_idx), 0, raw_data['left_endpose'].shape[0] - 1))
+        _gt = None
+        ep_path = raw_data.get('episode_path', None)
+        if ep_path is not None and os.path.isfile(ep_path):
+            import h5py
+            with h5py.File(ep_path, 'r') as _f_gt:
+                _enc = bytes(_f_gt['observation/head_camera/rgb'][gi])
+            _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
+        if _gt is None or _gt.size == 0:
+            return None
+
+        _pred = (recover_pred_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        if _pred.shape[:2] != _gt.shape[:2]:
+            _pred = cv2.resize(_pred, (_gt.shape[1], _gt.shape[0]), interpolation=cv2.INTER_LINEAR)
+        _img_cmp = np.concatenate([_gt, _pred], axis=1)
+        info_lines = []
+        info_lines.append(f"LEFT=GT_REF(idx={gi})   RIGHT=RECOVER_ROLLOUT_LAST")
+        info_lines.append(f"mode={mode}")
+        if recoverable is None:
+            info_lines.append("recoverable=unknown")
+        else:
+            info_lines.append(f"recoverable={bool(recoverable)}")
+        if metric_name is not None and metric is not None:
+            info_lines.append(f"{metric_name}={float(metric):.6f}")
+        if threshold is not None:
+            info_lines.append(f"threshold={float(threshold):.6f}")
+        if nearest_dist is not None:
+            info_lines.append(f"nearest_dist={float(nearest_dist):.6f}")
+
+        panel_h = 28 + 18 * len(info_lines)
+        _cmp = np.zeros((_img_cmp.shape[0] + panel_h, _img_cmp.shape[1], 3), dtype=np.uint8)
+        _cmp[:_img_cmp.shape[0], :, :] = _img_cmp
+        _cmp[_img_cmp.shape[0]:, :, :] = 245
+        cv2.line(_cmp, (0, _img_cmp.shape[0]), (_img_cmp.shape[1] - 1, _img_cmp.shape[0]), (120, 120, 120), 1, cv2.LINE_AA)
+        _x0 = 10
+        _y0 = _img_cmp.shape[0] + 20
+        for _li, _txt in enumerate(info_lines):
+            _y = _y0 + _li * 16
+            _put_text_hc(_cmp, _txt, (_x0, _y), scale=0.46)
+        out_path = os.path.join(debug_corr_dir, f"recover_eval_gtref_vs_rollout_last_step_{int(step_idx):03d}.png")
+        cv2.imwrite(out_path, _cmp)
+        return {
+            'path': out_path,
+            'exists': bool(os.path.exists(out_path)),
+            'gt_ref_idx': int(gi),
+            'step': int(step_idx),
+            'mode': mode,
+            'recoverable': (None if recoverable is None else bool(recoverable)),
+            'metric_name': metric_name,
+            'metric': (None if metric is None else float(metric)),
+            'threshold': (None if threshold is None else float(threshold)),
+            'nearest_dist': (None if nearest_dist is None else float(nearest_dist)),
+        }
+    except Exception:
+        try:
+            import traceback
+            with open(os.path.join(debug_corr_dir, 'recover_eval_compare_error.txt'), 'w') as _f:
+                _f.write(traceback.format_exc())
+        except Exception:
+            pass
+        return None
+
+
+def _save_perturb_compare_image(
+    debug_corr_dir,
+    first_img,
+    last_img,
+    sampled_unit,
+    rollout_last_record=None,
+):
+    import cv2
+
+    def _put_text_hc(img, text, org, scale=0.5):
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), 1, cv2.LINE_AA)
+
+    try:
+        _first = (first_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        _last = (last_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        if _last.shape[:2] != _first.shape[:2]:
+            _last = cv2.resize(_last, (_first.shape[1], _first.shape[0]), interpolation=cv2.INTER_LINEAR)
+        _img_cmp = np.concatenate([_first, _last], axis=1)
+
+        su = sampled_unit if isinstance(sampled_unit, dict) else {}
+        lines = [
+            "LEFT=INPUT_FIRST(start)   RIGHT=PERTURBED_LAST(after_rollout)",
+            f"phase={su.get('phase_key')} bin={su.get('phase_bin_id')} inst={su.get('phase_instance_idx')}",
+            f"error_mode={su.get('error_mode')} arm={su.get('active_arm_pattern')}",
+            f"dir_bin={su.get('dir_bin_id')} mag_bin={su.get('mag_bin_id')}",
+        ]
+        rr = rollout_last_record if isinstance(rollout_last_record, dict) else {}
+        lines.extend([
+            f"sampled_error_mode={rr.get('sampled_error_mode')}",
+            f"translation_gain_m={rr.get('perturb_translation_gain_m')} rotation_deg={rr.get('perturb_rotation_deg')}",
+        ])
+
+        panel_h = 28 + 18 * len(lines)
+        _cmp = np.zeros((_img_cmp.shape[0] + panel_h, _img_cmp.shape[1], 3), dtype=np.uint8)
+        _cmp[:_img_cmp.shape[0], :, :] = _img_cmp
+        _cmp[_img_cmp.shape[0]:, :, :] = 245
+        cv2.line(_cmp, (0, _img_cmp.shape[0]), (_img_cmp.shape[1] - 1, _img_cmp.shape[0]), (120, 120, 120), 1, cv2.LINE_AA)
+        y0 = _img_cmp.shape[0] + 20
+        for i, t in enumerate(lines):
+            _put_text_hc(_cmp, str(t), (10, y0 + 16 * i), scale=0.44)
+
+        out_path = os.path.join(debug_corr_dir, 'perturb_input_vs_last.png')
+        cv2.imwrite(out_path, _cmp)
+        return {
+            'path': out_path,
+            'exists': bool(os.path.exists(out_path)),
+            'sampled_unit': su,
+        }
+    except Exception:
+        try:
+            import traceback
+            with open(os.path.join(debug_corr_dir, 'perturb_compare_error.txt'), 'w') as _f:
                 _f.write(traceback.format_exc())
         except Exception:
             pass
@@ -483,6 +709,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     gripper_penalty = float(cfg['gripper_penalty'])
     recover_eval_enable = bool(cfg.get('recover_eval_enable', False))
     recover_eval_save_video = bool(cfg.get('recover_eval_save_video', False))
+    recover_eval_debug = bool(cfg.get('recover_eval_save_video', False))
     recover_eval_gripper_open_thresh = float(cfg.get('recover_eval_gripper_open_thresh', 0.8))
     recover_eval_pos_thresh_m = float(cfg.get('recover_eval_pos_thresh_m', 0.03))
     recover_eval_rot_thresh_deg = float(cfg.get('recover_eval_rot_thresh_deg', 10.0))
@@ -506,6 +733,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     forced_dir_bin_fixed = (None if forced_dir_bin_id is None else int(forced_dir_bin_id))
     forced_mag_bin_fixed = (None if forced_mag_bin_id is None else int(forced_mag_bin_id))
     phase_window_len = int(cfg['sample_phase_window_len'])
+    phase_bins = int(cfg.get('failure_phase_bins', 5))
     sampled_unit = {
         "phase_key": str(phase_key_fixed),
         "phase_bin_id": (None if phase_bin_fixed is None else int(phase_bin_fixed)),
@@ -725,6 +953,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         recover_eval_window_end = None
         recover_eval_error = None
         recover_eval_video = None
+        recover_eval_compare = None
 
         if recover_eval_enable:
             try:
@@ -750,6 +979,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 pred_right_grip_eval = float(np.clip(act_eval_raw[k_eval, 13], 0.0, 1.0))
                 recover_eval_horizon = int(h_eval)
                 gt_ref_idx = int(np.clip(start_ts + h_eval, 0, raw_data['left_endpose'].shape[0] - 1))
+                recover_eval_rollout_last_img = None
 
                 if recover_eval_save_video and (debug_dir is not None):
                     try:
@@ -824,7 +1054,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         evac_recover_eval_dir = os.path.join(
                             debug_dir, 'evac_recover_eval', f'rollout_step_{step:03d}'
                         )
-                        _ = evac_inference(
+                        recover_eval_rollout_last_img = evac_inference(
                             evac_model,
                             evac_cfg,
                             curr_image[0],
@@ -867,7 +1097,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     )
                 elif mode_eval == "translation":
                     fr_eval = fr_eval_last
-                    # Forward-only nearest matching around center=start_ts+H.
+                    # Forward-only nearest matching around center=start_ts+H,
+                    # using the same full metric as rollout nearest search.
                     near_w_eval = int(max(1, cfg.get('recover_eval_nearest_window_radius', int(max(1, rollout_exec_steps)))))
                     ws = int(np.clip(gt_ref_idx, 0, raw_data['left_endpose'].shape[0] - 1))
                     we = int(np.clip(gt_ref_idx + near_w_eval + 1, ws + 1, raw_data['left_endpose'].shape[0]))
@@ -878,12 +1109,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         np.asarray(fr_eval['right'][1], dtype=np.float32),
                         raw_data['left_endpose'],
                         raw_data['right_endpose'],
-                        orient_weight=0.0,
+                        orient_weight=orient_weight,
                         curr_left_grip=pred_left_grip_eval,
                         curr_right_grip=pred_right_grip_eval,
                         left_gripper_traj=raw_data.get('left_gripper'),
                         right_gripper_traj=raw_data.get('right_gripper'),
-                        gripper_penalty=0.0,
+                        gripper_penalty=gripper_penalty,
                         window_start=ws,
                         window_end=we,
                     )
@@ -911,7 +1142,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     )
                 elif mode_eval == "rotation":
                     fr_eval = fr_eval_last
-                    # Forward-only nearest matching around center=start_ts+H.
+                    # Forward-only nearest matching around center=start_ts+H,
+                    # using the same full metric as rollout nearest search.
                     near_w_eval = int(max(1, cfg.get('recover_eval_nearest_window_radius', int(max(1, rollout_exec_steps)))))
                     ws = int(np.clip(gt_ref_idx, 0, raw_data['left_endpose'].shape[0] - 1))
                     we = int(np.clip(gt_ref_idx + near_w_eval + 1, ws + 1, raw_data['left_endpose'].shape[0]))
@@ -922,12 +1154,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         np.asarray(fr_eval['right'][1], dtype=np.float32),
                         raw_data['left_endpose'],
                         raw_data['right_endpose'],
-                        orient_weight=0.0,
+                        orient_weight=orient_weight,
                         curr_left_grip=pred_left_grip_eval,
                         curr_right_grip=pred_right_grip_eval,
                         left_gripper_traj=raw_data.get('left_gripper'),
                         right_gripper_traj=raw_data.get('right_gripper'),
-                        gripper_penalty=0.0,
+                        gripper_penalty=gripper_penalty,
                         window_start=ws,
                         window_end=we,
                     )
@@ -969,6 +1201,22 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         'active_left_arm': bool(active_info.get('left_arm', True)),
                         'active_right_arm': bool(active_info.get('right_arm', True)),
                     }
+                    if recover_eval_debug and (debug_dir is not None) and (recover_eval_rollout_last_img is not None):
+                        _dbg_corr_cmp = os.path.join(debug_dir, 'correction')
+                        os.makedirs(_dbg_corr_cmp, exist_ok=True)
+                        recover_eval_compare = _save_recover_eval_compare_image(
+                            _dbg_corr_cmp,
+                            raw_data,
+                            int(recover_eval_gt_ref_idx),
+                            recover_eval_rollout_last_img,
+                            int(step),
+                            mode=mode_eval,
+                            recoverable=recover_eval_recoverable,
+                            metric_name=recover_eval_metric_name,
+                            metric=recover_eval_metric,
+                            threshold=recover_eval_threshold,
+                            nearest_dist=recover_eval_nearest_dist,
+                        )
             except Exception as exc:
                 recover_eval_recoverable = None
                 recover_eval_error = str(exc)
@@ -1050,6 +1298,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 ),
                 'recover_eval_error': recover_eval_error,
                 'recover_eval_video': recover_eval_video,
+                'recover_eval_compare': recover_eval_compare,
             })
 
     force_generate_correction = False
@@ -1061,6 +1310,18 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'reason': 'correction_force_generate',
                 'max_rollout_steps': int(max_steps),
             })
+    perturb_compare_meta = None
+    if debug_dir is not None:
+        _dbg_corr_cmp = os.path.join(debug_dir, 'correction')
+        os.makedirs(_dbg_corr_cmp, exist_ok=True)
+        _rr_last = _dbg_rollout[-1] if len(_dbg_rollout) > 0 else None
+        perturb_compare_meta = _save_perturb_compare_image(
+            _dbg_corr_cmp,
+            image_data_s[0],
+            curr_image[0],
+            sampled_unit,
+            rollout_last_record=_rr_last,
+        )
     # IMPORTANT: correction planning must start from post-rollout state.
     # `left_q/right_q` inside rollout loop are sampled before executing act_raw,
     # so refresh them from `curr_qpos_raw` here.
@@ -1126,14 +1387,17 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 gt_projection_meta = _save_gt_projection_on_original(
                     _dbg_corr,
                     image_data_s,
+                    curr_image,
                     raw_data,
                     start_ts,
                     rollout_steps_total,
                     phase_window_len,
+                    phase_bins,
                 )
                 json.dump({
                     'reason': _skip_reason,
                     'sampled_unit': sampled_unit,
+                    'perturb_compare': perturb_compare_meta,
                     'min_dist': float(min_dist),
                     'recover_eval_enable': bool(recover_eval_enable),
                     'recover_eval_any_unrecoverable': bool(recover_eval_any_unrecoverable),
@@ -1485,7 +1749,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         try:
             _cimg = (curr_image[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
             _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-            gt_ref_idx = int(np.clip(start_ts + int(rollout_steps_total), 0, raw_data['left_endpose'].shape[0] - 1))
+            gt_ref_idx = int(np.clip(start_ts, 0, raw_data['left_endpose'].shape[0] - 1))
             try:
                 ep_path = raw_data.get('episode_path', None)
                 if ep_path is not None and os.path.isfile(ep_path):
@@ -1768,6 +2032,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
                 _shared_draw_phase_polyline(_overlay_c, p_l_seq, phase_seq, width=1)
                 _shared_draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
+                _shared_draw_phase_bin_starts(_overlay_gt, p_l_seq, p_r_seq, phase_seq, phase_bins)
+                _shared_draw_phase_bin_starts(_overlay_c, p_l_seq, p_r_seq, phase_seq, phase_bins)
                 _shared_draw_phase_legend(_overlay_gt)
 
             # Corrected overlay: keep only correction trajectories + phase-colored GT path.
@@ -1961,6 +2227,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'last': recover_eval_last,
                 'projection_on_corrected': recover_eval_proj_meta,
             },
+            'perturb_compare': perturb_compare_meta,
             'correction_plan': {
                 'left_active': bool(corr_left_active),
                 'right_active': bool(corr_right_active),
@@ -2030,6 +2297,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 ),
                 'last': recover_eval_last,
             },
+            'perturb_compare': perturb_compare_meta,
             'rollouts': _closed_loop_rollouts,
         }
         with open(os.path.join(_dbg_corr, 'closed_loop_info.json'), 'w') as _f:

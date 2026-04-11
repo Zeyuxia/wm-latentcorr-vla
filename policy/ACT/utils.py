@@ -21,6 +21,14 @@ e = IPython.embed
 _FAILURE_ERROR_MODES = ("translation", "rotation", "gripper_close")
 
 
+def _shard_episode_indices_for_explore(indices):
+    world_size = int(max(1, int(os.environ.get("WORLD_SIZE", "1"))))
+    rank = int(max(0, int(os.environ.get("RANK", "0"))))
+    if world_size <= 1:
+        return list(indices)
+    return list(indices)[rank::world_size]
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
@@ -60,6 +68,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self._failure_entries = []
         self._explore_units = []
         self._explore_curr_unit_idx = 0
+        self._explore_k_local = int(self.failure_explore_k)
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
         self._init_failure_units()
         self.is_sim = None
         self.__getitem__(0)  # initialize self.is_sim
@@ -289,12 +300,36 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if len(self._explore_units) == 0:
             return
         self._explore_curr_unit_idx = (int(self._explore_curr_unit_idx) + 1) % int(len(self._explore_units))
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
 
     def set_explore_unit_idx(self, unit_idx):
         if len(self._explore_units) == 0:
             self._explore_curr_unit_idx = 0
             return
         self._explore_curr_unit_idx = int(np.clip(int(unit_idx), 0, len(self._explore_units) - 1))
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+
+    def set_explore_local_k(self, k_local):
+        self._explore_k_local = int(max(1, int(k_local)))
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+
+    def record_explore_trial(self, unit_idx, episode_id, start_ts):
+        if self.failure_mode != "explore":
+            return
+        if len(self._explore_units) == 0:
+            return
+        if int(unit_idx) != int(self._explore_curr_unit_idx):
+            return
+        sample_uid = (int(episode_id), int(start_ts))
+        if sample_uid in self._explore_seen_samples:
+            return
+        self._explore_seen_samples.add(sample_uid)
+        self._explore_trial_count_local += 1
+        if int(self._explore_trial_count_local) >= int(self._explore_k_local):
+            self._advance_explore_unit()
 
     def _select_failure_unit(self):
         if self.failure_mode == "explore":
@@ -699,6 +734,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     if dataset_dirs is None:
         print(f"\nData from: {dataset_dir}\n")
         train_indices = _collect_valid_indices(dataset_dir, num_episodes)
+        if str(failure_mode).strip().lower() == "explore":
+            train_indices = _shard_episode_indices_for_explore(train_indices)
         norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
         train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
                                         raw_data_dir=raw_data_dir, start_margin=start_margin,
@@ -734,6 +771,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     sub_datasets = []
     for ds_dir, n_ep in zip(dataset_dirs, num_episodes_list):
         train_indices = _collect_valid_indices(ds_dir, int(n_ep))
+        if str(failure_mode).strip().lower() == "explore":
+            train_indices = _shard_episode_indices_for_explore(train_indices)
         ds = EpisodicDataset(train_indices, ds_dir, camera_names, norm_stats, max_action_len,
                              raw_data_dir=None, start_margin=start_margin,
                              sample_skip_head_ratio=sample_skip_head_ratio,
