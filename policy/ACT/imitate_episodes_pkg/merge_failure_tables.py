@@ -22,10 +22,11 @@ def _infer_meta(src_dir: str):
         "failure_rotation_dir_bins": None,
         "failure_rotation_mag_bins": None,
         "failure_explore_k": None,
-        "failure_fail_recover_rate_thresh": None,
     }
-    table_files = sorted(glob.glob(os.path.join(src_dir, "failure_table_live_rank*.json")))
-    for p in table_files:
+    meta_files = sorted(glob.glob(os.path.join(src_dir, "failure_meta_rank*.json")))
+    if len(meta_files) == 0:
+        meta_files = sorted(glob.glob(os.path.join(src_dir, "failure_meta.json")))
+    for p in meta_files:
         try:
             with open(p, "r") as f:
                 t = json.load(f)
@@ -40,7 +41,7 @@ def _infer_meta(src_dir: str):
         raise RuntimeError(
             "Missing required failure meta in input files: "
             + ", ".join(missing)
-            + ". Please provide failure_table_live_rank*.json with these fields."
+            + ". Please provide failure_meta[_rankXX].json with these fields."
         )
     return meta
 
@@ -54,7 +55,6 @@ def _build_entries(trials, fail_thresh: float):
                 int(t["phase_instance_idx"]),
                 int(t["phase_bin_id"]),
                 str(t["error_mode"]),
-                str(t["active_arm_pattern"]),
                 int(t["dir_bin_id"]),
                 int(t["mag_bin_id"]),
             )
@@ -68,7 +68,7 @@ def _build_entries(trials, fail_thresh: float):
 
     entries = []
     for key, cnt in sorted(stats.items()):
-        phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
+        phase_key, phase_instance_idx, phase_bin_id, error_mode, dir_bin_id, mag_bin_id = key
         n = int(cnt["n"])
         n_recover = int(cnt["n_recover"])
         recover_rate = float(n_recover) / float(max(1, n))
@@ -80,7 +80,7 @@ def _build_entries(trials, fail_thresh: float):
                 "phase_instance_idx": int(phase_instance_idx),
                 "phase_bin_id": int(phase_bin_id),
                 "error_mode": str(error_mode),
-                "active_arm_pattern": str(active_arm_pattern),
+                "active_arm_pattern": None,
                 "dir_bin_id": int(dir_bin_id),
                 "mag_bin_id": int(mag_bin_id),
                 "n_trials": int(n),
@@ -98,6 +98,12 @@ def main():
     ap.add_argument("--failure_dir", required=True, help="Directory containing failure_trials_*_rankXX.json")
     ap.add_argument("--epoch", type=int, default=None, help="Epoch id for epoch files; default uses live files")
     ap.add_argument("--out_dir", type=str, default="", help="Output directory; default=failure_dir")
+    ap.add_argument(
+        "--failure_fail_recover_rate_thresh",
+        type=float,
+        required=True,
+        help="Recover-rate threshold used to keep failure entries.",
+    )
     args = ap.parse_args()
 
     src_dir = os.path.abspath(args.failure_dir)
@@ -118,7 +124,7 @@ def main():
     meta = _infer_meta(src_dir)
     entries = _build_entries(
         trials,
-        float(meta["failure_fail_recover_rate_thresh"]),
+        float(args.failure_fail_recover_rate_thresh),
     )
 
     mode = "explore_merged_live" if args.epoch is None else "explore_merged_epoch"
@@ -127,7 +133,7 @@ def main():
         json.dump(trials, f, indent=2)
 
     table = {
-        "version": 3,
+        "version": 4,
         "mode": mode,
         "epoch": (None if args.epoch is None else int(args.epoch)),
         "failure_phase_bins": int(meta["failure_phase_bins"]),
@@ -136,7 +142,7 @@ def main():
         "failure_rotation_dir_bins": int(meta["failure_rotation_dir_bins"]),
         "failure_rotation_mag_bins": int(meta["failure_rotation_mag_bins"]),
         "failure_explore_k": int(meta["failure_explore_k"]),
-        "failure_fail_recover_rate_thresh": float(meta["failure_fail_recover_rate_thresh"]),
+        "failure_fail_recover_rate_thresh": float(args.failure_fail_recover_rate_thresh),
         "entries": entries,
     }
 

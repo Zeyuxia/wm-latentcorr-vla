@@ -281,9 +281,7 @@ def main(args):
     config['failure_rotation_mag_bins'] = failure_rotation_mag_bins
     config['failure_table_path'] = failure_table_path
     config['failure_table_dir'] = str(args.get('failure_table_dir', '')).strip()
-    config['failure_explore_card_mode'] = str(args.get('failure_explore_card_mode', 'single')).strip().lower()
     config['failure_explore_k'] = int(max(1, int(args.get('failure_explore_k', 3))))
-    config['failure_fail_recover_rate_thresh'] = float(args.get('failure_fail_recover_rate_thresh', 0.5))
     if enable_wm:
         config['wm_args'] = args
         config['raw_data_dir'] = raw_data_dir
@@ -304,6 +302,7 @@ def main(args):
             'recover_eval_rot_thresh_deg': float(args.get('recover_eval_rot_thresh_deg', 10.0)),
             'recover_eval_nearest_window_radius': int(args.get('recover_eval_nearest_window_radius', 16)),
             'sample_phase_window_len': int(args['sample_phase_window_len']),
+            'failure_phase_bins': int(failure_phase_bins),
             'chunk_size': args['chunk_size'],
             'max_action_len': max_action_len,
             'orient_weight': args['orient_weight'],
@@ -323,6 +322,7 @@ def main(args):
             config['correction_cfg']['recover_eval_enable'] = True
     config['act_init_ckpt'] = args.get('act_init_ckpt')
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
+    config['debug_wm_all_ranks'] = bool(args.get('debug_wm_all_ranks', False))
     config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
     print(f"[main][rank={_rank}] before train_bc | enable_wm={enable_wm}")
     train_bc(train_dataloader, config, corr_train_dataloader=corr_train_dataloader)
@@ -404,15 +404,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     enable_wm = bool(config["enable_wm_correction"])
     failure_mode = str(config.get("failure_mode", "off")).strip().lower()
     failure_explore_mode = bool(failure_mode == "explore")
-    failure_explore_card_mode = str(config.get("failure_explore_card_mode", "single")).strip().lower()
-    if failure_explore_card_mode not in {"single", "multi"}:
-        raise ValueError(
-            f"Invalid failure_explore_card_mode={failure_explore_card_mode!r}, expected single|multi"
-        )
-    failure_explore_no_sync = bool(failure_explore_card_mode == "multi")
-    failure_explore_emit_local_table = bool(failure_explore_card_mode == "single")
     failure_explore_k = int(max(1, int(config.get("failure_explore_k", 3))))
-    failure_fail_thresh = float(config.get("failure_fail_recover_rate_thresh", 0.5))
     failure_table_dir = str(config.get("failure_table_dir", "")).strip()
     if failure_table_dir == "":
         failure_table_dir = os.path.join(ckpt_dir, "failure_explore")
@@ -425,15 +417,14 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     # Set seed after Accelerator init so each process gets proper seed offset
     set_seed(seed)
     failure_explore_k_global = int(failure_explore_k)
-    failure_explore_k_local = int(failure_explore_k_global)
-    if failure_explore_mode and failure_explore_no_sync:
-        ws = int(max(1, int(accelerator.num_processes)))
-        # In multi-card explore, treat CLI k as global target and split to local quota.
-        failure_explore_k_local = int(max(1, (failure_explore_k_global + ws - 1) // ws))
+    ws = int(max(1, int(accelerator.num_processes)))
+    # Current explore scheduling is rank-local, so each rank advances units
+    # after reaching its local ceil(k_global / world_size) trial budget.
+    failure_explore_k_local = int(max(1, (failure_explore_k_global + ws - 1) // ws))
     if failure_explore_mode:
         print(
             f"[failure_explore] k_global={failure_explore_k_global} "
-            f"k_local={failure_explore_k_local} mode={failure_explore_card_mode}"
+            f"k_local={failure_explore_k_local} world_size={ws}"
         )
 
     print(f"[train_bc][rank={_r} local_rank={_lr}] before make_policy")
@@ -469,9 +460,17 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
 
     correction_modules = None
     debug_wm = config.get('debug_wm_correction', False)
+    debug_wm_all_ranks = bool(config.get('debug_wm_all_ranks', False))
     debug_loss_batch_projection = bool(config.get('debug_loss_batch_projection', False))
-    debug_wm_dir = os.path.join(ckpt_dir, 'debug_wm') if debug_wm else None
-    if debug_wm_dir and accelerator.is_main_process:
+    debug_wm_root = os.path.join(ckpt_dir, 'debug_wm') if debug_wm else None
+    debug_wm_dir = None
+    if debug_wm_root is not None:
+        debug_wm_dir = (
+            os.path.join(debug_wm_root, f"rank{int(accelerator.process_index):02d}")
+            if debug_wm_all_ranks else debug_wm_root
+        )
+    debug_wm_should_save = bool(debug_wm_dir is not None and (debug_wm_all_ranks or accelerator.is_main_process))
+    if debug_wm_should_save:
         os.makedirs(debug_wm_dir, exist_ok=True)
     # correction statistics tracker
     _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
@@ -506,134 +505,35 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         except Exception:
             pass
 
-    def _build_failure_entries(trials):
-        stats = {}
-        for t in trials:
-            try:
-                key = (
-                    str(t["phase_key"]),
-                    int(t["phase_instance_idx"]),
-                    int(t["phase_bin_id"]),
-                    str(t["error_mode"]),
-                    str(t["active_arm_pattern"]),
-                    int(t["dir_bin_id"]),
-                    int(t["mag_bin_id"]),
-                )
-                recoverable = bool(t.get("recoverable", False))
-            except Exception:
-                continue
-            if key not in stats:
-                stats[key] = {"n": 0, "n_recover": 0}
-            stats[key]["n"] += 1
-            stats[key]["n_recover"] += int(recoverable)
-
-        entries = []
-        for key, cnt in sorted(stats.items()):
-            phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
-            n = int(cnt["n"])
-            if n < failure_explore_k_global:
-                continue
-            n_recover = int(cnt["n_recover"])
-            recover_rate = float(n_recover) / float(max(1, n))
-            fail_flag = bool(recover_rate <= float(failure_fail_thresh))
-            if not fail_flag:
-                continue
-            entries.append(
-                {
-                    "phase_key": str(phase_key),
-                    "phase_instance_idx": int(phase_instance_idx),
-                    "phase_bin_id": int(phase_bin_id),
-                    "error_mode": str(error_mode),
-                    "active_arm_pattern": str(active_arm_pattern),
-                    "dir_bin_id": int(dir_bin_id),
-                    "mag_bin_id": int(mag_bin_id),
-                    "n_trials": int(n),
-                    "n_recover": int(n_recover),
-                    "recover_rate": float(recover_rate),
-                    "fail_rate": float(1.0 - recover_rate),
-                    "weight": float(max(1e-6, 1.0 - recover_rate)),
-                }
-            )
-        return entries
-
-    def _gather_failure_trials_all_ranks():
-        local_trials = list(_failure_trials)
-        if failure_explore_no_sync:
-            return local_trials
-        if not (dist.is_available() and dist.is_initialized()):
-            return local_trials
-        ws = int(dist.get_world_size())
-        gathered = [None for _ in range(ws)]
-        dist.all_gather_object(gathered, local_trials)
-        merged = []
-        for g in gathered:
-            if isinstance(g, list):
-                merged.extend(g)
-        return merged
-
-    def _write_failure_tables(epoch_idx, live=False):
+    def _write_failure_tables(epoch_idx):
         if not failure_explore_mode:
             return
-        all_trials = _gather_failure_trials_all_ranks()
-        if (not failure_explore_no_sync) and (not accelerator.is_main_process):
-            return
+        all_trials = list(_failure_trials)
         os.makedirs(failure_table_dir, exist_ok=True)
-        rank_suffix = (f"_rank{int(accelerator.process_index):02d}" if failure_explore_no_sync else "")
+        rank_suffix = f"_rank{int(accelerator.process_index):02d}"
         trials_path = os.path.join(
             failure_table_dir,
-            (
-                f"failure_trials_live{rank_suffix}.json"
-                if live else f"failure_trials_epoch_{epoch_idx + 1:04d}{rank_suffix}.json"
-            ),
+            f"failure_trials_live{rank_suffix}.json",
         )
         with open(trials_path, "w") as f:
             json.dump(all_trials, f, indent=2)
-
-        if not failure_explore_emit_local_table:
-            return
-
-        entries = _build_failure_entries(all_trials)
-        table = {
-            "version": 3,
-            "mode": ("explore_live" if live else "explore"),
+        meta = {
+            "version": 1,
+            "mode": "explore_meta_live",
             "epoch": int(epoch_idx + 1),
             "failure_phase_bins": int(config.get("failure_phase_bins", 5)),
             "failure_translation_dir_bins": int(config.get("failure_translation_dir_bins", 5)),
             "failure_translation_mag_bins": int(config.get("failure_translation_mag_bins", 3)),
             "failure_rotation_dir_bins": int(config.get("failure_rotation_dir_bins", 6)),
             "failure_rotation_mag_bins": int(config.get("failure_rotation_mag_bins", 3)),
-                    "failure_explore_k": int(failure_explore_k_global),
-            "failure_fail_recover_rate_thresh": float(failure_fail_thresh),
-            "entries": entries,
+            "failure_explore_k": int(failure_explore_k_global),
         }
-        table_path = os.path.join(
+        meta_path = os.path.join(
             failure_table_dir,
-            (
-                f"failure_table_live{rank_suffix}.json"
-                if live else f"failure_table{rank_suffix}.json"
-            ),
+            f"failure_meta{rank_suffix}.json",
         )
-        with open(table_path, "w") as f:
-            json.dump(table, f, indent=2)
-
-        for mode in ("translation", "rotation", "gripper_close"):
-            table_mode = dict(table)
-            table_mode["entries"] = [e for e in entries if str(e.get("error_mode", "")) == mode]
-            mode_path = os.path.join(
-                failure_table_dir,
-                (
-                    f"failure_table_live_{mode}{rank_suffix}.json"
-                    if live else f"failure_table_{mode}{rank_suffix}.json"
-                ),
-            )
-            with open(mode_path, "w") as f:
-                json.dump(table_mode, f, indent=2)
-
-        if not live:
-            print(
-                f"[failure_explore] epoch={epoch_idx + 1} trials={len(all_trials)} "
-                f"failure_entries={len(entries)} table={table_path}"
-            )
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
 
     def _iter_leaf_datasets(ds):
         if ds is None:
@@ -685,11 +585,78 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                 return int(getattr(leaf, "_explore_curr_unit_idx"))
         return -1
 
+    def _get_current_explore_trial_count(loader):
+        ds = getattr(loader, "dataset", None)
+        for leaf in _iter_leaf_datasets(ds):
+            if hasattr(leaf, "_explore_trial_count_local"):
+                return int(getattr(leaf, "_explore_trial_count_local"))
+        return 0
+
+    def _get_explore_completed_unit_count(loader):
+        ds = getattr(loader, "dataset", None)
+        for leaf in _iter_leaf_datasets(ds):
+            if hasattr(leaf, "_explore_completed_unit_count"):
+                return int(getattr(leaf, "_explore_completed_unit_count"))
+        return 0
+
+    def _sync_all_explore_status(local_done, local_completed, local_total, local_unit_idx, local_trial_count):
+        status_t = torch.tensor(
+            [
+                1 if bool(local_done) else 0,
+                int(local_completed),
+                int(local_total),
+                int(local_unit_idx),
+                int(local_trial_count),
+            ],
+            device=accelerator.device,
+            dtype=torch.int64,
+        )
+        if dist.is_available() and dist.is_initialized():
+            gathered = [torch.zeros_like(status_t) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, status_t)
+            progress = []
+            for ridx, item in enumerate(gathered):
+                vals = [int(x) for x in item.tolist()]
+                progress.append(
+                    {
+                        "rank": int(ridx),
+                        "done": bool(vals[0]),
+                        "completed": int(vals[1]),
+                        "total": int(vals[2]),
+                        "unit_idx": int(vals[3]),
+                        "trial_count": int(vals[4]),
+                    }
+                )
+        else:
+            progress = [
+                {
+                    "rank": 0,
+                    "done": bool(local_done),
+                    "completed": int(local_completed),
+                    "total": int(local_total),
+                    "unit_idx": int(local_unit_idx),
+                    "trial_count": int(local_trial_count),
+                }
+            ]
+        all_done = bool(len(progress) > 0 and all(bool(x["done"]) for x in progress))
+        return all_done, progress
+
+    def _format_explore_progress(progress):
+        parts = []
+        for item in progress:
+            total_i = max(0, int(item["total"]))
+            comp_i = max(0, int(item["completed"]))
+            unit_i = max(0, int(item["unit_idx"])) + 1 if total_i > 0 else 0
+            trial_i = max(0, int(item["trial_count"]))
+            wait_tag = "w" if bool(item["done"]) else ""
+            parts.append(
+                f"r{int(item['rank'])}:{comp_i}/{total_i} u{unit_i} t{trial_i}{wait_tag}"
+            )
+        return " | ".join(parts)
+
     if enable_wm:
         print(f"[train_bc][rank={_r} local_rank={_lr}] before init_correction")
-        _t_init_corr = time.time()
         correction_modules = init_correction(config['wm_args'], accelerator.device)
-        print(f"[train_bc][rank={_r} local_rank={_lr}] after init_correction | elapsed={time.time() - _t_init_corr:.2f}s")
         norm_stats = config['norm_stats']
         correction_cfg = config['correction_cfg']
         raw_data_dir = config['raw_data_dir']
@@ -697,11 +664,19 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         export_corr_dir = str(correction_cfg.get('export_correction_dir', '')).strip()
         if export_corr and export_corr_dir == '':
             export_corr_dir = os.path.join(ckpt_dir, 'correction_dataset')
+        export_corr_rank_dir = None
         export_next_id = 0
-        if export_corr and accelerator.is_main_process:
-            os.makedirs(export_corr_dir, exist_ok=True)
-            export_next_id = _init_export_episode_id(export_corr_dir)
-            print(f"[train_bc] correction export enabled: {export_corr_dir}, next_episode_id={export_next_id}")
+        if export_corr:
+            export_corr_rank_dir = os.path.join(
+                export_corr_dir,
+                f"rank{int(accelerator.process_index):02d}",
+            )
+            os.makedirs(export_corr_rank_dir, exist_ok=True)
+            export_next_id = _init_export_episode_id(export_corr_rank_dir)
+            print(
+                f"[train_bc][rank={int(accelerator.process_index)}] correction export enabled: "
+                f"{export_corr_rank_dir}, next_episode_id={export_next_id}"
+            )
 
     train_history = []
 
@@ -719,15 +694,92 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         _set_explore_unit_idx_for_loader(train_dataloader, 0)
         _set_explore_local_k_for_loader(train_dataloader, int(failure_explore_k_local))
 
-    for epoch in tqdm(range(num_epochs), disable=not accelerator.is_main_process):
+    epoch_iter = range(num_epochs)
+    train_epoch_pbar = None
+    if not failure_explore_mode:
+        train_epoch_pbar = tqdm(
+            epoch_iter,
+            total=num_epochs,
+            desc="Epoch",
+            dynamic_ncols=True,
+            disable=not accelerator.is_main_process,
+        )
+        epoch_iter = train_epoch_pbar
+
+    explore_pbar = None
+    local_explore_done = False
+    all_explore_done = False
+    explore_progress = []
+    if failure_explore_mode:
+        init_unit_idx = _get_current_explore_unit_idx(train_dataloader)
+        init_trial_count = _get_current_explore_trial_count(train_dataloader)
+        init_completed_units = int(_get_explore_completed_unit_count(train_dataloader))
+        local_explore_done = bool(init_completed_units >= explore_num_units)
+        all_explore_done, explore_progress = _sync_all_explore_status(
+            local_explore_done,
+            init_completed_units,
+            explore_num_units,
+            init_unit_idx,
+            init_trial_count,
+        )
         if accelerator.is_main_process:
-            print(f"\nEpoch {epoch}")
+            total_all = int(sum(int(x["total"]) for x in explore_progress))
+            done_all = int(sum(int(x["completed"]) for x in explore_progress))
+            explore_pbar = tqdm(total=max(1, total_all), desc="Explore Units", dynamic_ncols=True)
+            if done_all > 0:
+                explore_pbar.update(done_all)
+            explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
+    for epoch in epoch_iter:
+        if failure_explore_mode and all_explore_done:
+            break
+        epoch_train_history = []
+        epoch_step_total = (None if failure_explore_mode else len(train_dataloader))
         corr_iter = iter(corr_train_dataloader) if corr_train_dataloader is not None else None
+        train_iter = iter(train_dataloader)
 
         # training
         policy.train()
         optimizer.zero_grad()
-        for batch_idx, data in enumerate(train_dataloader):
+        batch_idx = 0
+        if train_epoch_pbar is not None:
+            train_epoch_pbar.set_postfix_str(
+                f"epoch={epoch + 1}/{num_epochs} step=0/{epoch_step_total} global_step={global_step}"
+            )
+        while True:
+            if failure_explore_mode and all_explore_done:
+                break
+            if failure_explore_mode and local_explore_done:
+                curr_unit_idx = _get_current_explore_unit_idx(train_dataloader)
+                curr_trial_count = _get_current_explore_trial_count(train_dataloader)
+                curr_completed_units = int(_get_explore_completed_unit_count(train_dataloader))
+                all_explore_done, explore_progress = _sync_all_explore_status(
+                    True,
+                    curr_completed_units,
+                    explore_num_units,
+                    curr_unit_idx,
+                    curr_trial_count,
+                )
+                if explore_pbar is not None:
+                    done_all = int(sum(int(x["completed"]) for x in explore_progress))
+                    if done_all > int(explore_pbar.n):
+                        explore_pbar.update(done_all - int(explore_pbar.n))
+                    explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
+                global_step += 1
+                batch_idx += 1
+                if all_explore_done:
+                    break
+                continue
+            if failure_explore_mode:
+                try:
+                    data = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_dataloader)
+                    data = next(train_iter)
+            else:
+                try:
+                    data = next(train_iter)
+                except StopIteration:
+                    break
             did_explore_collective = False
 
             apply_wm = enable_wm and correction_modules is not None
@@ -747,9 +799,9 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                     bs_base = int(data[0].shape[0])
                     corr_images, corr_qpos, corr_actions, corr_pads = [], [], [], []
                     corr_mask = []
-                    # per-step debug dir (only on main process, only every 100 steps)
+                    # Per-step debug dir. When debug saving is enabled, we keep every step.
                     _step_dbg = None
-                    if debug_wm_dir and accelerator.is_main_process:
+                    if debug_wm_should_save:
                         _step_dbg = os.path.join(debug_wm_dir, f'step_{global_step:06d}')
                         os.makedirs(_step_dbg, exist_ok=True)
                     for bi in range(bs):
@@ -784,6 +836,15 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             ),
                             forced_mag_bin_id=(
                                 None if len(corr_source) <= 14 else corr_source[14][bi].item()
+                            ),
+                            sampled_mode_prob=(
+                                None if len(corr_source) <= 16 else corr_source[16][bi].item()
+                            ),
+                            sampled_entry_prob_within_mode=(
+                                None if len(corr_source) <= 17 else corr_source[17][bi].item()
+                            ),
+                            sampled_unit_prob=(
+                                None if len(corr_source) <= 18 else corr_source[18][bi].item()
                             ),
                         )
                         _corr_stats['n_triggered'] += 1
@@ -876,9 +937,9 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             corr_pads.append(cp)
                             corr_mask.append(1.0)
                             _corr_stats['n_success'] += 1
-                            if enable_wm and export_corr and accelerator.is_main_process:
+                            if enable_wm and export_corr and export_corr_rank_dir is not None:
                                 _export_correction_sample_as_episode(
-                                    export_corr_dir,
+                                    export_corr_rank_dir,
                                     export_next_id,
                                     config['camera_names'],
                                     ci,
@@ -898,10 +959,29 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                             corr_mask.append(0.0)
 
                     if failure_explore_mode:
+                        curr_unit_idx = _get_current_explore_unit_idx(train_dataloader)
+                        curr_trial_count = _get_current_explore_trial_count(train_dataloader)
+                        curr_completed_units = int(_get_explore_completed_unit_count(train_dataloader))
+                        local_explore_done = bool(curr_completed_units >= explore_num_units)
+                        all_explore_done, explore_progress = _sync_all_explore_status(
+                            local_explore_done,
+                            curr_completed_units,
+                            explore_num_units,
+                            curr_unit_idx,
+                            curr_trial_count,
+                        )
+                        if explore_pbar is not None:
+                            done_all = int(sum(int(x["completed"]) for x in explore_progress))
+                            if done_all > int(explore_pbar.n):
+                                explore_pbar.update(done_all - int(explore_pbar.n))
+                            explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
                         if global_step % failure_live_dump_interval == 0:
-                            _write_failure_tables(epoch, live=True)
+                            _write_failure_tables(epoch)
                         did_explore_collective = True
                         global_step += 1
+                        batch_idx += 1
+                        if all_explore_done:
+                            break
                         continue
 
                     # Build a fixed-size mixed batch: [base bs] + [correction bs].
@@ -1004,34 +1084,57 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                         print(f'[WM correction] step {global_step} error: {exc}')
                         print(_tb_text)
                     if failure_explore_mode and (not did_explore_collective):
-                        # Keep collectives aligned across ranks on synced mode.
-                        if (not failure_explore_no_sync) and dist.is_available() and dist.is_initialized():
-                            ws = int(dist.get_world_size())
-                            gathered_uids = [None for _ in range(ws)]
-                            dist.all_gather_object(gathered_uids, [])
+                        curr_unit_idx = _get_current_explore_unit_idx(train_dataloader)
+                        curr_trial_count = _get_current_explore_trial_count(train_dataloader)
+                        curr_completed_units = int(_get_explore_completed_unit_count(train_dataloader))
+                        local_explore_done = bool(curr_completed_units >= explore_num_units)
+                        all_explore_done, explore_progress = _sync_all_explore_status(
+                            local_explore_done,
+                            curr_completed_units,
+                            explore_num_units,
+                            curr_unit_idx,
+                            curr_trial_count,
+                        )
+                        if explore_pbar is not None:
+                            done_all = int(sum(int(x["completed"]) for x in explore_progress))
+                            if done_all > int(explore_pbar.n):
+                                explore_pbar.update(done_all - int(explore_pbar.n))
+                            explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
                         if global_step % failure_live_dump_interval == 0:
-                            _write_failure_tables(epoch, live=True)
+                            _write_failure_tables(epoch)
                         global_step += 1
+                        batch_idx += 1
+                        if all_explore_done:
+                            break
                         continue
                     forward_dict = forward_pass(data, policy)
                     loss = forward_dict["loss"]
 
             if failure_explore_mode:
                 global_step += 1
+                batch_idx += 1
+                if all_explore_done:
+                    break
                 continue
 
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
+            epoch_train_history.append(detach_dict(forward_dict))
             if accelerator.is_main_process and writer is not None:
                 writer.add_scalar('train/loss_step', forward_dict['loss'].item(), global_step)
                 writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
             global_step += 1
+            batch_idx += 1
+            if train_epoch_pbar is not None:
+                train_epoch_pbar.set_postfix_str(
+                    f"epoch={epoch + 1}/{num_epochs} step={batch_idx}/{epoch_step_total} global_step={global_step}"
+                )
         if failure_explore_mode:
             epoch_summary = {}
         else:
-            epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
+            epoch_summary = compute_dict_mean(epoch_train_history) if len(epoch_train_history) > 0 else {}
         # TensorBoard: log epoch-level metrics
         if accelerator.is_main_process and writer is not None:
             for k, v in epoch_summary.items():
@@ -1047,24 +1150,29 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
                 writer.add_scalar('correction/success_rate', _corr_stats['n_success'] / _total, epoch)
                 _succ = _corr_stats['n_success'] or 1
                 writer.add_scalar('correction/fallback_rate', _corr_stats['n_fallback'] / _succ, epoch)
-                print(f'  [Correction] triggered={_corr_stats["n_triggered"]} '
-                      f'success={_corr_stats["n_success"]} '
-                      f'skipped={_corr_stats["n_skipped"]} '
-                      f'error={_corr_stats["n_error"]} '
-                      f'fallback={_corr_stats["n_fallback"]} '
-                      f'rate={_corr_stats["n_success"]/_total:.2%}')
+                if train_epoch_pbar is not None:
+                    train_epoch_pbar.set_postfix_str(
+                        f"epoch={epoch + 1}/{num_epochs} "
+                        f"step={batch_idx}/{epoch_step_total} "
+                        f"global_step={global_step} "
+                        f"corr={_corr_stats['n_success']}/{_total} "
+                        f"fb={_corr_stats['n_fallback']}"
+                    )
                 # reset per-epoch
                 _corr_stats = {'n_triggered': 0, 'n_success': 0, 'n_skipped': 0,
                                'n_plan_fail': 0, 'n_error': 0, 'dists': [], 'steps_used': [],
                                'n_fallback': 0}
 
         if failure_explore_mode:
-            _write_failure_tables(epoch, live=False)
+            _write_failure_tables(epoch)
 
         if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
             unwrapped_policy = accelerator.unwrap_model(policy)
             torch.save(unwrapped_policy.state_dict(), ckpt_path)
+
+    if explore_pbar is not None:
+        explore_pbar.close()
 
     if accelerator.is_main_process:
         if writer is not None:

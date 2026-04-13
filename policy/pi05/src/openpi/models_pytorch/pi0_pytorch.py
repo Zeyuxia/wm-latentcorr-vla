@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -109,7 +110,14 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        disable_torch_compile = os.environ.get("OPENPI_DISABLE_TORCH_COMPILE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+        if not disable_torch_compile:
+            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

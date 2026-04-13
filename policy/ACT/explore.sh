@@ -4,7 +4,7 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate ACT
 
 # Base training parameters
-train_tag="open_laptop_0413_001944_train_test"
+train_tag="open_laptop_closed_loop_exploration_multigpu_test_thresh04_recovervideo"
 gpu_ids=4,5,6,7
 main_process_port=29500
 seed=0
@@ -25,7 +25,7 @@ policy_class=ACT
 kl_weight=10
 chunk_size=50
 hidden_dim=512
-batch_size=4
+batch_size=1
 dim_feedforward=3200
 num_epochs=2000
 lr=4e-5
@@ -52,23 +52,23 @@ sample_skip_head_ratio=0.6
 perturb_active_joint_delta_thresh=0.01
 perturb_active_gripper_delta_thresh=0.05
 rollout_exec_steps=16
-failure_mode=train
-failure_table_path=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260413_001944_open_laptop_closed_loop_exploration_multigpu_test_thresh04_recovervideo/failure_explore/failure_table.json
+failure_mode=explore
+failure_table_path=
 failure_table_dir=
 failure_phase_bins=3
 failure_translation_dir_bins=6
-failure_translation_mag_bins=3
+failure_translation_mag_bins=2
 failure_rotation_dir_bins=6
-failure_rotation_mag_bins=3
+failure_rotation_mag_bins=2
 failure_corr_batch_ratio=0.5
 failure_explore_k=4
 perturb_eef_fail_gain=0.12
 perturb_rot_max_deg=24
 recover_eval_enable=true
-recover_eval_save_video=false
+recover_eval_save_video=true
 recover_eval_gripper_open_thresh=0.8
 recover_eval_pos_thresh_m=0.04
-recover_eval_rot_thresh_deg=10.0
+recover_eval_rot_thresh_deg=8.0
 recover_eval_nearest_window_radius=16
 orient_weight=0.0573
 gripper_penalty=1.0
@@ -77,7 +77,7 @@ gripper_penalty=1.0
 debug_wm=true
 debug_wm_all_ranks=true
 debug_loss_batch_projection=true
-debug_correction_evac_rollout=false
+debug_correction_evac_rollout=true
 export_correction_dataset=true
 export_correction_dir=
 
@@ -89,7 +89,7 @@ if [ -n "${train_tag}" ]; then
 fi
 ckpt_dir=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/${timestamp}
 mkdir -p ${ckpt_dir}
-cp "$0" ${ckpt_dir}/train.sh
+cp "$0" ${ckpt_dir}/explore.sh
 
 # Bulid gpu flags
 num_gpus=$(echo ${gpu_ids} | awk -F',' '{print NF}')

@@ -98,15 +98,6 @@ def infer_phase_key_from_gt_window(left_grip_traj, right_grip_traj, window_len):
     l = left[:n]
     r = right[:n]
 
-    def _smooth3(arr):
-        if arr.size < 3:
-            return arr
-        k = np.array([1.0, 1.0, 1.0], dtype=np.float32) / 3.0
-        return np.convolve(arr, k, mode="same")
-
-    l_s = _smooth3(l)
-    r_s = _smooth3(r)
-
     def _first_cross(arr, open_event=True):
         if arr.size < 2:
             return None
@@ -116,8 +107,8 @@ def infer_phase_key_from_gt_window(left_grip_traj, right_grip_traj, window_len):
             idx = np.where((arr[:-1] > 0.5) & (arr[1:] <= 0.5))[0]
         return int(idx[0]) if idx.size > 0 else None
 
-    open_l, open_r = _first_cross(l_s, True), _first_cross(r_s, True)
-    close_l, close_r = _first_cross(l_s, False), _first_cross(r_s, False)
+    open_l, open_r = _first_cross(l, True), _first_cross(r, True)
+    close_l, close_r = _first_cross(l, False), _first_cross(r, False)
     open_events = [x for x in (open_l, open_r) if x is not None]
     close_events = [x for x in (close_l, close_r) if x is not None]
     first_open = min(open_events) if open_events else None
@@ -132,8 +123,8 @@ def infer_phase_key_from_gt_window(left_grip_traj, right_grip_traj, window_len):
     # For open_laptop-style tasks, slope-based trend fallback is intentionally
     # removed to avoid noisy short-window misclassification.
     # Fallback now relies only on gripper openness level.
-    mean_l = float(np.mean(l_s))
-    mean_r = float(np.mean(r_s))
+    mean_l = float(np.mean(l))
+    mean_r = float(np.mean(r))
     if mean_l > 0.5 and mean_r > 0.5:
         return "approach"
     if (mean_l <= 0.5) or (mean_r <= 0.5):
@@ -283,12 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Number of rotation magnitude bins for failure exploration")
         parser.add_argument("--failure_corr_batch_ratio", type=float, default=0.5,
                             help="Correction dataloader batch ratio relative to base batch size in failure_mode")
-        parser.add_argument("--failure_explore_card_mode", type=str, default="single",
-                            help="Explore card mode: single|multi. single writes local failure_table; multi writes trials-only for offline merge.")
         parser.add_argument("--failure_explore_k", type=int, default=3,
-                            help="Required unique samples (episode_id,start_ts) per failure unit before writing it to failure_table in explore mode")
-        parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5,
-                            help="Mark a unit as failure when recover_rate <= this threshold")
+                            help="Target number of explore trials per failure unit (global across all ranks)")
 
         # Online perturbation
         parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.03,
@@ -341,6 +328,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Penalty for gripper state mismatch in nearest-point matching (0=ignore gripper)")
         parser.add_argument("--debug_wm_correction", action="store_true",
                             help="Enable debug visualization for WM correction (saves images/stats to ckpt_dir/debug_wm)")
+        parser.add_argument("--debug_wm_all_ranks", type=str2bool, default=False,
+                            help="If true, save debug_wm outputs for every rank under ckpt_dir/debug_wm/rankXX")
         parser.add_argument("--debug_loss_batch_projection", type=str2bool, default=False,
                             help="Save projection images for every sample in the final batch used for loss update.")
         parser.add_argument("--export_correction_dataset", type=str2bool, default=False,

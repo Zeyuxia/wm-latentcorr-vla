@@ -54,9 +54,6 @@ def _infer_active_arms_from_gt_window(
     lg, lg_s = _grip_active(gt_left_grip)
     rg, rg_s = _grip_active(gt_right_grip)
 
-    if (not la) and (not ra):
-        la, ra = True, True
-
     return {
         "left_arm": bool(la), "right_arm": bool(ra),
         "left_gripper": bool(lg), "right_gripper": bool(rg),
