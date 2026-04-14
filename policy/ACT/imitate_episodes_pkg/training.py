@@ -143,6 +143,7 @@ def main(args):
         "camera_names": camera_names,
         "real_robot": not is_sim,
         "save_freq": args['save_freq'],
+        "resume_save_freq": args.get('resume_save_freq', 0),
     }
 
     enable_wm = args['enable_wm_correction']
@@ -173,6 +174,7 @@ def main(args):
         sample_skip_head_ratio = 0.0
         if failure_mode in {'explore', 'train'}:
             raise ValueError("failure_mode requires --enable_wm_correction")
+    resume_save_freq = int(config.get("resume_save_freq", 0) or 0)
     if enable_wm:
         if use_multi_task:
             raise ValueError("enable_wm_correction currently does not support multi-task training")
@@ -321,6 +323,7 @@ def main(args):
         if failure_mode == 'explore':
             config['correction_cfg']['recover_eval_enable'] = True
     config['act_init_ckpt'] = args.get('act_init_ckpt')
+    config['resume_ckpt'] = str(args.get('resume_ckpt', '')).strip()
     config['debug_wm_correction'] = args.get('debug_wm_correction', False)
     config['debug_wm_all_ranks'] = bool(args.get('debug_wm_all_ranks', False))
     config['debug_loss_batch_projection'] = bool(args.get('debug_loss_batch_projection', False))
@@ -432,7 +435,25 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     policy = make_policy(policy_class, policy_config)
     print(f"[train_bc][rank={_r} local_rank={_lr}] after make_policy | elapsed={time.time() - _t_make_policy:.2f}s")
 
-    if config.get('act_init_ckpt'):
+    resume_ckpt_path = str(config.get('resume_ckpt', '')).strip()
+    resume_state = None
+    start_epoch = 0
+    resumed_global_step = 0
+    if resume_ckpt_path:
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before load_resume_ckpt")
+        _t_load_resume = time.time()
+        resume_state = torch.load(resume_ckpt_path, map_location='cpu')
+        if isinstance(resume_state, dict) and ('model' in resume_state or 'policy' in resume_state):
+            model_state = resume_state.get('model', resume_state.get('policy'))
+            policy.load_state_dict(model_state)
+            start_epoch = int(resume_state.get('epoch', 0))
+            resumed_global_step = int(resume_state.get('global_step', 0))
+        else:
+            policy.load_state_dict(resume_state)
+            resume_state = None
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after load_resume_ckpt | elapsed={time.time() - _t_load_resume:.2f}s")
+        print(f"Loaded resume weights from {resume_ckpt_path} | start_epoch={start_epoch} | global_step={resumed_global_step}")
+    elif config.get('act_init_ckpt'):
         print(f"[train_bc][rank={_r} local_rank={_lr}] before load_act_init_ckpt")
         _t_load_act = time.time()
         ckpt = torch.load(config['act_init_ckpt'], map_location='cpu')
@@ -444,6 +465,10 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     _t_make_opt = time.time()
     optimizer = make_optimizer(policy_class, policy)
     print(f"[train_bc][rank={_r} local_rank={_lr}] after make_optimizer | elapsed={time.time() - _t_make_opt:.2f}s")
+    if resume_state is not None and 'optimizer' in resume_state:
+        print(f"[train_bc][rank={_r} local_rank={_lr}] before load_resume_optimizer")
+        optimizer.load_state_dict(resume_state['optimizer'])
+        print(f"[train_bc][rank={_r} local_rank={_lr}] after load_resume_optimizer")
     print(f"[train_bc][rank={_r} local_rank={_lr}] before accelerator.prepare")
     _t_prepare = time.time()
     if failure_explore_mode:
@@ -688,13 +713,13 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         print(f'TensorBoard log dir: {tb_log_dir}')
         if failure_explore_mode:
             os.makedirs(failure_table_dir, exist_ok=True)
-    global_step = 0
+    global_step = int(resumed_global_step)
     explore_num_units = int(_get_explore_num_units(train_dataloader)) if failure_explore_mode else 0
     if failure_explore_mode and explore_num_units > 0:
         _set_explore_unit_idx_for_loader(train_dataloader, 0)
         _set_explore_local_k_for_loader(train_dataloader, int(failure_explore_k_local))
 
-    epoch_iter = range(num_epochs)
+    epoch_iter = range(start_epoch, num_epochs)
     train_epoch_pbar = None
     if not failure_explore_mode:
         train_epoch_pbar = tqdm(
@@ -729,6 +754,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
             if done_all > 0:
                 explore_pbar.update(done_all)
             explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
+    last_finished_epoch = start_epoch
     for epoch in epoch_iter:
         if failure_explore_mode and all_explore_done:
             break
@@ -1170,6 +1196,21 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
             unwrapped_policy = accelerator.unwrap_model(policy)
             torch.save(unwrapped_policy.state_dict(), ckpt_path)
+        if resume_save_freq > 0 and (epoch + 1) % resume_save_freq == 0 and accelerator.is_main_process:
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            resume_path = os.path.join(ckpt_dir, f"resume_epoch_{epoch + 1}_seed_{seed}.pt")
+            torch.save(
+                {
+                    "model": unwrapped_policy.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": int(epoch + 1),
+                    "global_step": int(global_step),
+                    "seed": int(seed),
+                    "policy_class": str(policy_class),
+                },
+                resume_path,
+            )
+        last_finished_epoch = int(epoch + 1)
 
     if explore_pbar is not None:
         explore_pbar.close()
@@ -1181,5 +1222,17 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
         unwrapped_policy = accelerator.unwrap_model(policy)
         torch.save(unwrapped_policy.state_dict(), ckpt_path)
+        resume_path = os.path.join(ckpt_dir, "resume_last.pt")
+        torch.save(
+            {
+                "model": unwrapped_policy.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": int(last_finished_epoch),
+                "global_step": int(global_step),
+                "seed": int(seed),
+                "policy_class": str(policy_class),
+            },
+            resume_path,
+        )
 
     print(f"Training finished: Seed {seed}")

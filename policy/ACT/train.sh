@@ -30,8 +30,10 @@ dim_feedforward=3200
 num_epochs=2000
 lr=4e-5
 save_freq=10
+resume_save_freq=50
 state_dim=14
 act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933_1000epoch_baseline/policy_epoch_1000_seed_0.ckpt
+resume_ckpt=
 
 # EVAC parameters
 enable_wm=true
@@ -175,6 +177,7 @@ train_flags="--task_name sim-${task_name}-${task_config}-${expert_data_num} \
 --num_epochs ${num_epochs} \
 --lr ${lr} \
 --save_freq ${save_freq} \
+--resume_save_freq ${resume_save_freq} \
 --state_dim ${state_dim} \
 --seed ${seed} \
 "
@@ -186,6 +189,9 @@ if [ -n "${task_weights}" ]; then
 fi
 if [ -n "${act_init_ckpt}" ]; then
     train_flags="${train_flags} --act_init_ckpt ${act_init_ckpt}"
+fi
+if [ -n "${resume_ckpt}" ]; then
+    train_flags="${train_flags} --resume_ckpt ${resume_ckpt}"
 fi
 
 PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \

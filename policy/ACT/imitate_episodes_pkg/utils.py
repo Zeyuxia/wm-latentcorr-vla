@@ -242,6 +242,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--hidden_dim", action="store", type=int, help="hidden_dim", required=False)
         parser.add_argument("--state_dim", action="store", type=int, help="state dim", required=True)
         parser.add_argument("--save_freq", action="store", type=int, help="save ckpt frequency", required=False, default=6000)
+        parser.add_argument("--resume_save_freq", action="store", type=int,
+                            help="save resume ckpt frequency (0 or negative disables periodic resume saves)",
+                            required=False, default=0)
+        parser.add_argument("--resume_ckpt", type=str, default="",
+                            help="Path to training resume checkpoint (restores model/optimizer/epoch/global_step)")
         parser.add_argument(
             "--dim_feedforward",
             action="store",
