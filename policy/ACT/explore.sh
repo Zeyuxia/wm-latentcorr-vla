@@ -188,7 +188,7 @@ if [ -n "${act_init_ckpt}" ]; then
     train_flags="${train_flags} --act_init_ckpt ${act_init_ckpt}"
 fi
 
-CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     ${gpu_flags} \
     imitate_episodes.py \
     ${train_flags} \

@@ -5,7 +5,7 @@ conda activate ACT
 
 # Base training parameters
 train_tag="open_laptop_0413_001944_train_test"
-gpu_ids=4,5,6,7
+gpu_ids=0,1,2,3
 main_process_port=29500
 seed=0
 
@@ -36,7 +36,7 @@ act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/2026
 # EVAC parameters
 enable_wm=true
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
-evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3124-step=12500.ckpt
+evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3499-step=14000.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -188,7 +188,7 @@ if [ -n "${act_init_ckpt}" ]; then
     train_flags="${train_flags} --act_init_ckpt ${act_init_ckpt}"
 fi
 
-CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=${gpu_ids} accelerate launch \
     ${gpu_flags} \
     imitate_episodes.py \
     ${train_flags} \
