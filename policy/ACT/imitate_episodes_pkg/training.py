@@ -5,6 +5,7 @@ import sys
 import time
 import pickle
 import json
+import random
 import traceback
 
 import numpy as np
@@ -32,6 +33,79 @@ from imitate_episodes_pkg.utils import (
     active_arm_pattern_id_to_key,
     set_failure_param_bins,
 )
+
+def _capture_local_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state().cpu(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = [rng.cpu() for rng in torch.cuda.get_rng_state_all()]
+        except Exception:
+            state["torch_cuda"] = None
+    else:
+        state["torch_cuda"] = None
+    return state
+
+
+def _gather_rng_state_by_rank(accelerator):
+    local_payload = {
+        "rank": int(accelerator.process_index),
+        "state": _capture_local_rng_state(),
+    }
+    if dist.is_available() and dist.is_initialized():
+        world_size = int(dist.get_world_size())
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, local_payload)
+        rng_state_by_rank = {}
+        for item in gathered:
+            if not isinstance(item, dict):
+                continue
+            try:
+                rng_state_by_rank[int(item["rank"])] = item["state"]
+            except Exception:
+                continue
+        return rng_state_by_rank
+    return {int(accelerator.process_index): local_payload["state"]}
+
+
+def _restore_rng_state_for_rank(rng_state_payload, rank):
+    if not rng_state_payload:
+        return False
+
+    local_state = None
+    if isinstance(rng_state_payload, dict) and "torch_cpu" in rng_state_payload:
+        local_state = rng_state_payload
+    elif isinstance(rng_state_payload, dict):
+        for key in (int(rank), str(int(rank)), 0, "0"):
+            if key in rng_state_payload:
+                local_state = rng_state_payload[key]
+                break
+        if local_state is None and len(rng_state_payload) > 0:
+            first_key = next(iter(rng_state_payload))
+            local_state = rng_state_payload[first_key]
+
+    if not isinstance(local_state, dict):
+        return False
+
+    try:
+        if "python" in local_state:
+            random.setstate(local_state["python"])
+        if "numpy" in local_state:
+            np.random.set_state(local_state["numpy"])
+        if "torch_cpu" in local_state:
+            torch.random.set_rng_state(local_state["torch_cpu"])
+        cuda_states = local_state.get("torch_cuda")
+        if torch.cuda.is_available() and cuda_states:
+            n_curr = int(torch.cuda.device_count())
+            for dev_idx, rng_state in enumerate(list(cuda_states)[:n_curr]):
+                torch.cuda.set_rng_state(rng_state, device=dev_idx)
+    except Exception:
+        return False
+    return True
+
 
 def main(args):
     set_seed(int(args["seed"]))
@@ -174,7 +248,6 @@ def main(args):
         sample_skip_head_ratio = 0.0
         if failure_mode in {'explore', 'train'}:
             raise ValueError("failure_mode requires --enable_wm_correction")
-    resume_save_freq = int(config.get("resume_save_freq", 0) or 0)
     if enable_wm:
         if use_multi_task:
             raise ValueError("enable_wm_correction currently does not support multi-task training")
@@ -402,6 +475,7 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     num_epochs = config["num_epochs"]
     ckpt_dir = config["ckpt_dir"]
     seed = config["seed"]
+    resume_save_freq = int(config.get("resume_save_freq", 0) or 0)
     policy_class = config["policy_class"]
     policy_config = config["policy_config"]
     enable_wm = bool(config["enable_wm_correction"])
@@ -469,6 +543,10 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         print(f"[train_bc][rank={_r} local_rank={_lr}] before load_resume_optimizer")
         optimizer.load_state_dict(resume_state['optimizer'])
         print(f"[train_bc][rank={_r} local_rank={_lr}] after load_resume_optimizer")
+    if resume_state is not None:
+        rng_state_payload = resume_state.get('rng_state_by_rank', resume_state.get('rng_state'))
+        restored_rng = _restore_rng_state_for_rank(rng_state_payload, int(accelerator.process_index))
+        print(f"[train_bc][rank={_r} local_rank={_lr}] restored_rng_state={restored_rng}")
     print(f"[train_bc][rank={_r} local_rank={_lr}] before accelerator.prepare")
     _t_prepare = time.time()
     if failure_explore_mode:
@@ -1196,25 +1274,34 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
             unwrapped_policy = accelerator.unwrap_model(policy)
             torch.save(unwrapped_policy.state_dict(), ckpt_path)
-        if resume_save_freq > 0 and (epoch + 1) % resume_save_freq == 0 and accelerator.is_main_process:
-            unwrapped_policy = accelerator.unwrap_model(policy)
-            resume_path = os.path.join(ckpt_dir, f"resume_epoch_{epoch + 1}_seed_{seed}.pt")
-            torch.save(
-                {
-                    "model": unwrapped_policy.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": int(epoch + 1),
-                    "global_step": int(global_step),
-                    "seed": int(seed),
-                    "policy_class": str(policy_class),
-                },
-                resume_path,
-            )
+        if resume_save_freq > 0 and (epoch + 1) % resume_save_freq == 0:
+            rng_state_by_rank = _gather_rng_state_by_rank(accelerator)
+            if accelerator.is_main_process:
+                unwrapped_policy = accelerator.unwrap_model(policy)
+                resume_path = os.path.join(ckpt_dir, f"resume_epoch_{epoch + 1}_seed_{seed}.pt")
+                torch.save(
+                    {
+                        "resume_format_version": 2,
+                        "model": unwrapped_policy.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "epoch": int(epoch + 1),
+                        "global_step": int(global_step),
+                        "seed": int(seed),
+                        "policy_class": str(policy_class),
+                        "world_size": int(accelerator.num_processes),
+                        "save_freq": int(config['save_freq']),
+                        "resume_save_freq": int(resume_save_freq),
+                        "rng_state_by_rank": rng_state_by_rank,
+                        "resume_from": resume_ckpt_path,
+                    },
+                    resume_path,
+                )
         last_finished_epoch = int(epoch + 1)
 
     if explore_pbar is not None:
         explore_pbar.close()
 
+    final_rng_state_by_rank = _gather_rng_state_by_rank(accelerator)
     if accelerator.is_main_process:
         if writer is not None:
             writer.close()
@@ -1225,12 +1312,18 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         resume_path = os.path.join(ckpt_dir, "resume_last.pt")
         torch.save(
             {
+                "resume_format_version": 2,
                 "model": unwrapped_policy.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": int(last_finished_epoch),
                 "global_step": int(global_step),
                 "seed": int(seed),
                 "policy_class": str(policy_class),
+                "world_size": int(accelerator.num_processes),
+                "save_freq": int(config['save_freq']),
+                "resume_save_freq": int(resume_save_freq),
+                "rng_state_by_rank": final_rng_state_by_rank,
+                "resume_from": resume_ckpt_path,
             },
             resume_path,
         )
