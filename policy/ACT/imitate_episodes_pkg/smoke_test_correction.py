@@ -19,7 +19,7 @@ if _EVAC_ROOT not in sys.path:
 
 from constants import SIM_TASK_CONFIGS
 from imitate_episodes_pkg.correction import correction_step, load_raw_data
-from imitate_episodes_pkg.utils import build_evac_infer_kwargs
+from imitate_episodes_pkg.utils import build_evac_infer_kwargs, phase_id_to_key
 from imitate_episodes_pkg.training import init_correction, make_policy
 from utils import load_data
 
@@ -71,10 +71,6 @@ def _build_args():
     parser.add_argument("--kl_weight", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--sample_phase_window_len", type=int, default=30)
-    parser.add_argument("--sample_pregrasp_bias_enable", type=str, default="true")
-    parser.add_argument("--sample_pregrasp_prob", type=float, default=1.0)
-    parser.add_argument("--sample_pregrasp_keep_start_ratio", type=float, default=0.3)
-    parser.add_argument("--sample_pregrasp_keep_end_ratio", type=float, default=0.5)
     parser.add_argument("--sample_skip_head_ratio", type=float, default=0.25)
     parser.add_argument("--rollout_exec_steps", type=int, default=16)
     parser.add_argument("--max_rollout_steps", type=int, default=1)
@@ -85,11 +81,6 @@ def _build_args():
     parser.add_argument("--orient_weight", type=float, default=0.0573)
     parser.add_argument("--gripper_penalty", type=float, default=1.0)
     parser.add_argument("--enable_perturb", type=str, default="true")
-    parser.add_argument("--perturb_prob", type=float, default=1.0)
-    parser.add_argument("--perturb_error_mode", default="open_laptop_pregrasp")
-    parser.add_argument("--perturb_open_laptop_pregrasp_close_prob", type=float, default=0.5)
-    parser.add_argument("--perturb_open_laptop_pregrasp_translation_prob", type=float, default=0.0)
-    parser.add_argument("--perturb_open_laptop_pregrasp_rotation_prob", type=float, default=0.0)
     parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.10)
     parser.add_argument("--perturb_rot_max_deg", type=float, default=15.0)
     parser.add_argument("--perturb_mag_random", type=str, default="false")
@@ -127,20 +118,17 @@ def main():
         raw_data_dir=args.raw_data_dir,
         start_margin=int(args.max_rollout_steps) * int(args.rollout_exec_steps),
         sample_skip_head_ratio=float(args.sample_skip_head_ratio),
-        sample_pregrasp_bias_enable=_bool(args.sample_pregrasp_bias_enable),
-        sample_pregrasp_prob=float(args.sample_pregrasp_prob),
         sample_phase_window_len=int(args.sample_phase_window_len),
-        sample_pregrasp_keep_start_ratio=float(args.sample_pregrasp_keep_start_ratio),
-        sample_pregrasp_keep_end_ratio=float(args.sample_pregrasp_keep_end_ratio),
-        sample_pregrasp_close_offset_steps=int(args.rollout_exec_steps),
     )
 
     data = next(iter(train_loader))
     image_data, qpos_data = data[0], data[1]
     ep_id = int(data[4][0].item())
     start_ts = int(data[5][0].item())
-    pregrasp_seg_start = int(data[6][0].item()) if len(data) > 6 else None
-    pregrasp_seg_end = int(data[7][0].item()) if len(data) > 7 else None
+    sampled_phase_id = int(data[6][0].item())
+    sampled_phase_key = phase_id_to_key(sampled_phase_id)
+    pregrasp_seg_start = int(data[7][0].item())
+    pregrasp_seg_end = int(data[8][0].item())
 
     policy_config = {
         "lr": 4e-5,
@@ -200,11 +188,6 @@ def main():
         "gripper_penalty": float(args.gripper_penalty),
         "evac_infer_kwargs": build_evac_infer_kwargs(vars(args)),
         "enable_perturb": _bool(args.enable_perturb),
-        "perturb_prob": float(args.perturb_prob),
-        "perturb_error_mode": str(args.perturb_error_mode),
-        "perturb_open_laptop_pregrasp_close_prob": float(args.perturb_open_laptop_pregrasp_close_prob),
-        "perturb_open_laptop_pregrasp_translation_prob": float(args.perturb_open_laptop_pregrasp_translation_prob),
-        "perturb_open_laptop_pregrasp_rotation_prob": float(args.perturb_open_laptop_pregrasp_rotation_prob),
         "perturb_eef_fail_gain": float(args.perturb_eef_fail_gain),
         "perturb_rot_max_deg": float(args.perturb_rot_max_deg),
         "perturb_mag_random": _bool(args.perturb_mag_random),
@@ -230,6 +213,7 @@ def main():
         device,
         debug_dir=debug_dir,
         start_ts=start_ts,
+        sampled_phase_id=sampled_phase_id,
         pregrasp_seg_start=pregrasp_seg_start,
         pregrasp_seg_end=pregrasp_seg_end,
     )
@@ -237,6 +221,8 @@ def main():
     result = {
         "episode_id": ep_id,
         "start_ts": start_ts,
+        "sampled_phase_id": sampled_phase_id,
+        "sampled_phase_key": sampled_phase_key,
         "pregrasp_seg_start": pregrasp_seg_start,
         "pregrasp_seg_end": pregrasp_seg_end,
         "debug_dir": debug_dir,
@@ -245,22 +231,28 @@ def main():
 
     if corr is not None:
         corr_image, corr_qpos, corr_action, corr_is_pad, corr_meta = corr
-        valid_len = int((~corr_is_pad).sum().item())
-        result.update(
-            {
-                "corr_image_shape": list(corr_image.shape),
-                "corr_qpos_shape": list(corr_qpos.shape),
-                "corr_action_shape": list(corr_action.shape),
-                "valid_action_len": valid_len,
-                "first_action_raw": (
-                    corr_action[0].detach().cpu().numpy() * stats["action_std"] + stats["action_mean"]
-                ).astype(np.float32).tolist(),
-                "last_valid_action_raw": (
-                    corr_action[max(0, valid_len - 1)].detach().cpu().numpy() * stats["action_std"] + stats["action_mean"]
-                ).astype(np.float32).tolist(),
-                "corr_meta": corr_meta,
-            }
+        corr_generated = bool(
+            (corr_image is not None) and (corr_qpos is not None)
+            and (corr_action is not None) and (corr_is_pad is not None)
         )
+        result["correction_generated"] = corr_generated
+        result["corr_meta"] = corr_meta
+        if corr_generated:
+            valid_len = int((~corr_is_pad).sum().item())
+            result.update(
+                {
+                    "corr_image_shape": list(corr_image.shape),
+                    "corr_qpos_shape": list(corr_qpos.shape),
+                    "corr_action_shape": list(corr_action.shape),
+                    "valid_action_len": valid_len,
+                    "first_action_raw": (
+                        corr_action[0].detach().cpu().numpy() * stats["action_std"] + stats["action_mean"]
+                    ).astype(np.float32).tolist(),
+                    "last_valid_action_raw": (
+                        corr_action[max(0, valid_len - 1)].detach().cpu().numpy() * stats["action_std"] + stats["action_mean"]
+                    ).astype(np.float32).tolist(),
+                }
+            )
 
     out_path = os.path.join(args.export_dir, "smoke_result.json")
     with open(out_path, "w") as f:

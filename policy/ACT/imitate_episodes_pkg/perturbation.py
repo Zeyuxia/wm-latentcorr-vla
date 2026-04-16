@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from imitate_episodes_pkg.utils import (
+    get_failure_param_bins,
     resample_trajectory,
     infer_phase_key_from_gt_window as _infer_phase_key_from_gt_window,
 )
@@ -52,9 +53,6 @@ def _infer_active_arms_from_gt_window(
     ra, ra_s = _arm_active(gt_right_arm)
     lg, lg_s = _grip_active(gt_left_grip)
     rg, rg_s = _grip_active(gt_right_grip)
-
-    if (not la) and (not ra):
-        la, ra = True, True
 
     return {
         "left_arm": bool(la), "right_arm": bool(ra),
@@ -124,54 +122,69 @@ def _sample_in_forward_hemisphere(forward_dir):
         return fwd.astype(np.float32)
     return d.astype(np.float32)
 
-def _sample_error_mode(phase_key, cfg):
-    req = str(cfg.get("perturb_error_mode", "legacy")).strip().lower()
-    phase = str(phase_key).strip().lower()
 
-    # 1) Task-specific stage-gated sampling.
-    if req == "open_laptop_pregrasp":
-        if phase != "pregrasp":
-            return None
-        names = ["gripper_close", "translation", "rotation"]
-        probs = np.array(
-            [
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_close_prob", 0.8))),
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_translation_prob", 0.1))),
-                float(max(0.0, cfg.get("perturb_open_laptop_pregrasp_rotation_prob", 0.1))),
-            ],
-            dtype=np.float64,
-        )
-        if float(np.sum(probs)) <= 1e-12:
-            probs = np.array([0.8, 0.1, 0.1], dtype=np.float64)
-        probs = probs / np.sum(probs)
-        return np.random.choice(names, p=probs).item()
+def _build_basis_from_forward(forward_dir):
+    fwd = _unit_vec3(forward_dir)
+    if fwd is None:
+        fwd = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(float(np.dot(fwd, ref))) > 0.95:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    u = _unit_vec3(np.cross(ref, fwd))
+    if u is None:
+        u = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    v = _unit_vec3(np.cross(fwd, u))
+    if v is None:
+        v = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return (
+        np.asarray(fwd, dtype=np.float32),
+        np.asarray(u, dtype=np.float32),
+        np.asarray(v, dtype=np.float32),
+    )
 
-    # 2) Fixed mode.
-    if req in {"translation", "rotation", "gripper_close"}:
-        return req
 
-    # 3) Unsupported/disabled mode.
-    return None
+def _mag_value_from_bin(max_value, mag_bin_id, n_mag):
+    n = int(max(1, int(n_mag)))
+    b = int(np.clip(int(mag_bin_id), 0, n - 1))
+    # Use non-zero bins: (1/N, 2/N, ..., N/N) * max_value.
+    scale = float(b + 1) / float(n)
+    return float(max_value) * scale, b
 
-def _gate_gripper_error_mode(
-    selected_mode, init_left_grip, init_right_grip, cfg,
-    active_left_gripper=True, active_right_gripper=True
-):
-    # Guard gripper_close only when both sides are effectively not open.
-    # "active_*_gripper" is no longer required here.
-    mode = str(selected_mode).strip().lower() if selected_mode is not None else None
-    if mode == "gripper_close":
-        close_min = float(np.clip(cfg.get("perturb_gripper_close_min", 0.10), 0.0, 1.0))
-        l_open = bool(float(np.clip(init_left_grip, 0.0, 1.0)) > close_min)
-        r_open = bool(float(np.clip(init_right_grip, 0.0, 1.0)) > close_min)
-        if not (l_open or r_open):
-            return "translation"
-    return selected_mode
+
+def _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir, theta_deg=60.0):
+    fwd = _eef_forward_dir_from_wxyz(quat_wxyz)
+    fwd, u, v = _build_basis_from_forward(fwd)
+    n = int(max(1, int(n_dir)))
+    idx = int(np.clip(int(dir_bin_id), 0, n - 1))
+    if n == 1:
+        return np.asarray(fwd, dtype=np.float32), idx
+    # Clockwise around forward axis.
+    phi = -2.0 * np.pi * (float(idx) / float(n))
+    theta = np.deg2rad(float(theta_deg))
+    d = (
+        np.cos(theta) * fwd
+        + np.sin(theta) * (np.cos(phi) * u + np.sin(phi) * v)
+    )
+    du = _unit_vec3(d)
+    if du is None:
+        du = fwd
+    return np.asarray(du, dtype=np.float32), idx
+
+
+def _translation_dir_from_bin(quat_wxyz, dir_bin_id):
+    n = int(max(1, get_failure_param_bins()["translation_dir_bins"]))
+    return _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir=n, theta_deg=60.0)
+
+
+def _rotation_axis_from_bin(quat_wxyz, dir_bin_id):
+    n = int(max(1, get_failure_param_bins()["rotation_dir_bins"]))
+    return _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir=n, theta_deg=60.0)
 
 def _perturb_action_chunk_target_pose(
     act_raw, cfg, fk, planner_l, planner_r,
     curr_left_q, curr_right_q, init_left_grip, init_right_grip,
     left_ep, right_ep, left_grip_traj, right_grip_traj, t_star, rollout_exec_steps,
+    forced_dir_bin_id=-1, forced_mag_bin_id=-1,
     error_mode="translation",
     active_left_arm=True, active_right_arm=True,
     active_left_gripper=True, active_right_gripper=True,
@@ -201,32 +214,58 @@ def _perturb_action_chunk_target_pose(
     l_pose = l_pose_gt.copy()
     r_pose = r_pose_gt.copy()
 
-    mag_rand = bool(cfg["perturb_mag_random"])
-    mag_min = float(cfg["perturb_mag_rand_min"])
-    mag_max = float(cfg["perturb_mag_rand_max"])
-    if mag_max < mag_min:
-        mag_min, mag_max = mag_max, mag_min
-    mag_scale = float(np.random.uniform(mag_min, mag_max)) if mag_rand else 1.0
-
     mode = str(error_mode).lower()
+    bin_cfg = get_failure_param_bins()
+    if mode == "translation":
+        n_dir = int(max(1, bin_cfg["translation_dir_bins"]))
+        n_mag = int(max(1, bin_cfg["translation_mag_bins"]))
+        dir_bin_id = int(np.clip(int(forced_dir_bin_id), 0, n_dir - 1))
+        mag_bin_id = int(np.clip(int(forced_mag_bin_id), 0, n_mag - 1))
+        axis_bin_id = None
+    elif mode == "rotation":
+        n_dir = int(max(1, bin_cfg["rotation_dir_bins"]))
+        n_mag = int(max(1, bin_cfg["rotation_mag_bins"]))
+        dir_bin_id = int(np.clip(int(forced_dir_bin_id), 0, n_dir - 1))
+        mag_bin_id = int(np.clip(int(forced_mag_bin_id), 0, n_mag - 1))
+        axis_bin_id = int(dir_bin_id)
+    else:
+        n_dir = 0
+        n_mag = 0
+        dir_bin_id = -1
+        mag_bin_id = -1
+        axis_bin_id = None
     curr_left_q = np.asarray(curr_left_q, dtype=np.float32)
     curr_right_q = np.asarray(curr_right_q, dtype=np.float32)
+    sampled_axis_l = None
+    sampled_axis_r = None
+    sampled_dir_l = None
+    sampled_dir_r = None
+    sampled_rotation_deg = None
+    sampled_translation_gain_m = None
 
     if mode == "rotation":
         # Rotate around the unified sampled-start target pose.
-        angle_max_deg = float(cfg.get("perturb_rot_max_deg", 15.0)) * mag_scale
+        angle_max_deg, _ = _mag_value_from_bin(
+            float(cfg.get("perturb_rot_max_deg", 15.0)),
+            mag_bin_id,
+            n_mag,
+        )
         angle = np.deg2rad(angle_max_deg)
+        sampled_rotation_deg = float(angle_max_deg)
         axis_l = None
         axis_r = None
         if forced_axis_left is not None:
             axis_l = np.asarray(forced_axis_left, dtype=np.float32)
         if forced_axis_right is not None:
             axis_r = np.asarray(forced_axis_right, dtype=np.float32)
-        if forced_axis_left is None and forced_axis_right is None:
-            axis_l = _sample_unit_vec3()
-            axis_r = _sample_unit_vec3()
+        if forced_axis_left is None:
+            axis_l, _ = _rotation_axis_from_bin(l_pose[3:7], int(dir_bin_id if dir_bin_id >= 0 else 0))
+        if forced_axis_right is None:
+            axis_r, _ = _rotation_axis_from_bin(r_pose[3:7], int(dir_bin_id if dir_bin_id >= 0 else 0))
         axis_l = _unit_vec3(axis_l) if axis_l is not None else _sample_unit_vec3()
         axis_r = _unit_vec3(axis_r) if axis_r is not None else _sample_unit_vec3()
+        sampled_axis_l = np.asarray(axis_l, dtype=np.float32).tolist()
+        sampled_axis_r = np.asarray(axis_r, dtype=np.float32).tolist()
         if active_left_arm:
             ql_xyzw = np.array([l_pose[4], l_pose[5], l_pose[6], l_pose[3]], dtype=np.float32)
             ql_new = (R.from_rotvec(np.asarray(axis_l, dtype=np.float32) * angle) * R.from_quat(ql_xyzw)).as_quat()
@@ -238,7 +277,12 @@ def _perturb_action_chunk_target_pose(
         mode_tag = "target_pose_rotation"
     elif mode == "translation":
         # Translate from the same sampled-start target pose.
-        fail_gain = float(cfg.get("perturb_eef_fail_gain", 0.03)) * mag_scale
+        fail_gain, _ = _mag_value_from_bin(
+            float(cfg.get("perturb_eef_fail_gain", 0.03)),
+            mag_bin_id,
+            n_mag,
+        )
+        sampled_translation_gain_m = float(fail_gain)
         dir_l = None
         dir_r = None
         if forced_dir_left is not None:
@@ -246,9 +290,11 @@ def _perturb_action_chunk_target_pose(
         if forced_dir_right is not None:
             dir_r = np.asarray(forced_dir_right, dtype=np.float32)
         if dir_l is None:
-            dir_l = _sample_in_forward_hemisphere(_eef_forward_dir_from_wxyz(l_pose[3:7]))
+            dir_l, _ = _translation_dir_from_bin(l_pose[3:7], int(dir_bin_id if dir_bin_id >= 0 else 0))
         if dir_r is None:
-            dir_r = _sample_in_forward_hemisphere(_eef_forward_dir_from_wxyz(r_pose[3:7]))
+            dir_r, _ = _translation_dir_from_bin(r_pose[3:7], int(dir_bin_id if dir_bin_id >= 0 else 0))
+        sampled_dir_l = np.asarray(dir_l, dtype=np.float32).tolist()
+        sampled_dir_r = np.asarray(dir_r, dtype=np.float32).tolist()
         if active_left_arm:
             l_pose[:3] = l_pose[:3] + fail_gain * np.asarray(dir_l, dtype=np.float32)
         if active_right_arm:
@@ -300,9 +346,9 @@ def _perturb_action_chunk_target_pose(
         out[:, 0:6] = lt
         out[:, 7:13] = rt
     else:
-        # For gripper_close, keep original arm sequence unchanged.
-        out[:, 0:6] = np.asarray(act_raw[:, 0:6], dtype=np.float32)
-        out[:, 7:13] = np.asarray(act_raw[:, 7:13], dtype=np.float32)
+        # For gripper_close, keep arms fixed at sampled start (current qpos).
+        out[:, 0:6] = np.repeat(curr_left_q[None, :], T, axis=0).astype(np.float32)
+        out[:, 7:13] = np.repeat(curr_right_q[None, :], T, axis=0).astype(np.float32)
 
     if mode == "gripper_close":
         lg_tgt = 0.0
@@ -323,7 +369,15 @@ def _perturb_action_chunk_target_pose(
 
     info = {
         "target_idx": int(idx),
-        "perturb_mag_scale": float(mag_scale),
+        "dir_bin_id": (None if dir_bin_id < 0 else int(dir_bin_id)),
+        "mag_bin_id": (None if mag_bin_id < 0 else int(mag_bin_id)),
+        "axis_bin_id": (None if axis_bin_id is None else int(axis_bin_id)),
+        "perturb_translation_gain_m": sampled_translation_gain_m,
+        "perturb_rotation_deg": sampled_rotation_deg,
+        "perturb_dir_left": sampled_dir_l,
+        "perturb_dir_right": sampled_dir_r,
+        "perturb_axis_left": sampled_axis_l,
+        "perturb_axis_right": sampled_axis_r,
         "error_mode": mode,
     }
     return out, True, mode_tag, info
@@ -335,27 +389,29 @@ def perturb_action_chunk_online(
     active_left_arm=True, active_right_arm=True,
     active_left_gripper=True, active_right_gripper=True,
     left_ep=None, right_ep=None, left_grip_traj=None, right_grip_traj=None,
-    t_star=None, rollout_exec_steps=None
+    t_star=None, rollout_exec_steps=None, forced_error_mode=None,
+    forced_dir_bin_id=-1, forced_mag_bin_id=-1
 ):
     """
-    Dynamics-aware perturbation in action space:
-    low-pass execution + AR(1) colored noise + optional bias +
-    velocity/acceleration limits.
+    Apply forced perturbation mode/dir-bin/mag-bin on action chunk.
+    In failure train, mode and bins are provided by dataloader.
     """
     if not cfg.get("enable_perturb", False):
         return act_raw, False, "disabled", dyn_state
-    prob = float(cfg.get("perturb_prob", 0.0))
-    if prob <= 0.0 or np.random.rand() >= prob:
-        return act_raw, False, "skip_prob", dyn_state
 
-    selected_mode = _sample_error_mode(phase_key, cfg)
-    selected_mode = _gate_gripper_error_mode(
-        selected_mode, init_left_grip, init_right_grip, cfg,
-        active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper
-    )
-    req_mode = str(cfg.get("perturb_error_mode", "legacy")).strip().lower()
-    if req_mode == "open_laptop_pregrasp" and selected_mode is None:
-        return act_raw, False, "skip_non_pregrasp", dyn_state
+    del phase_key
+    selected_mode = None if forced_error_mode is None else str(forced_error_mode).strip().lower()
+    if selected_mode is None or selected_mode == "":
+        return act_raw, False, "missing_forced_error_mode", dyn_state
+    if selected_mode not in {"translation", "rotation", "gripper_close"}:
+        return act_raw, False, "invalid_forced_error_mode", {"error_mode": selected_mode}
+    if selected_mode == "gripper_close":
+        close_min = float(np.clip(cfg.get("perturb_gripper_close_min", 0.10), 0.0, 1.0))
+        l_open = bool(active_left_gripper) and bool(float(np.clip(init_left_grip, 0.0, 1.0)) > close_min)
+        r_open = bool(active_right_gripper) and bool(float(np.clip(init_right_grip, 0.0, 1.0)) > close_min)
+        if not (l_open or r_open):
+            return act_raw, False, "invalid_forced_gripper_close_not_open", {"error_mode": selected_mode}
+
     if selected_mode is not None:
         if (left_ep is not None) and (right_ep is not None):
             if selected_mode in {"translation", "rotation", "gripper_close"}:
@@ -363,6 +419,8 @@ def perturb_action_chunk_online(
                     act_raw, cfg, fk, planner_l, planner_r,
                     curr_left_q, curr_right_q, init_left_grip, init_right_grip,
                     left_ep, right_ep, left_grip_traj, right_grip_traj, t_star, rollout_exec_steps,
+                    forced_dir_bin_id=forced_dir_bin_id,
+                    forced_mag_bin_id=forced_mag_bin_id,
                     error_mode=selected_mode,
                     active_left_arm=active_left_arm, active_right_arm=active_right_arm,
                     active_left_gripper=active_left_gripper, active_right_gripper=active_right_gripper,
