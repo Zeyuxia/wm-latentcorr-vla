@@ -18,6 +18,9 @@ policy/weights/
 policy/ACT/evac*
 policy/ACT_LatentCorr
 policy/PI0_LatentCorr
+policy/TinyVLA/model_param
+policy/TinyVLA/data
+policy/TinyVLA/unet_diffusion_policy_results
 act-*
 wandb
 
@@ -46,3 +49,4 @@ viewer_show.*
 # downloaded files
 downloads/
 .codex
+

@@ -1,13 +1,51 @@
-DATA_DIR = "/data/robotiwin/policy/TinyVLA/data"
+from pathlib import Path
+
+DATA_DIR = str(Path(__file__).resolve().parents[1] / "data")
 PRETRAIN_DIR = '/data/h5py2'
 LOCAL_DATA_DIR = '/home/data'
 
 TASK_CONFIGS = {
-    "task_name_you_test": {
-        'dataset_dir': [DATA_DIR + "/sim-/aloha-agilex-1-m1_b1_l1_h0.03_c0_D435-100"],
+    "open_laptop": {
+        'dataset_dir': [DATA_DIR + "/sim-open_laptop/demo_clean-50"],
         'episode_len': 500,
-        'camera_names': ['cam_high', 'cam_left_wrist', 'cam_right_wrist'],
-        "sample_weights": [1, 1]
+        'camera_names': ['cam_high'],
+        "sample_weights": [1]
+    },
+    "pick_dual_bottles": {
+        'dataset_dir': [DATA_DIR + "/sim-pick_dual_bottles/demo_clean-50"],
+        'episode_len': 500,
+        'camera_names': ['cam_high'],
+        "sample_weights": [1]
+    },
+    "put_bottles_dustbin": {
+        'dataset_dir': [DATA_DIR + "/sim-put_bottles_dustbin/demo_clean-50"],
+        'episode_len': 500,
+        'camera_names': ['cam_high'],
+        "sample_weights": [1]
+    },
+    "place_burger_fries": {
+        'dataset_dir': [DATA_DIR + "/sim-place_burger_fries/demo_clean-50"],
+        'episode_len': 500,
+        'camera_names': ['cam_high'],
+        "sample_weights": [1]
+    },
+    "handover_block": {
+        'dataset_dir': [DATA_DIR + "/sim-handover_block/demo_clean-50"],
+        'episode_len': 500,
+        'camera_names': ['cam_high'],
+        "sample_weights": [1]
+    },
+    "robotwin_multitask_5_cam_high": {
+        'dataset_dir': [
+            DATA_DIR + "/sim-open_laptop/demo_clean-50",
+            DATA_DIR + "/sim-pick_dual_bottles/demo_clean-50",
+            DATA_DIR + "/sim-put_bottles_dustbin/demo_clean-50",
+            DATA_DIR + "/sim-place_burger_fries/demo_clean-50",
+            DATA_DIR + "/sim-handover_block/demo_clean-50",
+        ],
+        'episode_len': 500,
+        'camera_names': ['cam_high'],
+        "sample_weights": [1, 1, 1, 1, 1]
     },
 }
 

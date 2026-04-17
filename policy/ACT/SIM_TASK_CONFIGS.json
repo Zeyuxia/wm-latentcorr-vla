@@ -82,9 +82,31 @@
         "num_episodes": 50,
         "episode_len": 1000,
         "camera_names": [
-            "cam_high",
-            "cam_right_wrist",
-            "cam_left_wrist"
+            "cam_high"
+        ]
+    },
+    "sim-pick_dual_bottles-demo_clean-50": {
+        "dataset_dir": "./processed_data/sim-pick_dual_bottles/demo_clean-50",
+        "num_episodes": 50,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high"
+        ]
+    },
+    "sim-put_bottles_dustbin-demo_clean-50": {
+        "dataset_dir": "./processed_data/sim-put_bottles_dustbin/demo_clean-50",
+        "num_episodes": 50,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high"
+        ]
+    },
+    "sim-handover_block-demo_clean-50": {
+        "dataset_dir": "./processed_data/sim-handover_block/demo_clean-50",
+        "num_episodes": 50,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high"
         ]
     }
 }

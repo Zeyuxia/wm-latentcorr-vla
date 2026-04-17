@@ -7,6 +7,7 @@ Training Environment：
 cd policy/TinyVLA
 conda env create -f Train_Tiny_DexVLA_train.yml
 conda activate dexvla-robo
+pip install flash-attn==2.7.4.post1 --no-build-isolation
 cd policy_heads
 pip install -e .
 ```
@@ -40,7 +41,11 @@ If success, you will find the `sim_${task_name}/${setting}_${expert_data_num}` f
 
 ## Train Policy
 This step launches the training process.
-First, download the VLM model InternVL3-1B ([huggingface](https://huggingface.co/OpenGVLab/InternVL3-1B/tree/main)) to the path `.../policy/TinyVLA/model_param/InternVL3-1B`. Then modify the `config.json` file in the folder as follows:
+First, download the VLM model InternVL3-1B ([huggingface](https://huggingface.co/OpenGVLab/InternVL3-1B/tree/main)) to the path `.../policy/TinyVLA/model_param/InternVL3-1B`:
+```bash
+bash ./scripts/download_internvl3_1b.sh
+```
+Then modify the `config.json` file in the folder as follows:
 ```
 {
     "_name_or_path": ".../robotiwin/policy/TinyVLA/vla/models/internvl", # Modify this.

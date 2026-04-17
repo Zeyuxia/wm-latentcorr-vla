@@ -4,8 +4,8 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate ACT
 
 # Base training parameters
-train_tag="open_laptop_0413_001944_train_test"
-gpu_ids=0,1,2,3
+train_tag="robotwin_multitask_5_no_wm"
+gpu_ids=6
 main_process_port=29500
 seed=0
 
@@ -17,26 +17,28 @@ expert_data_num=50
 # Format example:
 # task_names="sim-open_laptop-demo_clean-50,sim-blocks_ranking_rgb-demo_clean-50"
 # task_weights="1.0,1.0"
-task_names=
-task_weights=
+multi_task_tag=robotwin_multitask_5
+task_names="sim-open_laptop-demo_clean-50,sim-pick_dual_bottles-demo_clean-50,sim-put_bottles_dustbin-demo_clean-50,sim-place_burger_fries-demo_clean-50,sim-handover_block-demo_clean-50"
+task_weights="1.0,1.0,1.0,1.0,1.0"
 
 # ACT Parameters
 policy_class=ACT
 kl_weight=10
 chunk_size=50
 hidden_dim=512
-batch_size=4
+# batch_size=4
+batch_size=32
 dim_feedforward=3200
 num_epochs=2000
 lr=4e-5
-save_freq=10
+save_freq=50
 resume_save_freq=50
 state_dim=14
-act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933_1000epoch_baseline/policy_epoch_1000_seed_0.ckpt
+act_init_ckpt=
 resume_ckpt=
 
 # EVAC parameters
-enable_wm=true
+enable_wm=false
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
 evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=4999-step=20000.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
@@ -54,8 +56,8 @@ sample_skip_head_ratio=0.6
 perturb_active_joint_delta_thresh=0.01
 perturb_active_gripper_delta_thresh=0.05
 rollout_exec_steps=16
-failure_mode=train
-failure_table_path=/data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260413_001944_open_laptop_closed_loop_exploration_multigpu_test_thresh04_recovervideo/failure_explore/failure_table.json
+failure_mode=off
+failure_table_path=
 failure_table_dir=
 failure_phase_bins=3
 failure_translation_dir_bins=6
@@ -89,7 +91,11 @@ if [ -n "${train_tag}" ]; then
     safe_train_tag=$(echo "${train_tag}" | sed 's/[^0-9A-Za-z._-]/_/g')
     timestamp="${timestamp}_${safe_train_tag}"
 fi
-ckpt_dir=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/${timestamp}
+exp_task_name=${task_name}
+if [ -n "${task_names}" ]; then
+    exp_task_name=${multi_task_tag}
+fi
+ckpt_dir=./act_ckpt/act-${exp_task_name}/${task_config}-${expert_data_num}/${timestamp}
 mkdir -p ${ckpt_dir}
 cp "$0" ${ckpt_dir}/train.sh
 

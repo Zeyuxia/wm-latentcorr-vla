@@ -7,6 +7,7 @@ Training Environment：
 cd policy/DexVLA
 conda env create -f Train_Tiny_DexVLA_train.yml
 conda activate dexvla-robo
+pip install flash-attn==2.7.4.post1 --no-build-isolation
 cd policy_heads
 pip install -e .
 ```
