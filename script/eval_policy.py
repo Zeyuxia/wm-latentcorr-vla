@@ -19,11 +19,19 @@ import importlib
 import argparse
 import pdb
 import re
+import random
 
 from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+USE_COLOR = sys.stdout.isatty()
+
+
+def colorize(text, code):
+    if not USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
 
 
 def class_decorator(task_name):
@@ -154,21 +162,21 @@ def main(usr_args):
 
     # output camera config
     print("============= Config =============\n")
-    print("\033[95mMessy Table:\033[0m " + str(args["domain_randomization"]["cluttered_table"]))
-    print("\033[95mRandom Background:\033[0m " + str(args["domain_randomization"]["random_background"]))
+    print(colorize("Messy Table:", "95") + " " + str(args["domain_randomization"]["cluttered_table"]))
+    print(colorize("Random Background:", "95") + " " + str(args["domain_randomization"]["random_background"]))
     if args["domain_randomization"]["random_background"]:
         print(" - Clean Background Rate: " + str(args["domain_randomization"]["clean_background_rate"]))
-    print("\033[95mRandom Light:\033[0m " + str(args["domain_randomization"]["random_light"]))
+    print(colorize("Random Light:", "95") + " " + str(args["domain_randomization"]["random_light"]))
     if args["domain_randomization"]["random_light"]:
         print(" - Crazy Random Light Rate: " + str(args["domain_randomization"]["crazy_random_light_rate"]))
-    print("\033[95mRandom Table Height:\033[0m " + str(args["domain_randomization"]["random_table_height"]))
-    print("\033[95mRandom Head Camera Distance:\033[0m " + str(args["domain_randomization"]["random_head_camera_dis"]))
+    print(colorize("Random Table Height:", "95") + " " + str(args["domain_randomization"]["random_table_height"]))
+    print(colorize("Random Head Camera Distance:", "95") + " " + str(args["domain_randomization"]["random_head_camera_dis"]))
 
-    print("\033[94mHead Camera Config:\033[0m " + str(args["camera"]["head_camera_type"]) + f", " +
+    print(colorize("Head Camera Config:", "94") + " " + str(args["camera"]["head_camera_type"]) + f", " +
           str(args["camera"]["collect_head_camera"]))
-    print("\033[94mWrist Camera Config:\033[0m " + str(args["camera"]["wrist_camera_type"]) + f", " +
+    print(colorize("Wrist Camera Config:", "94") + " " + str(args["camera"]["wrist_camera_type"]) + f", " +
           str(args["camera"]["collect_wrist_camera"]))
-    print("\033[94mEmbodiment Config:\033[0m " + embodiment_name)
+    print(colorize("Embodiment Config:", "94") + " " + embodiment_name)
     print("\n==================================")
 
     TASK_ENV = class_decorator(args["task_name"])
@@ -180,25 +188,41 @@ def main(usr_args):
     seed_file = usr_args.get("seed_file", None)
     seed_list = load_seed_list(seed_file)
 
-    st_seed = 100000 * (1 + seed)
+    start_seed_override = usr_args.get("start_seed", None)
+    if start_seed_override is not None:
+        st_seed = int(start_seed_override)
+    else:
+        st_seed = 100000 * (1 + seed)
+    initial_success_count = int(usr_args.get("initial_success_count", 0) or 0)
+    initial_test_count = int(usr_args.get("initial_test_count", 0) or 0)
     suc_nums = []
-    test_num = len(seed_list) if seed_list is not None else 100
+    total_target_eval_num = len(seed_list) if seed_list is not None else 100
+    test_num = total_target_eval_num
+    if seed_list is None:
+        test_num = max(0, int(total_target_eval_num) - int(initial_test_count))
     topk = 1
 
     if seed_list is not None:
-        print(f"\033[96mUsing seed file:\033[0m {seed_file}")
-        print(f"\033[96mTotal seeds for eval:\033[0m {test_num}")
+        print(f"{colorize('Using seed file:', '96')} {seed_file}")
+        print(f"{colorize('Total seeds for eval:', '96')} {test_num}")
+    elif initial_test_count > 0:
+        print(
+            f"{colorize('Resume eval:', '96')} already_done={initial_test_count}, "
+            f"remaining={test_num}, target_total={total_target_eval_num}"
+        )
 
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                    test_num=test_num,
-                                   seed_list=seed_list,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type)
+    st_seed, suc_num, final_test_num = eval_policy(task_name,
+                                                   TASK_ENV,
+                                                   args,
+                                                   model,
+                                                   st_seed,
+                                                   test_num=test_num,
+                                                   seed_list=seed_list,
+                                                   video_size=video_size,
+                                                   instruction_type=instruction_type,
+                                                   initial_success_count=initial_success_count,
+                                                   initial_test_count=initial_test_count)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -208,7 +232,8 @@ def main(usr_args):
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
         # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        denom = max(1, int(final_test_num))
+        file.write("\n".join(map(str, np.array(suc_nums) / denom)))
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -222,13 +247,15 @@ def eval_policy(task_name,
                 test_num=100,
                 seed_list=None,
                 video_size=None,
-                instruction_type=None):
-    print(f"\033[34mTask Name: {args['task_name']}\033[0m")
-    print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
+                instruction_type=None,
+                initial_success_count=0,
+                initial_test_count=0):
+    print(colorize(f"Task Name: {args['task_name']}", "34"))
+    print(colorize(f"Policy Name: {args['policy_name']}", "34"))
 
     expert_check = True
-    TASK_ENV.suc = 0
-    TASK_ENV.test_num = 0
+    TASK_ENV.suc = int(initial_success_count)
+    TASK_ENV.test_num = int(initial_test_count)
 
     now_id = 0
     succ_seed = 0
@@ -303,6 +330,8 @@ def eval_policy(task_name,
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
+        random.seed(now_seed)
+        np.random.seed(now_seed)
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
@@ -350,9 +379,9 @@ def eval_policy(task_name,
 
         if succ:
             TASK_ENV.suc += 1
-            print("\033[92mSuccess!\033[0m")
+            print(colorize("Success!", "92"))
         else:
-            print("\033[91mFail!\033[0m")
+            print(colorize("Fail!", "91"))
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
@@ -362,15 +391,17 @@ def eval_policy(task_name,
 
         TASK_ENV.test_num += 1
 
+        success_ratio = f"{TASK_ENV.suc}/{TASK_ENV.test_num}"
+        success_pct = f"{round(TASK_ENV.suc / TASK_ENV.test_num * 100, 1)}%"
         print(
-            f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
-            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
+            f"{colorize(task_name, '93')} | {colorize(args['policy_name'], '94')} | {colorize(args['task_config'], '92')} | {colorize(args['ckpt_setting'], '91')}\n"
+            f"Success rate: {colorize(success_ratio, '96')} => {colorize(success_pct, '95')}, current seed: {colorize(str(now_seed), '90')}\n"
         )
         # TASK_ENV._take_picture()
         if not use_seed_list:
             now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, TASK_ENV.test_num
 
 
 def parse_args_and_config():

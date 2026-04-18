@@ -31,6 +31,13 @@ from typing import Optional, Literal
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+USE_COLOR = sys.stdout.isatty() if "sys" in globals() else False
+
+
+def colorize(text, code):
+    if not USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
 
 
 class Base_Task(gym.Env):
@@ -552,14 +559,11 @@ class Base_Task(gym.Env):
 
     def remove_data_cache(self):
         folder_path = self.folder_path["cache"]
-        GREEN = "\033[92m"
-        RED = "\033[91m"
-        RESET = "\033[0m"
         try:
             shutil.rmtree(folder_path)
-            print(f"{GREEN}Folder {folder_path} deleted successfully.{RESET}")
+            print(colorize(f"Folder {folder_path} deleted successfully.", "92"))
         except OSError as e:
-            print(f"{RED}Error: {folder_path} is not empty or does not exist.{RESET}")
+            print(colorize(f"Error: {folder_path} is not empty or does not exist.", "91"))
 
     def set_instruction(self, instruction=None):
         self.instruction = instruction
@@ -1485,7 +1489,7 @@ class Base_Task(gym.Env):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
-        print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
+        print(f"step: {colorize(f'{self.take_action_cnt} / {self.step_lim}', '92')}", end="\r")
 
         self._update_render()
         if self.render_freq:
