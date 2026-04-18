@@ -6,9 +6,14 @@ import time
 import sys
 import pickle
 import numpy as np
+from pathlib import Path
 # import torch_utils as TorchUtils
 from torchvision import transforms
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+
+FILE_DIR = Path(__file__).resolve().parent
+if str(FILE_DIR) not in sys.path:
+    sys.path.insert(0, str(FILE_DIR))
 
 from vla import *
 from policy_heads import *

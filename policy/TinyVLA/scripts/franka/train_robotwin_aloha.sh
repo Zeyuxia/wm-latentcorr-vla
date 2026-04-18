@@ -20,16 +20,63 @@ SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-50}
 LOGGING_STEPS=${LOGGING_STEPS:-5}
 MASTER_PORT=${MASTER_PORT:-29604}
 NUM_NODES=${NUM_NODES:-1}
-RUN_TAG=${RUN_TAG:-base_multi_task}
+RUN_TAG=${RUN_TAG:-base_multi_task_resume_20k}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
-RESUME_FROM=${RESUME_FROM:-}
+RESUME_FROM=${RESUME_FROM:-/data/zhenyangfan/RoboTwin/policy/TinyVLA/unet_diffusion_policy_results/robotwin_multitask_5_cam_high/20260416_235212-base_multi_task}
 PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-1}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES// /}
 
+port_is_available() {
+  python3 - "$1" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", port))
+except OSError:
+    print("0")
+else:
+    print("1")
+finally:
+    s.close()
+PY
+}
+
+find_free_port() {
+  python3 - "$1" <<'PY'
+import socket
+import sys
+
+start_port = int(sys.argv[1])
+for port in range(start_port, start_port + 1000):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        s.close()
+        continue
+    s.close()
+    print(port)
+    sys.exit(0)
+
+raise SystemExit(f"Could not find a free port in [{start_port}, {start_port + 999}]")
+PY
+}
+
 if [ -z "${CUDA_VISIBLE_DEVICES}" ]; then
   echo "CUDA_VISIBLE_DEVICES is empty." >&2
   exit 1
+fi
+
+if [ "$(port_is_available "${MASTER_PORT}")" != "1" ]; then
+  OLD_MASTER_PORT="${MASTER_PORT}"
+  MASTER_PORT=$(find_free_port "${MASTER_PORT}")
+  echo "MASTER_PORT ${OLD_MASTER_PORT} is already in use; switching to ${MASTER_PORT}."
 fi
 
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
