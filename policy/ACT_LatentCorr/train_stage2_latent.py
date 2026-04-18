@@ -24,6 +24,7 @@ from .evac_interface import EvacLatentTeacher
 from .failure_utils import active_arm_pattern_id_to_key, error_mode_id_to_key, phase_id_to_key
 from .latent_policy import ACTLatentStage1
 from .merge_failure_tables import merge_failure_dir
+from .stage2_latent_cache import build_stage2_latent_cache_relpath
 from .train_stage1_latent import (
     _build_act_args,
     _resolve_dataset_info,
@@ -252,6 +253,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--failure_explore_k", type=int, default=4)
     parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5)
     parser.add_argument("--failure_sample_skip_head_ratio", type=float, default=0.6)
+    parser.add_argument("--stage2_latent_cache_dir", type=str, default="")
+    parser.add_argument("--stage2_latent_cache_strict", type=str2bool, default=False)
+    parser.add_argument("--stage2_latent_cache_writeback", type=str2bool, default=True)
     parser.add_argument(
         "--act_like_loss_only",
         type=str2bool,
@@ -448,8 +452,13 @@ def main():
     current_global_batch_size = (args.batch_size + args.correction_batch_size) * device_multiplier
     if is_main_process(rank):
         os.makedirs(args.output_dir, exist_ok=True)
+        if args.stage2_latent_cache_dir:
+            args.stage2_latent_cache_dir = os.path.realpath(args.stage2_latent_cache_dir)
+            os.makedirs(args.stage2_latent_cache_dir, exist_ok=True)
     if distributed:
         dist.barrier()
+    if args.stage2_latent_cache_dir:
+        args.stage2_latent_cache_dir = os.path.realpath(args.stage2_latent_cache_dir)
 
     def _heartbeat_status(status: str, **extra) -> None:
         if not is_main_process(rank):
@@ -508,6 +517,11 @@ def main():
         print(
             f"[stage2] correction_failure_mode={args.failure_mode}, "
             f"failure_table_path={args.failure_table_path or '<none>'}",
+        )
+    if args.stage2_latent_cache_dir:
+        print(
+            f"[stage2] stage2_latent_cache_dir={args.stage2_latent_cache_dir} "
+            f"strict={args.stage2_latent_cache_strict} writeback={args.stage2_latent_cache_writeback}"
         )
     _heartbeat_status(
         "init_dataset_ready",
@@ -1193,6 +1207,8 @@ def main():
             meter_t_builder = 0.0
             meter_t_rollout = 0.0
             meter_t_model = 0.0
+            meter_cache_hit = 0.0
+            meter_cache_miss = 0.0
             corr_stats = _empty_correction_stats()
             steps_this_epoch = 0
 
@@ -1217,6 +1233,8 @@ def main():
                 step_t_builder = 0.0
                 step_t_rollout = 0.0
                 step_t_model = 0.0
+                step_cache_hit = 0
+                step_cache_miss = 0
                 for batch_failure_mode, batch_src in batch_groups:
                     image_t = batch_src["image_t"].to(args.device, non_blocking=True)
                     qpos_t = batch_src["qpos_t"].to(args.device, non_blocking=True)
@@ -1422,6 +1440,16 @@ def main():
                             correction_is_pad[: args.prefix_steps] = correction_is_pad_prefix
                         if external_action_is_pad_prefix is None:
                             external_action_is_pad_prefix = correction_is_pad_prefix
+                        cache_relpath = None
+                        if args.stage2_latent_cache_dir and external_action_dev_raw is not None:
+                            cache_relpath = build_stage2_latent_cache_relpath(
+                                task_name=args.task_name,
+                                episode_id=ep_id,
+                                start_ts=int(start_ts_list[i]),
+                                prefix_steps=args.prefix_steps,
+                                ddim_steps=args.ddim_steps,
+                                error_action_prefix_raw=external_action_dev_raw,
+                            )
                         prepared_samples.append(
                             {
                                 "image_t": image_t[i].detach(),
@@ -1444,6 +1472,7 @@ def main():
                                     None if external_qpos_err_norm is None else external_qpos_err_norm.detach()
                                 ),
                                 "external_action_is_pad_prefix": external_action_is_pad_prefix.detach(),
+                                "cache_relpath": cache_relpath,
                                 "raw_data": raw_data,
                             }
                         )
@@ -1563,16 +1592,62 @@ def main():
                             if item["external_action_is_pad_prefix"] is not None:
                                 action_is_pad_prefix_batch[i] = item["external_action_is_pad_prefix"]
 
-                        t_roll0 = time.perf_counter()
-                        rollout_latent_batch = teacher.rollout_latent_from_actions_batch(
-                            curr_image=image_batch[:, 0],
-                            curr_qpos_raw=qpos_raw_batch,
-                            action_prefix_raw=action_dev_raw_batch,
-                            raw_data=[item["raw_data"] for item in prepared_samples],
-                            fk=correction_builder.fk,
-                            ddim_steps=args.ddim_steps,
-                        )
-                        step_t_rollout += time.perf_counter() - t_roll0
+                        loaded_rollout_latents: list[torch.Tensor | None] = [None] * num_prepared
+                        missing_rollout_indices: list[int] = []
+                        if args.stage2_latent_cache_dir:
+                            for i, item in enumerate(prepared_samples):
+                                cache_relpath = item.get("cache_relpath")
+                                if not cache_relpath:
+                                    missing_rollout_indices.append(i)
+                                    continue
+                                cache_path = os.path.join(args.stage2_latent_cache_dir, cache_relpath)
+                                if os.path.exists(cache_path):
+                                    latent_i = torch.load(cache_path, map_location="cpu")
+                                    if latent_i.ndim == 4 and latent_i.shape[0] == 1:
+                                        latent_i = latent_i[0]
+                                    loaded_rollout_latents[i] = latent_i.float()
+                                    step_cache_hit += 1
+                                else:
+                                    if args.stage2_latent_cache_strict:
+                                        raise FileNotFoundError(
+                                            f"Missing stage2 latent cache entry: {cache_path}"
+                                        )
+                                    missing_rollout_indices.append(i)
+                                    step_cache_miss += 1
+                        else:
+                            missing_rollout_indices = list(range(num_prepared))
+
+                        if missing_rollout_indices:
+                            miss_index_tensor = torch.as_tensor(
+                                missing_rollout_indices, dtype=torch.long, device=args.device
+                            )
+                            t_roll0 = time.perf_counter()
+                            rollout_latent_missing = teacher.rollout_latent_from_actions_batch(
+                                curr_image=image_batch[:, 0].index_select(0, miss_index_tensor),
+                                curr_qpos_raw=qpos_raw_batch.index_select(0, miss_index_tensor),
+                                action_prefix_raw=action_dev_raw_batch.index_select(0, miss_index_tensor),
+                                raw_data=[prepared_samples[i]["raw_data"] for i in missing_rollout_indices],
+                                fk=correction_builder.fk,
+                                ddim_steps=args.ddim_steps,
+                            ).detach().cpu()
+                            step_t_rollout += time.perf_counter() - t_roll0
+                            for local_idx, batch_idx in enumerate(missing_rollout_indices):
+                                latent_i = rollout_latent_missing[local_idx].float()
+                                loaded_rollout_latents[batch_idx] = latent_i
+                                cache_relpath = prepared_samples[batch_idx].get("cache_relpath")
+                                if (
+                                    args.stage2_latent_cache_dir
+                                    and args.stage2_latent_cache_writeback
+                                    and cache_relpath
+                                ):
+                                    cache_path = os.path.join(args.stage2_latent_cache_dir, cache_relpath)
+                                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                                    torch.save(latent_i.half(), cache_path)
+
+                        rollout_latent_batch = torch.stack(
+                            [latent_i for latent_i in loaded_rollout_latents],
+                            dim=0,
+                        ).to(args.device)
 
                 t_model0 = time.perf_counter()
                 out = model(
@@ -1631,6 +1706,8 @@ def main():
                 meter_t_builder += step_t_builder
                 meter_t_rollout += step_t_rollout
                 meter_t_model += step_t_model
+                meter_cache_hit += step_cache_hit
+                meter_cache_miss += step_cache_miss
 
                 if is_main_process(rank):
                     pbar.set_postfix(
@@ -1649,6 +1726,7 @@ def main():
                         t_build=f"{step_t_builder:.2f}s",
                         t_roll=f"{step_t_rollout:.2f}s",
                         t_model=f"{step_t_model:.2f}s",
+                        cache=f"{step_cache_hit}/{step_cache_hit + step_cache_miss}",
                     )
                 log_wandb(
                     wandb_run,
@@ -1673,6 +1751,8 @@ def main():
                         "step_time_builder_sec": step_t_builder,
                         "step_time_rollout_sec": step_t_rollout,
                         "step_time_model_sec": step_t_model,
+                        "step_rollout_cache_hit": step_cache_hit,
+                        "step_rollout_cache_miss": step_cache_miss,
                     },
                     step=global_step,
                 )
@@ -1698,6 +1778,8 @@ def main():
                             "step_time_builder_sec": float(step_t_builder),
                             "step_time_rollout_sec": float(step_t_rollout),
                             "step_time_model_sec": float(step_t_model),
+                            "step_rollout_cache_hit": int(step_cache_hit),
+                            "step_rollout_cache_miss": int(step_cache_miss),
                         },
                     )
 
@@ -1720,6 +1802,8 @@ def main():
                         meter_t_builder,
                         meter_t_rollout,
                         meter_t_model,
+                        meter_cache_hit,
+                        meter_cache_miss,
                         float(corr_stats["generated"]),
                         float(corr_stats["triggered"]),
                         float(corr_stats["fallback"]),
@@ -1748,21 +1832,25 @@ def main():
                 meter_t_builder = float(stats_tensor[8].item())
                 meter_t_rollout = float(stats_tensor[9].item())
                 meter_t_model = float(stats_tensor[10].item())
-                corr_stats["generated"] = int(stats_tensor[11].item())
-                corr_stats["triggered"] = int(stats_tensor[12].item())
-                corr_stats["fallback"] = int(stats_tensor[13].item())
-                corr_stats["branch_interp_nearest"] = int(stats_tensor[14].item())
-                corr_stats["branch_gripper_close"] = int(stats_tensor[15].item())
-                corr_stats["branch_translation"] = int(stats_tensor[16].item())
-                corr_stats["branch_rotation"] = int(stats_tensor[17].item())
-                corr_stats["branch_planner"] = int(stats_tensor[18].item())
-                corr_stats["branch_other"] = int(stats_tensor[19].item())
-                corr_stats["branch_timeout"] = int(stats_tensor[20].item())
-                corr_stats["branch_error"] = int(stats_tensor[21].item())
-                n = max(1, int(stats_tensor[22].item()))
+                meter_cache_hit = float(stats_tensor[11].item())
+                meter_cache_miss = float(stats_tensor[12].item())
+                corr_stats["generated"] = int(stats_tensor[13].item())
+                corr_stats["triggered"] = int(stats_tensor[14].item())
+                corr_stats["fallback"] = int(stats_tensor[15].item())
+                corr_stats["branch_interp_nearest"] = int(stats_tensor[16].item())
+                corr_stats["branch_gripper_close"] = int(stats_tensor[17].item())
+                corr_stats["branch_translation"] = int(stats_tensor[18].item())
+                corr_stats["branch_rotation"] = int(stats_tensor[19].item())
+                corr_stats["branch_planner"] = int(stats_tensor[20].item())
+                corr_stats["branch_other"] = int(stats_tensor[21].item())
+                corr_stats["branch_timeout"] = int(stats_tensor[22].item())
+                corr_stats["branch_error"] = int(stats_tensor[23].item())
+                n = max(1, int(stats_tensor[24].item()))
             corr_generated = int(corr_stats["generated"])
             corr_triggered = int(corr_stats["triggered"])
             corr_fallback = int(corr_stats["fallback"])
+            cache_total = int(meter_cache_hit + meter_cache_miss)
+            cache_hit_rate = (meter_cache_hit / cache_total) if cache_total > 0 else 0.0
             corr_trigger_rate = (corr_triggered / corr_generated) if corr_generated > 0 else 0.0
             corr_fallback_ratio = (corr_fallback / corr_generated) if corr_generated > 0 else 0.0
             corr_branch_counts = {
@@ -1783,6 +1871,7 @@ def main():
                     f"retain_w={meter_retain_weight/n:.4f} "
                     f"t_raw={meter_t_raw/n:.2f}s t_build={meter_t_builder/n:.2f}s "
                     f"t_roll={meter_t_rollout/n:.2f}s t_model={meter_t_model/n:.2f}s "
+                    f"cache={int(meter_cache_hit)}/{cache_total} ({cache_hit_rate:.1%}) "
                     f"corr={corr_generated} trig={corr_triggered} ({corr_trigger_rate:.1%}) "
                     f"fb={corr_fallback} ({corr_fallback_ratio:.1%}) "
                     f"branch={json.dumps(corr_branch_counts, ensure_ascii=True)} "
@@ -1803,6 +1892,9 @@ def main():
                     "epoch_time_builder_sec": meter_t_builder / n,
                     "epoch_time_rollout_sec": meter_t_rollout / n,
                     "epoch_time_model_sec": meter_t_model / n,
+                    "epoch_rollout_cache_hit": meter_cache_hit,
+                    "epoch_rollout_cache_miss": meter_cache_miss,
+                    "epoch_rollout_cache_hit_rate": cache_hit_rate,
                     "epoch_skipped_samples": meter_skipped,
                     "epoch_correction_generated": corr_generated,
                     "epoch_correction_triggered": corr_triggered,

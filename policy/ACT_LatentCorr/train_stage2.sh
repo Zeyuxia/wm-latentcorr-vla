@@ -8,6 +8,8 @@ if [ ! -x "${PYTHON_BIN}" ]; then
   echo "python interpreter not found: ${PYTHON_BIN}" >&2
   exit 1
 fi
+VENV_BIN_DIR=$(dirname "${PYTHON_BIN}")
+export PATH="${VENV_BIN_DIR}:${PATH}"
 
 TASK_NAME=${TASK_NAME:-sim-open_laptop-demo_clean-50}
 DATASET_DIR=${DATASET_DIR:-}
@@ -127,6 +129,9 @@ FAILURE_ROTATION_MAG_BINS=${FAILURE_ROTATION_MAG_BINS:-3}
 FAILURE_EXPLORE_K=${FAILURE_EXPLORE_K:-4}
 FAILURE_FAIL_RECOVER_RATE_THRESH=${FAILURE_FAIL_RECOVER_RATE_THRESH:-0.5}
 FAILURE_SAMPLE_SKIP_HEAD_RATIO=${FAILURE_SAMPLE_SKIP_HEAD_RATIO:-0.6}
+STAGE2_LATENT_CACHE_DIR=${STAGE2_LATENT_CACHE_DIR:-}
+STAGE2_LATENT_CACHE_STRICT=${STAGE2_LATENT_CACHE_STRICT:-false}
+STAGE2_LATENT_CACHE_WRITEBACK=${STAGE2_LATENT_CACHE_WRITEBACK:-true}
 USE_WANDB=${USE_WANDB:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-RoboTwin_ACT_LatentCorr}
 WANDB_ENTITY=${WANDB_ENTITY:-}
@@ -180,6 +185,9 @@ fi
 if [ -n "${CAMERA_NAMES}" ]; then
   read -r -a CAMERA_NAMES_ARR <<< "${CAMERA_NAMES}"
   EXTRA_ARGS+=(--camera_names "${CAMERA_NAMES_ARR[@]}")
+fi
+if [ -n "${STAGE2_LATENT_CACHE_DIR}" ]; then
+  EXTRA_ARGS+=(--stage2_latent_cache_dir "${STAGE2_LATENT_CACHE_DIR}")
 fi
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
@@ -299,6 +307,8 @@ PYTHONUNBUFFERED=1 \
   --failure_explore_k "${FAILURE_EXPLORE_K}" \
   --failure_fail_recover_rate_thresh "${FAILURE_FAIL_RECOVER_RATE_THRESH}" \
   --failure_sample_skip_head_ratio "${FAILURE_SAMPLE_SKIP_HEAD_RATIO}" \
+  --stage2_latent_cache_strict "${STAGE2_LATENT_CACHE_STRICT}" \
+  --stage2_latent_cache_writeback "${STAGE2_LATENT_CACHE_WRITEBACK}" \
   --use_wandb "${USE_WANDB}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_entity "${WANDB_ENTITY}" \
