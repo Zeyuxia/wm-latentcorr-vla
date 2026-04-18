@@ -21,11 +21,13 @@ policy/PI0_LatentCorr
 policy/TinyVLA/model_param
 policy/TinyVLA/data
 policy/TinyVLA/unet_diffusion_policy_results
+policy/TinyVLA/src/nvidia-curobo/
 act-*
 wandb
 
 # Environment-specific generated content
 envs/curobo/
+policy/TinyVLA/src/nvidia-curobo/
 
 # Code generation assets
 assets/*
@@ -49,4 +51,3 @@ viewer_show.*
 # downloaded files
 downloads/
 .codex
-
