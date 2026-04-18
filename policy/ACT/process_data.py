@@ -11,6 +11,14 @@ import argparse
 import pdb
 import json
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
+RAW_TO_PROCESSED_CAMERA_NAMES = {
+    "head_camera": "cam_high",
+    "right_camera": "cam_right_wrist",
+    "left_camera": "cam_left_wrist",
+}
+
 
 def load_hdf5(dataset_path):
     if not os.path.isfile(dataset_path):
@@ -48,7 +56,7 @@ def images_encoding(imgs):
     return encode_data, max_len
 
 
-def data_transform(path, episode_num, save_path):
+def data_transform(path, episode_num, save_path, camera_names):
     begin = 0
     floders = os.listdir(path)
     assert episode_num <= len(floders), "data num not enough"
@@ -61,9 +69,7 @@ def data_transform(path, episode_num, save_path):
             os.path.join(path, f"episode{i}.hdf5")))
         qpos = []
         actions = []
-        cam_high = []
-        cam_right_wrist = []
-        cam_left_wrist = []
+        image_buffers = {cam_name: [] for cam_name in camera_names}
         left_arm_dim = []
         right_arm_dim = []
 
@@ -83,20 +89,13 @@ def data_transform(path, episode_num, save_path):
                 state = state.astype(np.float32)
                 qpos.append(state)
 
-                camera_high_bits = image_dict["head_camera"][j]
-                camera_high = cv2.imdecode(np.frombuffer(camera_high_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_high_resized = cv2.resize(camera_high, (640, 480))
-                cam_high.append(camera_high_resized)
-
-                camera_right_wrist_bits = image_dict["right_camera"][j]
-                camera_right_wrist = cv2.imdecode(np.frombuffer(camera_right_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_right_wrist_resized = cv2.resize(camera_right_wrist, (640, 480))
-                cam_right_wrist.append(camera_right_wrist_resized)
-
-                camera_left_wrist_bits = image_dict["left_camera"][j]
-                camera_left_wrist = cv2.imdecode(np.frombuffer(camera_left_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_left_wrist_resized = cv2.resize(camera_left_wrist, (640, 480))
-                cam_left_wrist.append(camera_left_wrist_resized)
+                for raw_cam_name, processed_cam_name in RAW_TO_PROCESSED_CAMERA_NAMES.items():
+                    if processed_cam_name not in image_buffers:
+                        continue
+                    cam_bits = image_dict[raw_cam_name][j]
+                    cam_image = cv2.imdecode(np.frombuffer(cam_bits, np.uint8), cv2.IMREAD_COLOR)
+                    cam_image_resized = cv2.resize(cam_image, (640, 480))
+                    image_buffers[processed_cam_name].append(cam_image_resized)
 
             if j != 0:
                 action = state
@@ -113,12 +112,8 @@ def data_transform(path, episode_num, save_path):
             obs.create_dataset("left_arm_dim", data=np.array(left_arm_dim))
             obs.create_dataset("right_arm_dim", data=np.array(right_arm_dim))
             image = obs.create_group("images")
-            # cam_high_enc, len_high = images_encoding(cam_high)
-            # cam_right_wrist_enc, len_right = images_encoding(cam_right_wrist)
-            # cam_left_wrist_enc, len_left = images_encoding(cam_left_wrist)
-            image.create_dataset("cam_high", data=np.stack(cam_high), dtype=np.uint8)
-            image.create_dataset("cam_right_wrist", data=np.stack(cam_right_wrist), dtype=np.uint8)
-            image.create_dataset("cam_left_wrist", data=np.stack(cam_left_wrist), dtype=np.uint8)
+            for cam_name in camera_names:
+                image.create_dataset(cam_name, data=np.stack(image_buffers[cam_name]), dtype=np.uint8)
 
         begin += 1
         print(f"proccess {i} success!")
@@ -135,21 +130,37 @@ if __name__ == "__main__":
     )
     parser.add_argument("task_config", type=str)
     parser.add_argument("expert_data_num", type=int)
+    parser.add_argument(
+        "--camera_names",
+        type=str,
+        default="cam_high,cam_right_wrist,cam_left_wrist",
+        help="Comma-separated processed camera names to keep, e.g. cam_high",
+    )
 
     args = parser.parse_args()
 
     task_name = args.task_name
     task_config = args.task_config
     expert_data_num = args.expert_data_num
+    camera_names = [x.strip() for x in args.camera_names.split(",") if x.strip()]
+    valid_camera_names = set(RAW_TO_PROCESSED_CAMERA_NAMES.values())
+    invalid_camera_names = [x for x in camera_names if x not in valid_camera_names]
+    if invalid_camera_names:
+        raise ValueError(f"Unsupported camera_names: {invalid_camera_names}, valid={sorted(valid_camera_names)}")
+    if not camera_names:
+        raise ValueError("camera_names cannot be empty")
 
     begin = 0
+    raw_data_dir = os.path.join(REPO_ROOT, "data", task_name, task_config, "data")
+    save_path = os.path.join(CURRENT_DIR, "processed_data", f"sim-{task_name}", f"{task_config}-{expert_data_num}")
     begin = data_transform(
-        os.path.join("../../data/", task_name, task_config, 'data'),
+        raw_data_dir,
         expert_data_num,
-        f"processed_data/sim-{task_name}/{task_config}-{expert_data_num}",
+        save_path,
+        camera_names,
     )
 
-    SIM_TASK_CONFIGS_PATH = "./SIM_TASK_CONFIGS.json"
+    SIM_TASK_CONFIGS_PATH = os.path.join(CURRENT_DIR, "SIM_TASK_CONFIGS.json")
 
     try:
         with open(SIM_TASK_CONFIGS_PATH, "r") as f:
@@ -161,7 +172,7 @@ if __name__ == "__main__":
         "dataset_dir": f"./processed_data/sim-{task_name}/{task_config}-{expert_data_num}",
         "num_episodes": expert_data_num,
         "episode_len": 1000,
-        "camera_names": ["cam_high", "cam_right_wrist", "cam_left_wrist"],
+        "camera_names": camera_names,
     }
 
     with open(SIM_TASK_CONFIGS_PATH, "w") as f:

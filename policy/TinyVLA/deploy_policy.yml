@@ -8,8 +8,8 @@ instruction_type: unseen
 policy_conda_env: null
 
 # Add Parameters You Need
-state_path: /home/task/dataset_stats.pkl 
-model_base: /home/model_param/InternVL3-1B/ # 基座模型路径
-model_path: /home/model/task/4000 # 模型权重路径
+state_path: /data/zhenyangfan/RoboTwin/policy/TinyVLA/unet_diffusion_policy_results/robotwin_multitask_5_cam_high/20260416_235212-base_multi_task/dataset_stats.pkl
+model_base: /data/zhenyangfan/RoboTwin/policy/TinyVLA/model_param/InternVL3-1B # 基座模型路径
+model_path: /data/zhenyangfan/RoboTwin/policy/TinyVLA/unet_diffusion_policy_results/robotwin_multitask_5_cam_high/20260416_235212-base_multi_task # 模型权重路径
 enable_lore: False
 setting: NULL

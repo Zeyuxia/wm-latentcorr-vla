@@ -6,9 +6,14 @@ import time
 import sys
 import pickle
 import numpy as np
+from pathlib import Path
 # import torch_utils as TorchUtils
 from torchvision import transforms
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+
+FILE_DIR = Path(__file__).resolve().parent
+if str(FILE_DIR) not in sys.path:
+    sys.path.insert(0, str(FILE_DIR))
 
 from vla import *
 from policy_heads import *
@@ -125,8 +130,8 @@ def get_model(usr_args):  # from deploy_policy.yml and eval.sh (overrides)
     Load Model.
     """
     action_head = 'unet_diffusion_policy'
-    camera_names = ['cam_high', 'cam_left', 'cam_right']
     task_name = usr_args["task_name"]
+    camera_names = TASK_CONFIGS.get(task_name, {}).get("camera_names", ['cam_high', 'cam_left', 'cam_right'])
     model_dir = usr_args["model_path"]
     model_base = usr_args["model_base"]
     state_path = usr_args["state_path"]

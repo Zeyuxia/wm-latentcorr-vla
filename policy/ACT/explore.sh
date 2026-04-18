@@ -4,13 +4,13 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate ACT
 
 # Base training parameters
-train_tag="open_laptop_closed_loop_exploration_multigpu_test_thresh04_recovervideo"
-gpu_ids=4,5,6,7
+train_tag="test_evac_function"
+gpu_ids=4,5
 main_process_port=29500
 seed=0
 
 # Single-task settings (used when task_names is empty)
-task_name=open_laptop
+task_name=pick_dual_bottles
 task_config=demo_clean
 expert_data_num=50
 # Multi-task settings (task_names non-empty -> override single-task data source)
@@ -31,12 +31,13 @@ num_epochs=2000
 lr=4e-5
 save_freq=10
 state_dim=14
-act_init_ckpt=./act_ckpt/act-${task_name}/${task_config}-${expert_data_num}/20260213_001933_1000epoch_baseline/policy_epoch_1000_seed_0.ckpt
+act_init_ckpt=/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/unified_stage1_acthead_open1000_trainable_base/20260330_100537/stage1_epoch_0400_base_act_for_ACT.ckpt
 
 # EVAC parameters
 enable_wm=true
 # evac_ckpt=/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt
-evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=3124-step=12500.ckpt
+# evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/logs/evac_robotwin_mixed50p12_2026-03-16T21-19-22/checkpoints/epoch=4999-step=20000.ckpt
+evac_ckpt=/data/yujieyang/EVAC/runs/evac_robotwin_pick_dual_bottles_2026-04-14T11-03-26/logs/evac_robotwin_pick_dual_bottles_2026-04-14T11-03-26/checkpoints/epoch=2153-step=28000.ckpt
 evac_config=./evac/configs/robotwin/train_config.yaml
 urdf_path=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 curobo_left_yml=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml

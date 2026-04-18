@@ -40,6 +40,14 @@ import toppra as ta
 import transforms3d as t3d
 from collections import OrderedDict
 
+USE_COLOR = sys.stdout.isatty()
+
+
+def colorize(text, code):
+    if not USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
 
 class Sapien_TEST(gym.Env):
 
@@ -48,9 +56,9 @@ class Sapien_TEST(gym.Env):
         ta.setup_logging("CRITICAL")  # hide logging
         try:
             self.setup_scene()
-            print("\033[32m" + "Render Well" + "\033[0m")
+            print(colorize("Render Well", "32"))
         except:
-            print("\033[31m" + "Render Error" + "\033[0m")
+            print(colorize("Render Error", "31"))
             exit()
 
     def setup_scene(self, **kwargs):

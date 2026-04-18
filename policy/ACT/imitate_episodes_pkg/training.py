@@ -437,10 +437,9 @@ def init_correction(args, device):
     from util.fk_sapien import SapienFK
     _robotwin_root = os.path.realpath(os.path.join(_act_root, '..', '..'))
     sys.path.insert(0, _robotwin_root)
-    sys.path.insert(0, os.path.join(_robotwin_root, 'envs', 'robot'))
     _prev_cwd = os.getcwd()
     os.chdir(_robotwin_root)
-    from planner import CuroboPlanner
+    from envs.robot.planner import CuroboPlanner
     os.chdir(_prev_cwd)
 
     evac_cfg = OmegaConf.load(args['evac_config'])
@@ -1270,11 +1269,11 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
         if failure_explore_mode:
             _write_failure_tables(epoch)
 
-        if (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
+        if (not failure_explore_mode) and (epoch + 1) % config['save_freq'] == 0 and accelerator.is_main_process:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
             unwrapped_policy = accelerator.unwrap_model(policy)
             torch.save(unwrapped_policy.state_dict(), ckpt_path)
-        if resume_save_freq > 0 and (epoch + 1) % resume_save_freq == 0:
+        if (not failure_explore_mode) and resume_save_freq > 0 and (epoch + 1) % resume_save_freq == 0:
             rng_state_by_rank = _gather_rng_state_by_rank(accelerator)
             if accelerator.is_main_process:
                 unwrapped_policy = accelerator.unwrap_model(policy)
@@ -1301,31 +1300,32 @@ def train_bc(train_dataloader, config, corr_train_dataloader=None):
     if explore_pbar is not None:
         explore_pbar.close()
 
-    final_rng_state_by_rank = _gather_rng_state_by_rank(accelerator)
+    final_rng_state_by_rank = None if failure_explore_mode else _gather_rng_state_by_rank(accelerator)
     if accelerator.is_main_process:
         if writer is not None:
             writer.close()
 
-        ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
-        unwrapped_policy = accelerator.unwrap_model(policy)
-        torch.save(unwrapped_policy.state_dict(), ckpt_path)
-        resume_path = os.path.join(ckpt_dir, "resume_last.pt")
-        torch.save(
-            {
-                "resume_format_version": 2,
-                "model": unwrapped_policy.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": int(last_finished_epoch),
-                "global_step": int(global_step),
-                "seed": int(seed),
-                "policy_class": str(policy_class),
-                "world_size": int(accelerator.num_processes),
-                "save_freq": int(config['save_freq']),
-                "resume_save_freq": int(resume_save_freq),
-                "rng_state_by_rank": final_rng_state_by_rank,
-                "resume_from": resume_ckpt_path,
-            },
-            resume_path,
-        )
+        if not failure_explore_mode:
+            ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            torch.save(unwrapped_policy.state_dict(), ckpt_path)
+            resume_path = os.path.join(ckpt_dir, "resume_last.pt")
+            torch.save(
+                {
+                    "resume_format_version": 2,
+                    "model": unwrapped_policy.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": int(last_finished_epoch),
+                    "global_step": int(global_step),
+                    "seed": int(seed),
+                    "policy_class": str(policy_class),
+                    "world_size": int(accelerator.num_processes),
+                    "save_freq": int(config['save_freq']),
+                    "resume_save_freq": int(resume_save_freq),
+                    "rng_state_by_rank": final_rng_state_by_rank,
+                    "resume_from": resume_ckpt_path,
+                },
+                resume_path,
+            )
 
     print(f"Training finished: Seed {seed}")

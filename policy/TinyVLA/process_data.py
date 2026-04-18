@@ -1,7 +1,10 @@
 ## 本文件用于将robotwin Challenge 2 中的hdf5数据转为TinyVLA可以直接训练的数据。
 import sys
+from pathlib import Path
 
-sys.path.append('./policy/ACT/')
+FILE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = FILE_DIR.parents[1]
+sys.path.append(str(REPO_ROOT / 'policy' / 'ACT'))
 
 import os
 import h5py
@@ -10,11 +13,26 @@ import pickle
 import cv2
 import argparse
 import pdb
+import json
 
-task_prompt = {
-    "place_object_scale": "Use one arm to grab the object and put it on the scale.",
-"place_phone_stand": "Place phone onto stand using multi-angle desk images to determine positions and plan actions.",
-}
+
+def load_episode_instruction(data_dir, episode_idx, task_name):
+    instruction_path = os.path.join(os.path.dirname(data_dir), "instructions", f"episode{episode_idx}.json")
+    if not os.path.isfile(instruction_path):
+        raise FileNotFoundError(
+            f"Missing instruction file for task '{task_name}', episode{episode_idx}: {instruction_path}"
+        )
+
+    with open(instruction_path, "r", encoding="utf-8") as f:
+        instruction_dict = json.load(f)
+
+    seen_instructions = instruction_dict.get("seen", [])
+    if not seen_instructions:
+        raise ValueError(
+            f"Instruction file {instruction_path} does not contain a usable 'seen[0]' prompt."
+        )
+
+    return seen_instructions[0]
 
 def load_hdf5(dataset_path):
     '''
@@ -94,7 +112,7 @@ def data_transform(path, episode_num, save_path, task_name):
 
         with h5py.File(hdf5path, 'w') as f:
             f.create_dataset('action', data=np.array(actions))
-            language_raw = task_prompt[task_name].encode('utf-8')
+            language_raw = load_episode_instruction(path, i, task_name).encode('utf-8')
             f.create_dataset('language_raw', data=np.array(language_raw))
             obs = f.create_group('observations')
             obs.create_dataset('qpos', data=np.array(qpos))
@@ -126,7 +144,7 @@ if __name__ == "__main__":
     setting = args.setting
     expert_data_num = args.expert_data_num
 
-    data_path_name = task_name + "/" + setting + "/data"
+    data_path = REPO_ROOT / "data" / task_name / setting / "data"
+    save_path = FILE_DIR / "data" / f"sim-{task_name}" / f"{setting}-{expert_data_num}"
     begin = 0
-    begin = data_transform(os.path.join("../../../data/", data_path_name), expert_data_num,
-                           f"data/sim-{task_name}/{setting}-{expert_data_num}",task_name)
+    begin = data_transform(str(data_path), expert_data_num, str(save_path), task_name)
