@@ -277,6 +277,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 phase_key = str(meta["phase_key"])
                 phase_instance_idx = int(meta["phase_instance_idx"])
                 phase_bin_id = int(meta["phase_bin_id"])
+                if phase_key == "transport":
+                    continue
                 if phase_key == "approach" and phase_bin_id < int(self.failure_skip_approach_bins):
                     continue
                 unit_key = (phase_key, phase_instance_idx, phase_bin_id)
@@ -600,11 +602,22 @@ class EpisodicDataset(torch.utils.data.Dataset):
             forced_dir_bin_id = int(failure_sampled.get("dir_bin_id", -1))
             forced_mag_bin_id = int(failure_sampled.get("mag_bin_id", -1))
             sampled_explore_unit_idx = int(failure_sampled.get("explore_unit_idx", -1))
-            sampled_mode_prob = float(failure_sampled.get("sampled_mode_prob", np.nan))
-            sampled_entry_prob_within_mode = float(
-                failure_sampled.get("sampled_entry_prob_within_mode", np.nan)
+            sampled_mode_prob_raw = failure_sampled.get("sampled_mode_prob", np.nan)
+            sampled_entry_prob_within_mode_raw = failure_sampled.get(
+                "sampled_entry_prob_within_mode", np.nan
             )
-            sampled_unit_prob = float(failure_sampled.get("sampled_unit_prob", np.nan))
+            sampled_unit_prob_raw = failure_sampled.get("sampled_unit_prob", np.nan)
+            sampled_mode_prob = (
+                np.nan if sampled_mode_prob_raw is None else float(sampled_mode_prob_raw)
+            )
+            sampled_entry_prob_within_mode = (
+                np.nan
+                if sampled_entry_prob_within_mode_raw is None
+                else float(sampled_entry_prob_within_mode_raw)
+            )
+            sampled_unit_prob = (
+                np.nan if sampled_unit_prob_raw is None else float(sampled_unit_prob_raw)
+            )
 
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
