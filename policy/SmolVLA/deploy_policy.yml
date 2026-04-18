@@ -1,0 +1,13 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: SmolVLA
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# SmolVLA-specific configuration
+model_path: /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/latest/checkpoints/030000/pretrained_model
+device: cuda
+camera_sources:
+  - head_camera
