@@ -4,40 +4,40 @@ set -euo pipefail
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
+LOCAL_SRC_DIR="${SCRIPT_DIR}/src"
+
+source /data/miniconda3/etc/profile.d/conda.sh
+conda activate smolvla
+cd /data/zhenyangfan/RoboTwin/policy/SmolVLA
 cd "${SCRIPT_DIR}"
-LOCAL_SRC_DIR=${SCRIPT_DIR}/src
 
-DATASET_REPO_ID=${DATASET_REPO_ID:-robotwin_multitask_5_cam_high}
-DATASET_ROOT=${DATASET_ROOT:-${SCRIPT_DIR}/data/${DATASET_REPO_ID}}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/train/${DATASET_REPO_ID}}
+# Edit the values in this block directly before launching the script.
+DATASET_REPO_ID="robotwin_multitask_5_cam_high"
+DATASET_ROOT="${SCRIPT_DIR}/data/${DATASET_REPO_ID}"
+OUTPUT_ROOT="${SCRIPT_DIR}/outputs/train/${DATASET_REPO_ID}"
 
-TRAIN_TAG=${TRAIN_TAG:-}
-RUN_TAG=${RUN_TAG:-${TRAIN_TAG:-base_cam_high}}
-RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
+TRAIN_TAG="rgb_seen_random"
+RUN_TAG="rgb_seen_random"
+RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-PRETRAINED_PATH=${PRETRAINED_PATH:-/data/weights/smolvla_base}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-7}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES// /}
-POLICY_DEVICE=${POLICY_DEVICE:-cuda}
+PRETRAINED_PATH="/data/weights/smolvla_base"
+CUDA_VISIBLE_DEVICES="7"
+POLICY_DEVICE="cuda"
 
-STEPS=${STEPS:-50000}
-BATCH_SIZE=${BATCH_SIZE:-64}
-NUM_WORKERS=${NUM_WORKERS:-32}
-SAVE_FREQ=${SAVE_FREQ:-2500}
-LOG_FREQ=${LOG_FREQ:-50}
-EVAL_FREQ=${EVAL_FREQ:-0}
-WANDB_ENABLE=${WANDB_ENABLE:-false}
-RANDOMIZE_SEEN_INSTRUCTIONS=${RANDOMIZE_SEEN_INSTRUCTIONS:-1}
+STEPS=50000
+BATCH_SIZE=64
+NUM_WORKERS=32
+SAVE_FREQ=2500
+LOG_FREQ=50
+EVAL_FREQ=0
+WANDB_ENABLE="false"
+RANDOMIZE_SEEN_INSTRUCTIONS=1
 
-RESUME_FROM=${RESUME_FROM:-}
-PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-1}
-PYTHONPATH=${PYTHONPATH:-}
+RESUME_FROM=""
+PYTHONNOUSERSITE=1
+TOKENIZERS_PARALLELISM=false
 
-if [ -n "${PYTHONPATH}" ]; then
-  EFFECTIVE_PYTHONPATH=${LOCAL_SRC_DIR}:${PYTHONPATH}
-else
-  EFFECTIVE_PYTHONPATH=${LOCAL_SRC_DIR}
-fi
+PYTHONPATH="${LOCAL_SRC_DIR}"
 
 if [ ! -d "${DATASET_ROOT}" ]; then
   echo "Dataset root does not exist: ${DATASET_ROOT}" >&2
@@ -90,7 +90,7 @@ else
   if [ -n "${RUN_TAG}" ]; then
     RUN_NAME="${RUN_NAME}-${RUN_TAG}"
   fi
-  OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}
+  OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   if [ -e "${OUTPUT_DIR}" ]; then
     echo "Output directory already exists: ${OUTPUT_DIR}" >&2
     exit 1
@@ -124,7 +124,7 @@ run_timestamp=${RUN_TIMESTAMP}
 output_dir=${OUTPUT_DIR}
 resume_from=${RESUME_FROM}
 pythonnousersite=${PYTHONNOUSERSITE}
-pythonpath=${EFFECTIVE_PYTHONPATH}
+pythonpath=${PYTHONPATH}
 EOF
 
 CMD=(
@@ -151,10 +151,7 @@ if [ -n "${RESUME_FROM}" ]; then
   CMD+=(--resume=true --config_path="${OUTPUT_DIR}/train_config.json")
 fi
 
-printf 'TRAIN_TAG=%q RUN_TAG=%q CUDA_VISIBLE_DEVICES=%q PYTHONNOUSERSITE=%q PYTHONPATH=%q ' \
-  "${TRAIN_TAG}" "${RUN_TAG}" "${CUDA_VISIBLE_DEVICES}" "${PYTHONNOUSERSITE}" "${EFFECTIVE_PYTHONPATH}" \
-  > "${ARTIFACT_DIR}/launch_command.sh"
-printf '%q ' "${CMD[@]}" >> "${ARTIFACT_DIR}/launch_command.sh"
+printf '%q ' "${CMD[@]}" > "${ARTIFACT_DIR}/launch_command.sh"
 printf '\n' >> "${ARTIFACT_DIR}/launch_command.sh"
 
 echo "Training output dir: ${OUTPUT_DIR}"
@@ -162,10 +159,12 @@ echo "Train tag: ${TRAIN_TAG}"
 echo "Run tag: ${RUN_TAG}"
 echo "Checkpoint save frequency: every ${SAVE_FREQ} steps"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
-PYTHONNOUSERSITE="${PYTHONNOUSERSITE}" \
-LEROBOT_RANDOMIZE_TASK_FROM_EPISODE_INSTRUCTIONS="${RANDOMIZE_SEEN_INSTRUCTIONS}" \
-PYTHONPATH="${EFFECTIVE_PYTHONPATH}" \
+export CUDA_VISIBLE_DEVICES
+export PYTHONNOUSERSITE
+export PYTHONPATH
+export TOKENIZERS_PARALLELISM
+export LEROBOT_RANDOMIZE_TASK_FROM_EPISODE_INSTRUCTIONS="${RANDOMIZE_SEEN_INSTRUCTIONS}"
+
 "${CMD[@]}" 2>&1 | tee "${ARTIFACT_DIR}/log.log"
 
 if [ "${ARTIFACT_DIR}" != "${OUTPUT_DIR}" ] && [ -d "${OUTPUT_DIR}" ]; then
