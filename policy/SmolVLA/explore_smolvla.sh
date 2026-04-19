@@ -115,7 +115,7 @@ WORLD_SIZE=${#GPU_IDS[@]}
 PIDS=()
 for RANK in "${!GPU_IDS[@]}"; do
   GPU_ID=${GPU_IDS[$RANK]}
-  CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 /data/zhenyangfan/RoboTwin/policy/SmolVLA/explore_smolvla.py \
+  CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 /data/zhenyangfan/RoboTwin/policy/SmolVLA/latentcorr/explore_smolvla.py \
     --output_dir "${OUTPUT_DIR}" \
     --smolvla_pretrained_path "${SMOLVLA_PRETRAINED_PATH}" \
     --stage1_ckpt "${STAGE1_CKPT}" \

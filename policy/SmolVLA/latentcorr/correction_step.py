@@ -1,694 +1,39 @@
 from __future__ import annotations
 
 import os
-import re
-from contextlib import redirect_stdout, redirect_stderr
 
 import numpy as np
-import torch
 
-from policy.SmolVLA.failure_utils import (
+from policy.SmolVLA.latentcorr.failure_utils import (
     active_arm_pattern_id_to_key,
     error_mode_id_to_key,
     phase_id_to_key,
 )
-from policy.SmolVLA.act_aligned_pkg.utils_common import resample_trajectory
-from policy.SmolVLA.act_aligned_pkg.perturbation import (
+from policy.SmolVLA.latentcorr.correction_episode_io import (
+    export_correction_sample_as_episode,
+    init_export_episode_id,
+    load_raw_data,
+)
+from policy.SmolVLA.latentcorr.correction_evac_rollout import (
+    evac_inference,
+    find_nearest_traj_point,
+    quat_geodesic_deg_wxyz,
+)
+from policy.SmolVLA.latentcorr.correction_utils import resample_trajectory
+from policy.SmolVLA.latentcorr.correction_projection_debug import (
+    compute_phase_projection,
+    draw_phase_bin_starts,
+    draw_phase_legend,
+    draw_phase_polyline,
+    save_gt_projection_on_original,
+    save_loss_batch_projection,
+    save_perturb_compare_image,
+    save_recover_eval_compare_image,
+)
+from policy.SmolVLA.latentcorr.correction_perturbation import (
     _infer_active_arms_from_gt_window,
-    _infer_phase_key_from_gt_window,
     perturb_action_chunk_online,
 )
-
-def load_raw_data(raw_data_dir, episode_id):
-    import h5py, cv2 as _cv2
-    path = os.path.join(raw_data_dir, f'episode{episode_id}.hdf5')
-    with h5py.File(path, 'r') as f:
-        # decode one frame to get native resolution (intrinsic is calibrated for this size)
-        _frame0 = bytes(f['observation/head_camera/rgb'][0])
-        _img0 = _cv2.imdecode(np.frombuffer(_frame0, np.uint8), _cv2.IMREAD_COLOR)
-        h_native, w_native = _img0.shape[:2]
-        return {
-            'episode_path': path,
-            'left_endpose': f['endpose/left_endpose'][()].astype(np.float32),
-            'right_endpose': f['endpose/right_endpose'][()].astype(np.float32),
-            'left_gripper': f['endpose/left_gripper'][()].astype(np.float32),
-            'right_gripper': f['endpose/right_gripper'][()].astype(np.float32),
-            'gt_left_arm': f['joint_action/left_arm'][()].astype(np.float32) if ('joint_action' in f and 'left_arm' in f['joint_action']) else None,
-            'gt_right_arm': f['joint_action/right_arm'][()].astype(np.float32) if ('joint_action' in f and 'right_arm' in f['joint_action']) else None,
-            'intrinsic_cv': f['observation/head_camera/intrinsic_cv'][0].astype(np.float32),
-            'extrinsic_cv': f['observation/head_camera/extrinsic_cv'][0].astype(np.float32),
-            'native_resolution': (h_native, w_native),  # intrinsic is calibrated for this
-        }
-
-def _init_export_episode_id(export_dir):
-    if not os.path.isdir(export_dir):
-        return 0
-    max_id = -1
-    for fn in os.listdir(export_dir):
-        m = re.match(r"episode_(\d+)\.hdf5$", fn)
-        if m:
-            max_id = max(max_id, int(m.group(1)))
-    return max_id + 1
-
-def _export_correction_sample_as_episode(
-    export_dir,
-    episode_id,
-    cam_names,
-    corr_image,
-    corr_qpos_norm,
-    corr_action_norm,
-    corr_is_pad,
-    norm_stats,
-):
-    os.makedirs(export_dir, exist_ok=True)
-    path = os.path.join(export_dir, f"episode_{episode_id}.hdf5")
-
-    img = corr_image.detach().cpu().numpy()            # (K,C,H,W), [0,1]
-    qn = corr_qpos_norm.detach().cpu().numpy()         # (14,)
-    an = corr_action_norm.detach().cpu().numpy()       # (Tmax,14)
-    pad = corr_is_pad.detach().cpu().numpy().astype(bool)
-
-    valid_len = int(np.sum(~pad))
-    valid_len = max(1, valid_len)
-
-    qpos_raw = (qn * norm_stats["qpos_std"] + norm_stats["qpos_mean"]).astype(np.float32)
-    action_raw = (an * norm_stats["action_std"] + norm_stats["action_mean"]).astype(np.float32)
-    action_raw = action_raw[:valid_len]
-    qpos_seq = np.repeat(qpos_raw[None, :], valid_len, axis=0).astype(np.float32)
-
-    img_u8 = np.clip(np.round(img * 255.0), 0, 255).astype(np.uint8)
-    img_hwc = np.transpose(img_u8, (0, 2, 3, 1))  # (K,H,W,C)
-
-    import h5py
-    with h5py.File(path, "w") as f:
-        f.create_dataset("/action", data=action_raw, compression="gzip", compression_opts=1)
-        f.create_dataset("/observations/qpos", data=qpos_seq, compression="gzip", compression_opts=1)
-        g_img = f.create_group("/observations/images")
-        for k, cam_name in enumerate(cam_names):
-            frames = np.repeat(img_hwc[k][None, ...], valid_len, axis=0)
-            g_img.create_dataset(cam_name, data=frames, compression="gzip", compression_opts=1)
-
-def find_nearest_traj_point(fk_left_pos, fk_left_quat, fk_right_pos, fk_right_quat,
-                            left_endpose, right_endpose, orient_weight=0.0,
-                            curr_left_grip=None, curr_right_grip=None,
-                            left_gripper_traj=None, right_gripper_traj=None,
-                            gripper_penalty=0.0,
-                            window_start=None, window_end=None):
-    """Find nearest trajectory point using position + orientation + gripper distance.
-    Quaternions are in wxyz format. orient_weight scales the geodesic
-    orientation distance (radians) relative to position distance (meters).
-    gripper_penalty penalizes matching to points with different gripper state
-    (binarized at 0.5 threshold)."""
-    left_d = np.linalg.norm(left_endpose[:, :3] - fk_left_pos, axis=1)
-    right_d = np.linalg.norm(right_endpose[:, :3] - fk_right_pos, axis=1)
-    dists = (left_d + right_d) / 2
-    if orient_weight > 0:
-        # quaternion geodesic distance: 2 * arccos(|q1 · q2|)
-        left_dot = np.clip(np.abs(np.sum(left_endpose[:, 3:7] * fk_left_quat, axis=1)), 0.0, 1.0)
-        right_dot = np.clip(np.abs(np.sum(right_endpose[:, 3:7] * fk_right_quat, axis=1)), 0.0, 1.0)
-        left_d_ori = 2.0 * np.arccos(left_dot)
-        right_d_ori = 2.0 * np.arccos(right_dot)
-        dists += orient_weight * (left_d_ori + right_d_ori) / 2
-    if gripper_penalty > 0 and left_gripper_traj is not None:
-        # binarize gripper: <=0.5 -> closed(0), >0.5 -> open(1)
-        curr_lg = 0.0 if curr_left_grip <= 0.5 else 1.0
-        curr_rg = 0.0 if curr_right_grip <= 0.5 else 1.0
-        traj_lg = (left_gripper_traj > 0.5).astype(np.float32)
-        traj_rg = (right_gripper_traj > 0.5).astype(np.float32)
-        lg_mismatch = np.abs(traj_lg - curr_lg)
-        rg_mismatch = np.abs(traj_rg - curr_rg)
-        dists += gripper_penalty * (lg_mismatch + rg_mismatch) / 2
-    if window_start is not None or window_end is not None:
-        ws = 0 if window_start is None else int(np.clip(window_start, 0, len(dists) - 1))
-        we = len(dists) if window_end is None else int(np.clip(window_end, ws + 1, len(dists)))
-        d_win = np.full_like(dists, np.inf, dtype=np.float32)
-        d_win[ws:we] = dists[ws:we]
-        if np.any(np.isfinite(d_win)):
-            dists = d_win
-    t_star = np.argmin(dists)
-    return t_star, dists[t_star]
-
-
-def _quat_geodesic_deg_wxyz(q1_wxyz, q2_wxyz):
-    q1 = np.asarray(q1_wxyz, dtype=np.float32).reshape(4,)
-    q2 = np.asarray(q2_wxyz, dtype=np.float32).reshape(4,)
-    n1 = float(np.linalg.norm(q1))
-    n2 = float(np.linalg.norm(q2))
-    if n1 < 1e-8 or n2 < 1e-8:
-        return 180.0
-    q1 = q1 / n1
-    q2 = q2 / n2
-    dot = float(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0))
-    rad = 2.0 * float(np.arccos(dot))
-    return float(np.rad2deg(rad))
-
-def evac_inference(evac_model, evac_cfg, curr_image, fk_poses, grippers, raw_data, device,
-                   save_dir=None, ddim_steps=27, infer_kwargs=None):
-    """EVAC prediction via model.inference() — matches infer_all.py exactly.
-
-    Args:
-        curr_image: (3, H, W) BGR [0,1] tensor (current observation)
-        fk_poses: list of (lp, lq_wxyz, rp, rq_wxyz).
-                  First entry = current state, rest = action outcomes. Total N entries.
-        grippers: list of (lg, rg), same length as fk_poses.
-        raw_data: dict with extrinsic_cv, intrinsic_cv, native_resolution
-        save_dir: if set, save frames + traj video there
-        infer_kwargs: optional kwargs forwarded to evac_model.inference()
-    Returns: last predicted frame as (3, H, W) BGR [0,1] tensor
-    """
-    import cv2, math, tempfile, shutil
-    from evac.lvdm.data.get_actions import get_actions
-    from evac.lvdm.data.statistics import StatisticInfo
-    import torchvision.transforms as tvt
-
-    chunk = evac_cfg.chunk
-    n_prev = evac_cfg.n_previous
-    N = len(fk_poses)  # 1 (init state) + N_actions
-
-    # --- Image: BGR→RGB [0,1], resize to native resolution, repeat n_prev ---
-    # inference() scales intrinsic by sample_size / image_size, so image must
-    # be at the same resolution as the intrinsic calibration (native_resolution).
-    h_native, w_native = raw_data['native_resolution']
-    img_rgb = curr_image[[2, 1, 0]]  # (3, 480, 640) → RGB
-    img_rgb = tvt.Resize((h_native, w_native))(img_rgb)  # → native res
-    memories = img_rgb.unsqueeze(1).repeat(1, n_prev, 1, 1)  # (3, n_prev, h, w)
-
-    # --- Actions: same format as infer_all.py h5 variant ---
-    all_ends_p = np.zeros((N, 2, 3), dtype=np.float32)
-    all_ends_o = np.zeros((N, 2, 4), dtype=np.float32)
-    gripper_arr = np.zeros((N, 2), dtype=np.float32)
-    for i, ((lp, lq, rp, rq), (lg, rg)) in enumerate(zip(fk_poses, grippers)):
-        all_ends_p[i, 0], all_ends_p[i, 1] = lp, rp
-        # wxyz→xyzw, canonicalize so w>=0 (match HDF5 sign convention)
-        lq_xyzw = np.array([lq[1], lq[2], lq[3], lq[0]])
-        rq_xyzw = np.array([rq[1], rq[2], rq[3], rq[0]])
-        if lq_xyzw[3] < 0: lq_xyzw = -lq_xyzw
-        if rq_xyzw[3] < 0: rq_xyzw = -rq_xyzw
-        all_ends_o[i, 0] = lq_xyzw
-        all_ends_o[i, 1] = rq_xyzw
-        gripper_arr[i] = [lg * 120.0, rg * 120.0]
-
-    slices = [0] * (n_prev - 1) + list(range(N))
-    action, delta_action = get_actions(
-        gripper=gripper_arr, all_ends_p=all_ends_p, all_ends_o=all_ends_o,
-        slices=slices, delta_act_sidx=n_prev)
-    action = torch.FloatTensor(action)
-    delta_action = torch.FloatTensor(delta_action)
-    mv = torch.tensor(StatisticInfo['agibotworld']['mean']).unsqueeze(0)
-    sv = torch.tensor(StatisticInfo['agibotworld']['std']).unsqueeze(0)
-    delta_action[:, :6] = (delta_action[:, :6] - mv[:, :6]) / sv[:, :6]
-    delta_action[:, 7:13] = (delta_action[:, 7:13] - mv[:, 6:]) / sv[:, 6:]
-
-    # --- Camera: same format as infer_all.py ---
-    ext_cv = raw_data['extrinsic_cv']
-    w2c = np.eye(4, dtype=np.float32)
-    w2c[:3, :] = ext_cv
-    c2w = np.linalg.inv(w2c)
-    n_act = action.shape[0]
-    c2w_t = torch.from_numpy(c2w).float().unsqueeze(0).repeat(n_act, 1, 1)
-    w2c_t = torch.from_numpy(w2c).float().unsqueeze(0).repeat(n_act, 1, 1)
-    # clone() to prevent inference() in-place intrinsic scaling from corrupting raw_data
-    intrinsic = torch.from_numpy(raw_data['intrinsic_cv']).float().clone()
-
-    # --- Run inference ---
-    n_valid = N - 1  # predicted frames = number of action steps
-    num_chunk = int(math.ceil(float(n_valid) / chunk))
-    tmp_dir = None
-    if save_dir is None:
-        tmp_dir = tempfile.mkdtemp(prefix='evac_')
-        target_dir = tmp_dir
-    else:
-        target_dir = save_dir
-    os.makedirs(target_dir, exist_ok=True)
-
-    if infer_kwargs is None:
-        infer_kwargs = {}
-
-    with open(os.devnull, "w") as _devnull:
-        with redirect_stdout(_devnull), redirect_stderr(_devnull):
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                frames, _ = evac_model.inference(
-                    evac_cfg, memories, action, delta_action,
-                    c2w_t, w2c_t, intrinsic,
-                    target_dir, num_chunk,
-                    chunk=chunk, n_previous=n_prev, n_valid=n_valid,
-                    unconditional_guidance_scale=1.0,
-                    guidance_rescale=0.7,
-                    ddim_steps=ddim_steps,
-                    dataset_name="agibotworld",
-                    saving_video=(save_dir is not None),
-                    saving_fps=30,
-                    video_dir=target_dir,
-                    **infer_kwargs,
-                )
-                torch.cuda.empty_cache()
-
-    # Debug continuity helper: keep explicit input frame.
-    if save_dir is not None:
-        try:
-            inp_rgb = np.clip((img_rgb.permute(1, 2, 0).cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
-            inp_bgr = inp_rgb[:, :, ::-1].copy()
-            cv2.imwrite(os.path.join(target_dir, 'input_frame.png'), inp_bgr)
-        except Exception:
-            pass
-
-    if tmp_dir is not None:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # frames: (n_valid, H, W, 3) RGB uint8 at sample_size resolution
-    last_rgb = cv2.resize(frames[-1], (640, 480))
-    last_bgr = last_rgb[:, :, ::-1].copy()
-    return torch.from_numpy(last_bgr).float().permute(2, 0, 1) / 255.0
-
-
-def _shared_phase_color(phase_key):
-    k = str(phase_key).strip().lower()
-    cmap = {
-        "approach": (255, 120, 0),
-        "pregrasp": (0, 165, 255),
-        "transport": (0, 255, 255),
-        "place": (255, 0, 255),
-    }
-    return cmap.get(k, (180, 180, 180))
-
-
-def _shared_draw_phase_polyline(img, seq, phase_seq, width=1):
-    import cv2
-
-    prev = None
-    for i, pt in enumerate(seq):
-        if pt is None:
-            prev = None
-            continue
-        if prev is not None:
-            c = _shared_phase_color(phase_seq[i] if i < len(phase_seq) else "unknown")
-            cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), c, width, cv2.LINE_AA)
-        prev = pt
-
-
-def _shared_draw_phase_legend(img):
-    import cv2
-
-    rows = [
-        ("approach", _shared_phase_color("approach")),
-        ("pregrasp", _shared_phase_color("pregrasp")),
-        ("transport", _shared_phase_color("transport")),
-        ("place", _shared_phase_color("place")),
-    ]
-    x0, y0 = 8, 8
-    row_h = 14
-    w = 126
-    h = 6 + row_h * len(rows) + 6
-    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (20, 20, 20), -1, cv2.LINE_AA)
-    cv2.rectangle(img, (x0, y0), (x0 + w, y0 + h), (220, 220, 220), 1, cv2.LINE_AA)
-    for i, (name, color) in enumerate(rows):
-        y = y0 + 14 + i * row_h
-        cv2.circle(img, (x0 + 9, y - 3), 3, color, -1, cv2.LINE_AA)
-        cv2.putText(img, name, (x0 + 17, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
-
-
-def _shared_build_pose_np_from_raw_indices(raw_data, raw_idx_list):
-    pose_list = []
-    for gi in raw_idx_list:
-        lp_gt = raw_data['left_endpose'][gi, :3].astype(np.float32)
-        lq_gt_wxyz = raw_data['left_endpose'][gi, 3:7].astype(np.float32)
-        rp_gt = raw_data['right_endpose'][gi, :3].astype(np.float32)
-        rq_gt_wxyz = raw_data['right_endpose'][gi, 3:7].astype(np.float32)
-        lq_gt_xyzw = np.array([lq_gt_wxyz[1], lq_gt_wxyz[2], lq_gt_wxyz[3], lq_gt_wxyz[0]], dtype=np.float32)
-        rq_gt_xyzw = np.array([rq_gt_wxyz[1], rq_gt_wxyz[2], rq_gt_wxyz[3], rq_gt_wxyz[0]], dtype=np.float32)
-        if lq_gt_xyzw[3] < 0:
-            lq_gt_xyzw = -lq_gt_xyzw
-        if rq_gt_xyzw[3] < 0:
-            rq_gt_xyzw = -rq_gt_xyzw
-        lg_gt = float(np.clip(raw_data['left_gripper'][gi], 0.0, 1.0)) * 120.0
-        rg_gt = float(np.clip(raw_data['right_gripper'][gi], 0.0, 1.0)) * 120.0
-        pose_list.append(
-            np.concatenate([lp_gt, lq_gt_xyzw, [lg_gt], rp_gt, rq_gt_xyzw, [rg_gt]], axis=0).astype(np.float32)
-        )
-    if len(pose_list) == 0:
-        return None
-    return np.stack(pose_list, axis=0)
-
-
-def _shared_project_base_uv_from_pose_np(pose_arr, K, E):
-    import evac.lvdm.models.ddpm3d as ddpm3d_mod
-
-    w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
-    intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
-    cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
-    ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
-
-    pose_t = torch.from_numpy(pose_arr).float()
-    pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
-    pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
-    ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
-    ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
-    pts_l = torch.matmul(ee2cam_l, ee_key_pts)
-    pts_r = torch.matmul(ee2cam_r, ee_key_pts)
-    uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
-    uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
-    uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
-    uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
-    return uvs_l, uvs_r, pts_l, pts_r
-
-
-def _shared_extract_base_uv(uvs, pts):
-    out = []
-    n = int(uvs.shape[0])
-    for i in range(n):
-        try:
-            z = float(pts[0, i, 2, 0].item())
-            u = int(uvs[i, 0, 0])
-            v = int(uvs[i, 0, 1])
-        except Exception:
-            out.append(None)
-            continue
-        if z > 1e-6 and np.isfinite(uvs[i, 0, :]).all():
-            out.append((u, v))
-        else:
-            out.append(None)
-    return out
-
-
-def _shared_compute_phase_projection(raw_data, phase_window_len, K, E):
-    n_ep_total = int(raw_data['left_endpose'].shape[0])
-    full_left_grip = np.asarray(raw_data['left_gripper'], dtype=np.float32).reshape(-1)
-    full_right_grip = np.asarray(raw_data['right_gripper'], dtype=np.float32).reshape(-1)
-    phase_raw_idx = []
-    phase_seq = []
-    if n_ep_total <= 1:
-        return None, None, None
-    stride = int(max(1, n_ep_total // 240))
-    for raw_idx in range(0, n_ep_total, stride):
-        ph = _infer_phase_key_from_gt_window(
-            full_left_grip[raw_idx:],
-            full_right_grip[raw_idx:],
-            phase_window_len,
-        )
-        phase_raw_idx.append(raw_idx)
-        phase_seq.append(ph)
-    if len(phase_raw_idx) < 2:
-        return None, None, None
-    phase_pose_np = _shared_build_pose_np_from_raw_indices(raw_data, phase_raw_idx)
-    if phase_pose_np is None:
-        return None, None, None
-    p_uvs_l, p_uvs_r, p_pts_l, p_pts_r = _shared_project_base_uv_from_pose_np(phase_pose_np, K, E)
-    p_l_seq = _shared_extract_base_uv(p_uvs_l, p_pts_l.reshape(1, p_pts_l.shape[1], 4, 4))
-    p_r_seq = _shared_extract_base_uv(p_uvs_r, p_pts_r.reshape(1, p_pts_r.shape[1], 4, 4))
-    return p_l_seq, p_r_seq, phase_seq
-
-
-def _shared_draw_phase_bin_starts(img, l_seq, r_seq, phase_seq, phase_bins):
-    import cv2
-
-    phase_bins = int(max(1, phase_bins))
-    n = len(phase_seq)
-    if n <= 0:
-        return
-
-    i = 0
-    while i < n:
-        key = str(phase_seq[i])
-        j = i + 1
-        while j < n and str(phase_seq[j]) == key:
-            j += 1
-        seg_len = j - i
-        if seg_len > 0:
-            for b in range(phase_bins):
-                rel = int(np.floor(float(b) * float(seg_len) / float(phase_bins)))
-                idx = i + min(seg_len - 1, max(0, rel))
-
-                # Find a drawable uv near idx.
-                uv_l = None
-                uv_r = None
-                for k in range(idx, j):
-                    if uv_l is None and k < len(l_seq) and l_seq[k] is not None:
-                        uv_l = l_seq[k]
-                    if uv_r is None and k < len(r_seq) and r_seq[k] is not None:
-                        uv_r = r_seq[k]
-                    if uv_l is not None and uv_r is not None:
-                        break
-                if uv_l is None and uv_r is None:
-                    for k in range(idx - 1, i - 1, -1):
-                        if uv_l is None and k < len(l_seq) and l_seq[k] is not None:
-                            uv_l = l_seq[k]
-                        if uv_r is None and k < len(r_seq) and r_seq[k] is not None:
-                            uv_r = r_seq[k]
-                        if uv_l is not None and uv_r is not None:
-                            break
-
-                label_anchor = None
-                if uv_l is not None:
-                    ul, vl = int(uv_l[0]), int(uv_l[1])
-                    cv2.circle(img, (ul, vl), 2, (0, 255, 0), -1, cv2.LINE_AA)
-                    label_anchor = (ul, vl) if label_anchor is None else label_anchor
-                if uv_r is not None:
-                    ur, vr = int(uv_r[0]), int(uv_r[1])
-                    cv2.circle(img, (ur, vr), 2, (0, 0, 255), -1, cv2.LINE_AA)
-                    label_anchor = (ur, vr) if label_anchor is None else label_anchor
-
-                if label_anchor is not None:
-                    _tag_prefix = {
-                        "approach": "A",
-                        "pregrasp": "G",
-                        "transport": "T",
-                        "place": "L",
-                    }.get(key, key[:1].upper() if len(key) > 0 else "?")
-                    tag = f"{_tag_prefix}{b}"
-                    tx, ty = (int(label_anchor[0]) + 4, int(label_anchor[1]) - 4)
-                    cv2.putText(
-                        img,
-                        tag,
-                        (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.30,
-                        (0, 0, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    cv2.putText(
-                        img,
-                        tag,
-                        (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.30,
-                        (0, 0, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
-        i = j
-
-
-def _save_gt_projection_on_original(
-    debug_corr_dir,
-    image_data_s,
-    curr_image,
-    raw_data,
-    start_ts,
-    rollout_steps_total,
-    phase_window_len,
-    phase_bins,
-):
-    import cv2
-
-    try:
-        _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        gt_ref_idx = int(np.clip(start_ts, 0, raw_data['left_endpose'].shape[0] - 1))
-        try:
-            ep_path = raw_data.get('episode_path', None)
-            if ep_path is not None and os.path.isfile(ep_path):
-                import h5py
-                with h5py.File(ep_path, 'r') as _f_gt:
-                    _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
-                _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
-                if _gt is not None and _gt.size > 0:
-                    _oimg = _gt
-        except Exception:
-            pass
-
-        K = raw_data['intrinsic_cv'].astype(np.float32).copy()
-        E = np.eye(4, dtype=np.float32)
-        E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
-        h_native, w_native = raw_data.get('native_resolution', (_oimg.shape[0], _oimg.shape[1]))
-        h_img, w_img = _oimg.shape[:2]
-        if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
-            sx = float(w_img) / float(w_native)
-            sy = float(h_img) / float(h_native)
-            K[0, 0] *= sx
-            K[0, 2] *= sx
-            K[1, 1] *= sy
-            K[1, 2] *= sy
-        _ = np.linalg.inv(E).astype(np.float32)
-
-        _overlay_gt = _oimg.copy()
-        p_l_seq, p_r_seq, phase_seq = _shared_compute_phase_projection(raw_data, phase_window_len, K, E)
-        if p_l_seq is not None and p_r_seq is not None and phase_seq is not None:
-            _shared_draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
-            _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
-            _shared_draw_phase_bin_starts(_overlay_gt, p_l_seq, p_r_seq, phase_seq, phase_bins)
-            _shared_draw_phase_legend(_overlay_gt)
-
-        out_path = os.path.join(debug_corr_dir, 'gt_projection_on_original.png')
-        cv2.imwrite(out_path, _overlay_gt)
-        return {
-            'path': out_path,
-            'exists': bool(os.path.exists(out_path)),
-            'gt_ref_idx': int(gt_ref_idx),
-        }
-    except Exception:
-        try:
-            import traceback
-            with open(os.path.join(debug_corr_dir, 'gt_projection_on_original_error.txt'), 'w') as _f:
-                _f.write(traceback.format_exc())
-        except Exception:
-            pass
-        return None
-
-
-def _save_recover_eval_compare_image(
-    debug_corr_dir,
-    raw_data,
-    gt_ref_idx,
-    recover_pred_img,
-    step_idx,
-    mode=None,
-    recoverable=None,
-    metric_name=None,
-    metric=None,
-    threshold=None,
-    nearest_dist=None,
-):
-    import cv2
-
-    def _put_text_hc(img, text, org, scale=0.5):
-        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), 1, cv2.LINE_AA)
-
-    try:
-        gi = int(np.clip(int(gt_ref_idx), 0, raw_data['left_endpose'].shape[0] - 1))
-        _gt = None
-        ep_path = raw_data.get('episode_path', None)
-        if ep_path is not None and os.path.isfile(ep_path):
-            import h5py
-            with h5py.File(ep_path, 'r') as _f_gt:
-                _enc = bytes(_f_gt['observation/head_camera/rgb'][gi])
-            _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
-        if _gt is None or _gt.size == 0:
-            return None
-
-        _pred = (recover_pred_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        if _pred.shape[:2] != _gt.shape[:2]:
-            _pred = cv2.resize(_pred, (_gt.shape[1], _gt.shape[0]), interpolation=cv2.INTER_LINEAR)
-        _img_cmp = np.concatenate([_gt, _pred], axis=1)
-        info_lines = []
-        info_lines.append(f"LEFT=GT_REF(idx={gi})   RIGHT=RECOVER_ROLLOUT_LAST")
-        info_lines.append(f"mode={mode}")
-        if recoverable is None:
-            info_lines.append("recoverable=unknown")
-        else:
-            info_lines.append(f"recoverable={bool(recoverable)}")
-        if metric_name is not None and metric is not None:
-            info_lines.append(f"{metric_name}={float(metric):.6f}")
-        if threshold is not None:
-            info_lines.append(f"threshold={float(threshold):.6f}")
-        if nearest_dist is not None:
-            info_lines.append(f"nearest_dist={float(nearest_dist):.6f}")
-
-        panel_h = 28 + 18 * len(info_lines)
-        _cmp = np.zeros((_img_cmp.shape[0] + panel_h, _img_cmp.shape[1], 3), dtype=np.uint8)
-        _cmp[:_img_cmp.shape[0], :, :] = _img_cmp
-        _cmp[_img_cmp.shape[0]:, :, :] = 245
-        cv2.line(_cmp, (0, _img_cmp.shape[0]), (_img_cmp.shape[1] - 1, _img_cmp.shape[0]), (120, 120, 120), 1, cv2.LINE_AA)
-        _x0 = 10
-        _y0 = _img_cmp.shape[0] + 20
-        for _li, _txt in enumerate(info_lines):
-            _y = _y0 + _li * 16
-            _put_text_hc(_cmp, _txt, (_x0, _y), scale=0.46)
-        out_path = os.path.join(debug_corr_dir, f"recover_eval_gtref_vs_rollout_last_step_{int(step_idx):03d}.png")
-        cv2.imwrite(out_path, _cmp)
-        return {
-            'path': out_path,
-            'exists': bool(os.path.exists(out_path)),
-            'gt_ref_idx': int(gi),
-            'step': int(step_idx),
-            'mode': mode,
-            'recoverable': (None if recoverable is None else bool(recoverable)),
-            'metric_name': metric_name,
-            'metric': (None if metric is None else float(metric)),
-            'threshold': (None if threshold is None else float(threshold)),
-            'nearest_dist': (None if nearest_dist is None else float(nearest_dist)),
-        }
-    except Exception:
-        try:
-            import traceback
-            with open(os.path.join(debug_corr_dir, 'recover_eval_compare_error.txt'), 'w') as _f:
-                _f.write(traceback.format_exc())
-        except Exception:
-            pass
-        return None
-
-
-def _save_perturb_compare_image(
-    debug_corr_dir,
-    first_img,
-    last_img,
-    sampled_unit,
-    rollout_last_record=None,
-):
-    import cv2
-
-    def _put_text_hc(img, text, org, scale=0.5):
-        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), 1, cv2.LINE_AA)
-
-    try:
-        _first = (first_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        _last = (last_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        if _last.shape[:2] != _first.shape[:2]:
-            _last = cv2.resize(_last, (_first.shape[1], _first.shape[0]), interpolation=cv2.INTER_LINEAR)
-        _img_cmp = np.concatenate([_first, _last], axis=1)
-
-        su = sampled_unit if isinstance(sampled_unit, dict) else {}
-        lines = [
-            "LEFT=INPUT_FIRST(start)   RIGHT=PERTURBED_LAST(after_rollout)",
-            f"phase={su.get('phase_key')} bin={su.get('phase_bin_id')} inst={su.get('phase_instance_idx')}",
-            f"error_mode={su.get('error_mode')} arm={su.get('active_arm_pattern')}",
-            f"dir_bin={su.get('dir_bin_id')} mag_bin={su.get('mag_bin_id')}",
-        ]
-        rr = rollout_last_record if isinstance(rollout_last_record, dict) else {}
-        _tr_gain = rr.get('perturb_translation_gain_m')
-        _rot_deg = rr.get('perturb_rotation_deg')
-        _tr_gain_s = ("None" if _tr_gain is None else f"{float(_tr_gain):.3f}")
-        _rot_deg_s = ("None" if _rot_deg is None else f"{float(_rot_deg):.3f}")
-        lines.extend([
-            f"sampled_error_mode={rr.get('sampled_error_mode')}",
-            f"translation_gain_m={_tr_gain_s} rotation_deg={_rot_deg_s}",
-        ])
-
-        panel_h = 28 + 18 * len(lines)
-        _cmp = np.zeros((_img_cmp.shape[0] + panel_h, _img_cmp.shape[1], 3), dtype=np.uint8)
-        _cmp[:_img_cmp.shape[0], :, :] = _img_cmp
-        _cmp[_img_cmp.shape[0]:, :, :] = 245
-        cv2.line(_cmp, (0, _img_cmp.shape[0]), (_img_cmp.shape[1] - 1, _img_cmp.shape[0]), (120, 120, 120), 1, cv2.LINE_AA)
-        y0 = _img_cmp.shape[0] + 20
-        for i, t in enumerate(lines):
-            _put_text_hc(_cmp, str(t), (10, y0 + 16 * i), scale=0.44)
-
-        out_path = os.path.join(debug_corr_dir, 'perturb_input_vs_last.png')
-        cv2.imwrite(out_path, _cmp)
-        return {
-            'path': out_path,
-            'exists': bool(os.path.exists(out_path)),
-            'sampled_unit': su,
-        }
-    except Exception:
-        try:
-            import traceback
-            with open(os.path.join(debug_corr_dir, 'perturb_compare_error.txt'), 'w') as _f:
-                _f.write(traceback.format_exc())
-        except Exception:
-            pass
-        return None
 
 
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
@@ -1195,12 +540,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     recover_eval_gt_ref_idx = int(nidx_abs)
                     rot_errs = []
                     if bool(active_info.get('left_arm', True)):
-                        rot_errs.append(_quat_geodesic_deg_wxyz(
+                        rot_errs.append(quat_geodesic_deg_wxyz(
                             fr_eval['left'][1],
                             raw_data['left_endpose'][recover_eval_gt_ref_idx, 3:7],
                         ))
                     if bool(active_info.get('right_arm', True)):
-                        rot_errs.append(_quat_geodesic_deg_wxyz(
+                        rot_errs.append(quat_geodesic_deg_wxyz(
                             fr_eval['right'][1],
                             raw_data['right_endpose'][recover_eval_gt_ref_idx, 3:7],
                         ))
@@ -1222,7 +567,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 ):
                     _dbg_corr_cmp = os.path.join(debug_dir, 'correction')
                     os.makedirs(_dbg_corr_cmp, exist_ok=True)
-                    recover_eval_compare = _save_recover_eval_compare_image(
+                    recover_eval_compare = save_recover_eval_compare_image(
                         _dbg_corr_cmp,
                         raw_data,
                         int(recover_eval_gt_ref_idx),
@@ -1340,7 +685,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 break
         if _rr_last is None and len(_dbg_rollout) > 0:
             _rr_last = _dbg_rollout[-1]
-        perturb_compare_meta = _save_perturb_compare_image(
+        perturb_compare_meta = save_perturb_compare_image(
             _dbg_corr_cmp,
             image_data_s[0],
             curr_image[0],
@@ -1413,13 +758,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     _rr.pop('perturb_axis_bin_id', None)
                     _rr['perturb_nl'] = _mk_perturb_nl(_rr)
                     _rollout_skip.append(_rr)
-                gt_projection_meta = _save_gt_projection_on_original(
+                gt_projection_meta = save_gt_projection_on_original(
                     _dbg_corr,
                     image_data_s,
-                    curr_image,
                     raw_data,
                     start_ts,
-                    rollout_steps_total,
                     phase_window_len,
                     phase_bins,
                 )
@@ -2055,15 +1398,15 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 return np.stack(pose_list, axis=0)
 
             # Phase-colored GT trajectory projection (shared with skip/debug path).
-            p_l_seq, p_r_seq, phase_seq = _shared_compute_phase_projection(raw_data, phase_window_len, K, E)
+            p_l_seq, p_r_seq, phase_seq = compute_phase_projection(raw_data, phase_window_len, K, E)
             if p_l_seq is not None and p_r_seq is not None and phase_seq is not None:
-                _shared_draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
-                _shared_draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
-                _shared_draw_phase_polyline(_overlay_c, p_l_seq, phase_seq, width=1)
-                _shared_draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
-                _shared_draw_phase_bin_starts(_overlay_gt, p_l_seq, p_r_seq, phase_seq, phase_bins)
-                _shared_draw_phase_bin_starts(_overlay_c, p_l_seq, p_r_seq, phase_seq, phase_bins)
-                _shared_draw_phase_legend(_overlay_gt)
+                draw_phase_polyline(_overlay_gt, p_l_seq, phase_seq, width=2)
+                draw_phase_polyline(_overlay_gt, p_r_seq, phase_seq, width=2)
+                draw_phase_polyline(_overlay_c, p_l_seq, phase_seq, width=1)
+                draw_phase_polyline(_overlay_c, p_r_seq, phase_seq, width=1)
+                draw_phase_bin_starts(_overlay_gt, p_l_seq, p_r_seq, phase_seq, phase_bins)
+                draw_phase_bin_starts(_overlay_c, p_l_seq, p_r_seq, phase_seq, phase_bins)
+                draw_phase_legend(_overlay_gt)
 
             # Corrected overlay: keep only correction trajectories + phase-colored GT path.
             _overlay_c[mask] = (0.6 * _overlay_c[mask] + 0.4 * traj_u8[mask]).astype(np.uint8)
@@ -2270,138 +1613,3 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         torch.from_numpy(is_pad).bool().to(device),
         corr_meta,
     )
-
-def _save_loss_batch_projection(
-    save_dir,
-    image_cam,
-    action_norm,
-    is_pad,
-    raw_data,
-    fk,
-    norm_stats,
-    meta=None,
-):
-    os.makedirs(save_dir, exist_ok=True)
-    import json
-    import cv2
-
-    act = np.asarray(action_norm.detach().cpu().numpy(), dtype=np.float32)
-    pad = np.asarray(is_pad.detach().cpu().numpy(), dtype=bool).reshape(-1)
-    if act.ndim != 2 or act.shape[1] < 14:
-        return
-    valid = np.where(~pad)[0]
-    if valid.size == 0:
-        return
-    act = act[valid]
-    act_raw = np.asarray(act * norm_stats['action_std'] + norm_stats['action_mean'], dtype=np.float32)
-    if act_raw.shape[0] <= 0:
-        return
-
-    img_u8 = np.clip(
-        image_cam.detach().cpu().permute(1, 2, 0).numpy() * 255.0, 0.0, 255.0
-    ).astype(np.uint8)
-    overlay = img_u8.copy()
-
-    K = raw_data['intrinsic_cv'].astype(np.float32).copy()
-    E = np.eye(4, dtype=np.float32)
-    E[:3, :] = raw_data['extrinsic_cv'].astype(np.float32)
-    h_native, w_native = raw_data.get('native_resolution', (overlay.shape[0], overlay.shape[1]))
-    h_img, w_img = overlay.shape[:2]
-    if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
-        sx = float(w_img) / float(w_native)
-        sy = float(h_img) / float(h_native)
-        K[0, 0] *= sx
-        K[0, 2] *= sx
-        K[1, 1] *= sy
-        K[1, 2] *= sy
-
-    pose_list = []
-    for i in range(act_raw.shape[0]):
-        fr = fk.forward(act_raw[i, 0:6], act_raw[i, 7:13])
-        lp, lq_wxyz = fr['left']
-        rp, rq_wxyz = fr['right']
-        lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
-        rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
-        if lq_xyzw[3] < 0:
-            lq_xyzw = -lq_xyzw
-        if rq_xyzw[3] < 0:
-            rq_xyzw = -rq_xyzw
-        lg = float(np.clip(act_raw[i, 6], 0.0, 1.0)) * 120.0
-        rg = float(np.clip(act_raw[i, 13], 0.0, 1.0)) * 120.0
-        pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
-    pose_np = np.stack(pose_list, axis=0)
-
-    try:
-        import evac.lvdm.models.ddpm3d as ddpm3d_mod
-        w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
-        intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
-        cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
-        ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
-
-        def _project_base_uv_from_pose_np(pose_arr):
-            pose_t = torch.from_numpy(pose_arr).float()
-            pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
-            pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
-            ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
-            ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
-            pts_l = torch.matmul(ee2cam_l, ee_key_pts)
-            pts_r = torch.matmul(ee2cam_r, ee_key_pts)
-            uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
-            uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
-            uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
-            uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
-            return uvs_l, uvs_r, pts_l, pts_r
-
-        def _extract_base_uv(uvs, pts):
-            seq = []
-            for i in range(uvs.shape[0]):
-                z = float(pts[0, i, 2, 0].item())
-                u = int(uvs[i, 0, 0])
-                v = int(uvs[i, 0, 1])
-                if z > 1e-6 and (0 <= u < w_img) and (0 <= v < h_img):
-                    seq.append((u, v))
-                else:
-                    seq.append(None)
-            return seq
-
-        def _draw_polyline(img, seq, color):
-            prev = None
-            for pt in seq:
-                if pt is None:
-                    prev = None
-                    continue
-                if prev is not None:
-                    cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), color, 2, cv2.LINE_AA)
-                prev = pt
-
-        def _annotate_start_end(img, seq, prefix, color):
-            if len(seq) == 0:
-                return
-            s = seq[0]
-            e = seq[-1]
-            if s is not None:
-                cv2.circle(img, (int(s[0]), int(s[1])), 4, color, -1, cv2.LINE_AA)
-                cv2.putText(img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-            if e is not None:
-                cv2.circle(img, (int(e[0]), int(e[1])), 4, color, -1, cv2.LINE_AA)
-                cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-
-        uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
-        luv = _extract_base_uv(uvs_l, pts_l.reshape(1, pts_l.shape[1], 4, 4))
-        ruv = _extract_base_uv(uvs_r, pts_r.reshape(1, pts_r.shape[1], 4, 4))
-        _draw_polyline(overlay, luv, (0, 255, 0))
-        _draw_polyline(overlay, ruv, (0, 0, 255))
-        _annotate_start_end(overlay, luv, "L", (0, 255, 0))
-        _annotate_start_end(overlay, ruv, "R", (0, 0, 255))
-        cv2.imwrite(os.path.join(save_dir, 'loss_projection_on_input.png'), overlay)
-    except Exception:
-        import traceback
-        with open(os.path.join(save_dir, 'loss_projection_error.txt'), 'w') as _f:
-            _f.write(traceback.format_exc())
-        cv2.imwrite(os.path.join(save_dir, 'loss_projection_on_input.png'), overlay)
-
-    meta_out = {'n_valid_actions': int(act_raw.shape[0]), 'image_hw': [int(h_img), int(w_img)]}
-    if isinstance(meta, dict):
-        meta_out.update(meta)
-    with open(os.path.join(save_dir, 'loss_projection_meta.json'), 'w') as _f:
-        json.dump(meta_out, _f, indent=2)

@@ -8,23 +8,55 @@ import os
 from aloha_scripts.utils import *
 
 
-def find_all_linear_names(model, rank0_print):
+def find_all_linear_names(model, rank0_print, lora_module="vit llm"):
     cls = torch.nn.Linear
     lora_module_names = set()
+    requested_modules = set(str(lora_module).split())
+    multimodal_keywords = []
+    attention_keywords = (
+        "attn",
+        "attention",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "qkv",
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+    )
 
-    multimodal_keywords = ['language_model', 'vision_model']
+    if "llm" in requested_modules:
+        multimodal_keywords.append("language_model")
+    if "vit" in requested_modules:
+        multimodal_keywords.append("vision_model")
+
+    if not multimodal_keywords:
+        raise ValueError(f"Unsupported lora_module setting: {lora_module}")
 
     rank0_print("##" * 20)
 
     for name, module in model.named_modules():
-        # we only apply lora to the llm and vit
-        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-            if isinstance(module, cls):
-                lora_module_names.add(name)
+        # Match only attention-related linear layers in the requested submodules.
+        if not any(mm_keyword in name for mm_keyword in multimodal_keywords):
+            continue
+        if not isinstance(module, cls):
+            continue
+        lowered_name = name.lower()
+        if any(attention_keyword in lowered_name for attention_keyword in attention_keywords):
+            lora_module_names.add(name)
 
     if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
 
+    if not lora_module_names:
+        raise ValueError(
+            f"No attention linear layers matched for lora_module={lora_module}. "
+            "Please verify the model module names."
+        )
+
+    rank0_print(f"LoRA target modules ({len(lora_module_names)}): {sorted(lora_module_names)}")
     return list(lora_module_names)
 
 

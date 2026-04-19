@@ -23,7 +23,7 @@ if [ -z "${OUTPUT_ROOT}" ]; then
   exit 1
 fi
 
-python3 /data/zhenyangfan/RoboTwin/policy/SmolVLA/merge_multitask_failure_tables.py \
+python3 /data/zhenyangfan/RoboTwin/policy/SmolVLA/latentcorr/merge_multitask_failure_tables.py \
   --source_root "${SOURCE_ROOT}" \
   --output_root "${OUTPUT_ROOT}" \
   --task_names "${TASK_NAMES[@]}" \

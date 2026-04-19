@@ -6,8 +6,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from policy.SmolVLA.multitask_latent_utils import MultiTaskSpec, get_multitask_norm_stats
-from policy.SmolVLA.stage2_failure_dataset import FailureAwareStage2Dataset
+from policy.SmolVLA.latentcorr.multitask_latent_utils import MultiTaskSpec, get_multitask_norm_stats
+from policy.SmolVLA.latentcorr.stage2_failure_dataset import FailureAwareStage2Dataset
 
 
 @dataclass(frozen=True)

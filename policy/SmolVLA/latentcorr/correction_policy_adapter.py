@@ -13,7 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SMOLVLA_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SMOLVLA_SRC_DIR))
 
-from policy.SmolVLA.smolvla_data_utils import build_smolvla_batch
+from policy.SmolVLA.latentcorr.smolvla_data_utils import build_smolvla_batch
 
 
 class SampleBoundSmolVLAAdapter:

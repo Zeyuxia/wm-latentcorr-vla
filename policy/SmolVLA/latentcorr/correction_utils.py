@@ -1,6 +1,24 @@
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes", "y"):
+        return True
+    if lowered in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def build_evac_infer_kwargs(cfg):
+    del cfg
+    return {}
 
 
 def resample_trajectory(traj, target_len):
@@ -19,4 +37,3 @@ def resample_trajectory(traj, target_len):
         frac = float(idx - lo)
         out[i] = arr[lo] * (1.0 - frac) + arr[hi] * frac
     return out.astype(np.float32)
-

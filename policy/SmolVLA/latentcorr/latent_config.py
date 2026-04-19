@@ -9,4 +9,3 @@ class DynamicsWarmupConfig:
     ramp_steps: int
     max_weight: float
     curve: str
-

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from policy.SmolVLA.latent_dataset_utils import resolve_raw_data_dir
+from policy.SmolVLA.latentcorr.latent_dataset_utils import resolve_raw_data_dir
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from policy.SmolVLA.failure_utils import (
+from policy.SmolVLA.latentcorr.failure_utils import (
     ACTIVE_ARM_PATTERN_KEYS,
     ERROR_MODE_KEYS,
     active_arm_pattern_key_to_id,
@@ -18,8 +18,8 @@ from policy.SmolVLA.failure_utils import (
     phase_key_to_id,
     set_failure_param_bins,
 )
-from policy.SmolVLA.latent_dataset_utils import get_norm_stats, list_valid_episode_ids, load_processed_episode_window
-from policy.SmolVLA.phase_utils import infer_phase_key_from_gt_window
+from policy.SmolVLA.latentcorr.latent_dataset_utils import get_norm_stats, list_valid_episode_ids, load_processed_episode_window
+from policy.SmolVLA.latentcorr.phase_utils import infer_phase_key_from_gt_window
 
 FAILURE_ERROR_MODES = tuple(ERROR_MODE_KEYS)
 ACTIVE_ARM_PATTERNS = set(ACTIVE_ARM_PATTERN_KEYS)

@@ -309,10 +309,12 @@ class ACTLatentStage1(nn.Module):
         alpha_latent = self.beta_scheduler.weight(global_step)
         loss_action_conditioned = torch.zeros_like(loss_action)
         if use_act_head_conditioning:
-            conditioned_qpos = qpos_future_norm if qpos_future_norm is not None else qpos_t
-            cond_token = self._latent_to_act_token(z_hat_next, scale=alpha_latent)
+            # Stage-1 conditioned action loss follows the teacher-latent
+            # formulation: current observation plus future-state token should
+            # still imitate the action chunk starting at the current state.
+            cond_token = self._latent_to_act_token(z_wm_shared_t1.detach(), scale=alpha_latent)
             cond_loss_dict = self.base_act(
-                conditioned_qpos,
+                qpos_t,
                 image_t,
                 actions=act_action_chunk,
                 is_pad=act_is_pad,

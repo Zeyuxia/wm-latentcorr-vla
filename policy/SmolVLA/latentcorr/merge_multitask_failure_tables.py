@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from policy.SmolVLA.merge_failure_tables import merge_failure_dir
+from policy.SmolVLA.latentcorr.merge_failure_tables import merge_failure_dir
 
 
 def _task_dir_name(task_name: str) -> str:

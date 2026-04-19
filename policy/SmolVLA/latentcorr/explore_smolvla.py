@@ -19,15 +19,15 @@ if str(SMOLVLA_SRC_DIR) not in sys.path:
 
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from policy.ACT.constants import SIM_TASK_CONFIGS
-from policy.SmolVLA.act_aligned_correction import ACTAlignedCorrectionBuilder, build_act_aligned_cfg_from_args
-from policy.SmolVLA.evac_interface import EvacLatentTeacher
-from policy.SmolVLA.correction_policy_adapter import SampleBoundSmolVLAAdapter
-from policy.SmolVLA.latent_dataset_utils import load_raw_episode
-from policy.SmolVLA.multitask_latent_utils import resolve_multitask_specs
-from policy.SmolVLA.smolvla_data_utils import make_smolvla_processors
-from policy.SmolVLA.smolvla_latent_policy import SmolVLALatentBridgeConfig, SmolVLALatentPolicy
-from policy.SmolVLA.stage2_failure_dataset import build_failure_table_dataset
-from policy.SmolVLA.latent_config import DynamicsWarmupConfig
+from policy.SmolVLA.latentcorr.act_aligned_correction import ACTAlignedCorrectionBuilder, build_act_aligned_cfg_from_args
+from policy.SmolVLA.latentcorr.evac_interface import EvacLatentTeacher
+from policy.SmolVLA.latentcorr.correction_policy_adapter import SampleBoundSmolVLAAdapter
+from policy.SmolVLA.latentcorr.latent_dataset_utils import load_raw_episode
+from policy.SmolVLA.latentcorr.multitask_latent_utils import resolve_multitask_specs
+from policy.SmolVLA.latentcorr.smolvla_data_utils import make_smolvla_processors
+from policy.SmolVLA.latentcorr.smolvla_latent_policy import SmolVLALatentBridgeConfig, SmolVLALatentPolicy
+from policy.SmolVLA.latentcorr.stage2_failure_dataset import build_failure_table_dataset
+from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig
 
 
 def str2bool(value):

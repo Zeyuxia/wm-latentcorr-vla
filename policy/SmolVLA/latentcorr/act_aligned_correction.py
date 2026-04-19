@@ -17,12 +17,10 @@ for _path in (_ROBOTWIN_ROOT, _SMOLVLA_EVAC_ROOT):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-try:
-    from .act_aligned_pkg.correction import correction_step
-    from .act_aligned_pkg.shared import build_evac_infer_kwargs
-except ImportError:
-    from policy.SmolVLA.act_aligned_pkg.correction import correction_step
-    from policy.SmolVLA.act_aligned_pkg.shared import build_evac_infer_kwargs
+from policy.SmolVLA.latentcorr.correction_step import correction_step
+from policy.SmolVLA.latentcorr.correction_utils import build_evac_infer_kwargs
+
+
 def _init_act_correction_modules(
     evac_ckpt: str,
     evac_config: str,

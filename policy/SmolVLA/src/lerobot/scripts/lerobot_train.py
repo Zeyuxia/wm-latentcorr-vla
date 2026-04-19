@@ -399,6 +399,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 tb_writer.add_scalar("train/lr", train_tracker.lr.avg, step)
                 tb_writer.add_scalar("train/update_s", train_tracker.update_s.avg, step)
                 tb_writer.add_scalar("train/dataloading_s", train_tracker.dataloading_s.avg, step)
+                if output_dict:
+                    for key, value in output_dict.items():
+                        if isinstance(value, (int, float)):
+                            tb_writer.add_scalar(f"train/{key}", value, step)
+                        elif hasattr(value, "item"):
+                            try:
+                                tb_writer.add_scalar(f"train/{key}", value.item(), step)
+                            except Exception:
+                                pass
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:

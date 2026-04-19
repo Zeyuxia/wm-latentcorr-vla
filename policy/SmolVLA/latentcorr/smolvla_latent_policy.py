@@ -20,8 +20,8 @@ if str(SMOLVLA_SRC_DIR) not in sys.path:
 
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-from policy.SmolVLA.latent_config import DynamicsWarmupConfig
-from policy.SmolVLA.latent_warmup import DynamicsWarmup
+from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig
+from policy.SmolVLA.latentcorr.latent_warmup import DynamicsWarmup
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ class SmolVLAStage1LossOutput:
     loss_action: torch.Tensor
     loss_action_conditioned: torch.Tensor
     loss_dynamics: torch.Tensor
+    beta_condition: float
     beta_dynamics: float
 
 
@@ -214,9 +215,10 @@ class SmolVLALatentPolicy(nn.Module):
         teacher_vector = teacher_vector.to(dtype=visual_latent.dtype)
 
         beta_dynamics = self.beta_scheduler.weight(global_step)
+        beta_condition = beta_dynamics
         predicted_latent = self.predict_next_latent(batch, action_prefix)
         loss_action = self._action_loss(batch=batch, actions=batch[ACTION])
-        cond_token, cond_mask, cond_att_mask = self.build_condition_token(teacher_vector, scale=1.0)
+        cond_token, cond_mask, cond_att_mask = self.build_condition_token(predicted_latent.detach(), scale=1.0)
         loss_action_conditioned = self._action_loss(
             batch=batch,
             actions=batch[ACTION],
@@ -225,14 +227,22 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_att_mask=cond_att_mask,
         )
         loss_dynamics = F.mse_loss(predicted_latent, teacher_vector)
-        loss = loss_action + loss_action_conditioned + (beta_dynamics * loss_dynamics)
+        loss = loss_action + (beta_condition * loss_action_conditioned) + (beta_dynamics * loss_dynamics)
         return SmolVLAStage1LossOutput(
             loss=loss,
             loss_action=loss_action,
             loss_action_conditioned=loss_action_conditioned,
             loss_dynamics=loss_dynamics,
+            beta_condition=beta_condition,
             beta_dynamics=beta_dynamics,
         )
+
+    def forward(self, train_stage: str, **kwargs):
+        if train_stage == "stage1":
+            return self.compute_stage1_loss(**kwargs)
+        if train_stage == "stage2":
+            return self.compute_stage2_loss(**kwargs)
+        raise ValueError(f"Unsupported train_stage: {train_stage}")
 
     def compute_stage2_loss(
         self,

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from policy.SmolVLA.failure_utils import get_failure_param_bins
-from policy.SmolVLA.act_aligned_pkg.utils_common import resample_trajectory
-from policy.SmolVLA.phase_utils import infer_phase_key_from_gt_window as _infer_phase_key_from_gt_window
+from policy.SmolVLA.latentcorr.failure_utils import get_failure_param_bins
+from policy.SmolVLA.latentcorr.correction_utils import resample_trajectory
+from policy.SmolVLA.latentcorr.phase_utils import infer_phase_key_from_gt_window as _infer_phase_key_from_gt_window
 
 
 def _infer_active_arms_from_gt_window(

@@ -20,9 +20,14 @@ SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT:-50}
 LOGGING_STEPS=${LOGGING_STEPS:-5}
 MASTER_PORT=${MASTER_PORT:-29604}
 NUM_NODES=${NUM_NODES:-1}
-RUN_TAG=${RUN_TAG:-base_multi_task_resume_20k}
 RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
-RESUME_FROM=${RESUME_FROM:-/data/zhenyangfan/RoboTwin/policy/TinyVLA/unet_diffusion_policy_results/robotwin_multitask_5_cam_high/20260416_235212-base_multi_task}
+LORA_ENABLE=${LORA_ENABLE:-True}
+LORA_MODULE=${LORA_MODULE:-vit llm}
+LORA_R=${LORA_R:-64}
+LORA_ALPHA=${LORA_ALPHA:-256}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+RUN_TAG=${RUN_TAG:-base_multi_task_lora}
+RESUME_FROM=${RESUME_FROM:-}
 PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-1}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES// /}
@@ -174,6 +179,11 @@ run_tag=${RUN_TAG}
 run_timestamp=${RUN_TIMESTAMP}
 output_dir=${OUTPUT}
 resume_from_checkpoint=${RESUME_CKPT}
+lora_enable=${LORA_ENABLE}
+lora_module=${LORA_MODULE}
+lora_r=${LORA_R}
+lora_alpha=${LORA_ALPHA}
+lora_dropout=${LORA_DROPOUT}
 EOF
 
 CMD=(
@@ -192,6 +202,11 @@ CMD=(
   --episode_first False
   --task_name "${TASK}"
   --model_name_or_path "${MODEL_PATH}"
+  --lora_enable "${LORA_ENABLE}"
+  --lora_module "${LORA_MODULE}"
+  --lora_r "${LORA_R}"
+  --lora_alpha "${LORA_ALPHA}"
+  --lora_dropout "${LORA_DROPOUT}"
   --freeze_vision_tower False
   --freeze_backbone False
   --bf16 True
