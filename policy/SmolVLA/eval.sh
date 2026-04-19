@@ -15,14 +15,14 @@ cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
 POLICY_NAME="SmolVLA"
-TASK_NAME="open_laptop"
+TASK_NAME="put_bottles_dustbin"
 TASK_CONFIG="demo_clean"
-CKPT_SETTING="ckpt40000"
+CKPT_SETTING="ckpt55000"
 SEED=0
-GPU_ID=1
+GPU_ID=2
 INSTRUCTION_TYPE="seen"
-MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260418_020514-rgb_seen_random/checkpoints/040000/pretrained_model"
-EVAL_TAG="ckpt40000_seen"
+MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
+EVAL_TAG="ckpt55000_seen"
 SEED_FILE=""
 POLICY_CONDA_ENV=""
 PYTHONNOUSERSITE=1
@@ -33,6 +33,38 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE}"
 export PYTHONPATH="${EFFECTIVE_PYTHONPATH}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM}"
+
+resolve_model_path() {
+  local requested_path="$1"
+  local candidate_path=""
+
+  if [[ -d "${requested_path}" ]]; then
+    printf '%s\n' "${requested_path}"
+    return 0
+  fi
+
+  if [[ "${requested_path}" =~ ^(.*/checkpoints)/([0-9]{6})/pretrained_model$ ]]; then
+    candidate_path="${BASH_REMATCH[1]}/checkpoints/${BASH_REMATCH[2]}/pretrained_model"
+    if [[ -d "${candidate_path}" ]]; then
+      printf '%s\n' "${candidate_path}"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+if ! RESOLVED_MODEL_PATH=$(resolve_model_path "${MODEL_PATH}"); then
+  echo "Model path does not exist: ${MODEL_PATH}" >&2
+  echo "Expected a local pretrained_model directory containing config.json and model.safetensors." >&2
+  exit 1
+fi
+
+if [[ "${RESOLVED_MODEL_PATH}" != "${MODEL_PATH}" ]]; then
+  echo -e "${YELLOW}resolved model path: ${RESOLVED_MODEL_PATH}${RESET}"
+fi
+
+MODEL_PATH="${RESOLVED_MODEL_PATH}"
 
 if [[ -t 1 ]]; then
   YELLOW=$'\033[33m'

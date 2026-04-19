@@ -546,6 +546,7 @@ class VLAFlowMatching(nn.Module):
             num_vlm_layers=self.config.num_vlm_layers,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
+            device=self.config.device,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -595,12 +596,60 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def extract_primary_visual_embedding(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        if len(images) != len(img_masks):
+            raise ValueError(
+                f"images/img_masks length mismatch: {len(images)} vs {len(img_masks)}"
+            )
+        if len(images) == 0:
+            raise ValueError("At least one image tensor is required.")
+
+        img = images[0]
+        img_mask = img_masks[0]
+        if img.ndim != 4:
+            raise ValueError(f"Primary image tensor must be (B, C, H, W), got {tuple(img.shape)}")
+        if img_mask.ndim != 1:
+            raise ValueError(f"Primary image mask must be (B,), got {tuple(img_mask.shape)}")
+        if img.shape[0] != img_mask.shape[0]:
+            raise ValueError(
+                f"Primary image batch/mask mismatch: {img.shape[0]} vs {img_mask.shape[0]}"
+            )
+
+        img_emb = self.vlm_with_expert.embed_image(img)
+        img_emb_dim = img_emb.shape[-1]
+        img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+        img_mask = img_mask[:, None].expand(img.shape[0], img_emb.shape[1])
+        return img_emb, img_mask
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        external_prefix_tokens: Tensor | None = None,
+        external_prefix_mask: Tensor | None = None,
+        external_prefix_att_mask: Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         """
+        external_inputs = (
+            external_prefix_tokens,
+            external_prefix_mask,
+            external_prefix_att_mask,
+        )
+        if any(x is not None for x in external_inputs) and not all(x is not None for x in external_inputs):
+            raise ValueError(
+                "external_prefix_tokens, external_prefix_mask, and external_prefix_att_mask must "
+                "either all be provided or all be None."
+            )
+
         embs = []
         pad_masks = []
         att_masks = []
@@ -624,9 +673,6 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
-
-            # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
@@ -674,6 +720,43 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
+
+        if external_prefix_tokens is not None:
+            if external_prefix_tokens.ndim != 3:
+                raise ValueError(
+                    f"external_prefix_tokens must be (B, N, H), got {tuple(external_prefix_tokens.shape)}"
+                )
+            if external_prefix_mask.ndim != 2:
+                raise ValueError(
+                    f"external_prefix_mask must be (B, N), got {tuple(external_prefix_mask.shape)}"
+                )
+            if external_prefix_att_mask.ndim != 2:
+                raise ValueError(
+                    f"external_prefix_att_mask must be (B, N), got {tuple(external_prefix_att_mask.shape)}"
+                )
+            if external_prefix_tokens.shape[:2] != external_prefix_mask.shape:
+                raise ValueError(
+                    "external_prefix_tokens and external_prefix_mask shape mismatch: "
+                    f"{tuple(external_prefix_tokens.shape[:2])} vs {tuple(external_prefix_mask.shape)}"
+                )
+            if external_prefix_tokens.shape[:2] != external_prefix_att_mask.shape:
+                raise ValueError(
+                    "external_prefix_tokens and external_prefix_att_mask shape mismatch: "
+                    f"{tuple(external_prefix_tokens.shape[:2])} vs {tuple(external_prefix_att_mask.shape)}"
+                )
+            if external_prefix_tokens.shape[0] != bsize:
+                raise ValueError(
+                    f"external_prefix_tokens batch mismatch: expected {bsize}, got {external_prefix_tokens.shape[0]}"
+                )
+            if external_prefix_tokens.shape[2] != state_emb.shape[2]:
+                raise ValueError(
+                    "external_prefix_tokens hidden size mismatch: "
+                    f"expected {state_emb.shape[2]}, got {external_prefix_tokens.shape[2]}"
+                )
+            embs.append(external_prefix_tokens)
+            pad_masks.append(external_prefix_mask)
+            att_masks += external_prefix_att_mask[0].to(dtype=torch.int64).tolist()
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -733,7 +816,18 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        external_prefix_tokens: Tensor | None = None,
+        external_prefix_mask: Tensor | None = None,
+        external_prefix_att_mask: Tensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -746,7 +840,14 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            external_prefix_tokens=external_prefix_tokens,
+            external_prefix_mask=external_prefix_mask,
+            external_prefix_att_mask=external_prefix_att_mask,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -778,6 +879,9 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        external_prefix_tokens: Tensor | None = None,
+        external_prefix_mask: Tensor | None = None,
+        external_prefix_att_mask: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -789,7 +893,14 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            external_prefix_tokens=external_prefix_tokens,
+            external_prefix_mask=external_prefix_mask,
+            external_prefix_att_mask=external_prefix_att_mask,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
