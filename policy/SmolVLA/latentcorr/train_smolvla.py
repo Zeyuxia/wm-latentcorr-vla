@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -18,8 +17,8 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent.parent
-SMOLVLA_SRC_DIR = THIS_DIR / "src"
+REPO_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = REPO_ROOT / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(SMOLVLA_SRC_DIR) not in sys.path:
@@ -379,7 +378,7 @@ def run_stage1(args: argparse.Namespace) -> None:
     args.device = str(accelerator.device)
     output_dir = Path(args.output_dir).resolve()
     if is_main:
-        output_dir.mkdir(parents=True, exist_ok=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
     else:
         tb_writer = None
@@ -425,20 +424,21 @@ def run_stage1(args: argparse.Namespace) -> None:
         total_training_steps=int(args.max_steps),
     )
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(model, optimizer, dataloader, lr_scheduler)
+    latent_model = accelerator.unwrap_model(model)
     if is_main:
         save_train_args(output_dir, args)
 
     global_step, epoch = resume_training_checkpoint(
         checkpoint_path=str(args.resume_ckpt),
-        model=accelerator.unwrap_model(model),
+        model=latent_model,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
     )
     max_steps = int(args.max_steps)
+    progress = tqdm(total=max_steps, initial=global_step, desc="stage1", leave=True, disable=not is_main)
     try:
         while global_step < max_steps:
-            progress = tqdm(dataloader, desc=f"stage1 epoch {epoch}", leave=True, disable=not is_main)
-            for raw_batch in progress:
+            for raw_batch in dataloader:
                 samples = []
                 future_images = []
                 action_prefix = []
@@ -446,7 +446,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                     task_name = raw_batch["task_name"][batch_index]
                     task_only, task_config = parse_task_parts(task_name)
                     sample = build_smolvla_batch(
-                        policy=model.base_policy,
+                        policy=latent_model.base_policy,
                         preprocess=preprocess,
                         image_t=raw_batch["image_t"][batch_index],
                         qpos_raw=raw_batch["qpos_raw"][batch_index],
@@ -499,12 +499,13 @@ def run_stage1(args: argparse.Namespace) -> None:
                     step=global_step,
                 )
                 global_step += 1
+                progress.update(1)
                 if global_step % int(args.save_freq) == 0 and is_main:
                     save_training_checkpoint(
                         output_dir=output_dir,
                         prefix="stage1",
                         step=global_step,
-                        model=accelerator.unwrap_model(model),
+                        model=latent_model,
                         optimizer=optimizer,
                         lr_scheduler=lr_scheduler,
                         extra_state={
@@ -521,7 +522,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                 output_dir=output_dir,
                 prefix="stage1",
                 step=global_step,
-                model=accelerator.unwrap_model(model),
+                model=latent_model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 extra_state={
@@ -531,6 +532,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                 },
             )
     finally:
+        progress.close()
         if tb_writer is not None:
             tb_writer.flush()
             tb_writer.close()
@@ -538,10 +540,14 @@ def run_stage1(args: argparse.Namespace) -> None:
 
 def run_stage2(args: argparse.Namespace) -> None:
     accelerator = build_accelerator()
+    is_main = bool(accelerator.is_main_process)
     args.device = str(accelerator.device)
     output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=False)
-    tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+    else:
+        tb_writer = None
 
     failure_table_paths = load_failure_table_paths(args.failure_table_paths_json)
 
@@ -621,7 +627,12 @@ def run_stage2(args: argparse.Namespace) -> None:
         args=args,
         total_training_steps=int(args.max_steps),
     )
-    save_train_args(output_dir, args)
+    model, optimizer, normal_loader, correction_loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, normal_loader, correction_loader, lr_scheduler
+    )
+    latent_model = accelerator.unwrap_model(model)
+    if is_main:
+        save_train_args(output_dir, args)
 
     qpos_mean = torch.as_tensor(norm_stats["qpos_mean"], dtype=torch.float32, device=args.device)
     qpos_std = torch.as_tensor(norm_stats["qpos_std"], dtype=torch.float32, device=args.device)
@@ -632,16 +643,16 @@ def run_stage2(args: argparse.Namespace) -> None:
     correction_iter = iter(correction_loader)
     global_step, epoch = resume_training_checkpoint(
         checkpoint_path=str(args.resume_ckpt),
-        model=model,
+        model=latent_model,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
     )
     max_steps = int(args.max_steps)
     skip_reason_counter: Counter[str] = Counter()
+    progress = tqdm(total=max_steps, initial=global_step, desc="stage2", leave=True, disable=not is_main)
     try:
         while global_step < max_steps:
-            progress = tqdm(normal_loader, desc=f"stage2 epoch {epoch}", leave=True)
-            for normal_raw_batch in progress:
+            for normal_raw_batch in normal_loader:
                 try:
                     correction_raw_batch = next(correction_iter)
                 except StopIteration:
@@ -652,7 +663,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                 for sample_index in range(normal_raw_batch["image_t"].shape[0]):
                     normal_samples.append(
                         build_smolvla_batch_from_raw_sample(
-                            latent_policy=model,
+                            latent_policy=latent_model,
                             preprocess=preprocess,
                             instruction_type=args.instruction_type,
                             task_name_full=normal_raw_batch["task_name"][sample_index],
@@ -675,7 +686,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                     task_only, task_config = parse_task_parts(task_name_full)
                     episode_id = int(correction_raw_batch["episode_id"][sample_index].item())
                     adapter = SampleBoundSmolVLAAdapter(
-                        latent_policy=model,
+                        latent_policy=latent_model,
                         preprocess=preprocess,
                         task_name=task_only,
                         task_config=task_config,
@@ -728,7 +739,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                         raise ValueError(f"Expected single-camera correction image, got {tuple(corr_image.shape)}")
 
                     smolvla_batch = build_smolvla_batch_from_raw_sample(
-                        latent_policy=model,
+                        latent_policy=latent_model,
                         preprocess=preprocess,
                         instruction_type=args.instruction_type,
                         task_name_full=task_name_full,
@@ -766,7 +777,8 @@ def run_stage2(args: argparse.Namespace) -> None:
                     step_progress=float(global_step),
                 )
 
-                output = model.compute_stage2_loss(
+                output = model(
+                    train_stage="stage2",
                     normal_batch=normal_batch,
                     correction_batch=correction_batch,
                     correction_actions=correction_actions_tensor,
@@ -777,20 +789,22 @@ def run_stage2(args: argparse.Namespace) -> None:
                     retain_weight=retain_weight_cur,
                 )
                 optimizer.zero_grad(set_to_none=True)
-                output.loss.backward()
-                clip_grad_norm_(model.parameters(), optimizer_cfg.grad_clip_norm)
+                accelerator.backward(output.loss)
+                if optimizer_cfg.grad_clip_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), optimizer_cfg.grad_clip_norm)
                 optimizer.step()
                 lr_scheduler.step()
 
                 current_lr = float(optimizer.param_groups[0]["lr"])
-                log_stage2_tensorboard(
-                    writer=tb_writer,
-                    step=global_step,
-                    output=output,
-                    lr=current_lr,
-                    retain_weight=retain_weight_cur,
-                    skipped_batches=sum(skip_reason_counter.values()),
-                )
+                if tb_writer is not None:
+                    log_stage2_tensorboard(
+                        writer=tb_writer,
+                        step=global_step,
+                        output=output,
+                        lr=current_lr,
+                        retain_weight=retain_weight_cur,
+                        skipped_batches=sum(skip_reason_counter.values()),
+                    )
 
                 progress.set_postfix(
                     loss=f"{output.loss.item():.4f}",
@@ -804,13 +818,14 @@ def run_stage2(args: argparse.Namespace) -> None:
                     step=global_step,
                 )
                 global_step += 1
+                progress.update(1)
 
-                if global_step % int(args.save_freq) == 0:
+                if global_step % int(args.save_freq) == 0 and is_main:
                     save_training_checkpoint(
                         output_dir=output_dir,
                         prefix="stage2",
                         step=global_step,
-                        model=model,
+                        model=latent_model,
                         optimizer=optimizer,
                         lr_scheduler=lr_scheduler,
                         extra_state={
@@ -823,12 +838,12 @@ def run_stage2(args: argparse.Namespace) -> None:
                 if global_step >= max_steps:
                     break
             epoch += 1
-        if global_step % int(args.save_freq) != 0:
+        if global_step % int(args.save_freq) != 0 and is_main:
             save_training_checkpoint(
                 output_dir=output_dir,
                 prefix="stage2",
                 step=global_step,
-                model=model,
+                model=latent_model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
                 extra_state={
@@ -839,8 +854,10 @@ def run_stage2(args: argparse.Namespace) -> None:
                 },
             )
     finally:
-        tb_writer.flush()
-        tb_writer.close()
+        progress.close()
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
 
 
 def main() -> None:

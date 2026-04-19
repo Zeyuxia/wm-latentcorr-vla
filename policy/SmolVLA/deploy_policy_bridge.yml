@@ -1,0 +1,16 @@
+# Basic experiment configuration
+policy_name: SmolVLA.deploy_policy_bridge
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: seen
+
+# Bridge-specific configuration
+model_path: /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model
+bridge_ckpt: /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_005743-stage1_1345/stage1_step_000250.pt
+device: cuda
+condition_scale: 1.0
+camera_sources:
+  - head_camera
+

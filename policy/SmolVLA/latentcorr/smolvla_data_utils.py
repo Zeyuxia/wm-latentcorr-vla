@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent.parent
-SMOLVLA_SRC_DIR = THIS_DIR / "src"
+REPO_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = REPO_ROOT / "src"
 if not SMOLVLA_SRC_DIR.is_dir():
     raise FileNotFoundError(f"SmolVLA src directory not found: {SMOLVLA_SRC_DIR}")
 if str(REPO_ROOT) not in sys.path:
@@ -22,20 +23,49 @@ from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
-def load_episode_instruction(task_name: str, task_config: str, episode_id: int, instruction_type: str) -> str:
-    instruction_path = REPO_ROOT / "data" / task_name / task_config / "instructions" / f"episode{int(episode_id)}.json"
+@lru_cache(maxsize=None)
+def _load_episode_instruction_table(dataset_name: str) -> list[dict[str, Any]]:
+    instruction_path = REPO_ROOT / "data" / dataset_name / "meta" / "episode_instructions.json"
     if not instruction_path.is_file():
         raise FileNotFoundError(f"Instruction file not found: {instruction_path}")
     with open(instruction_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    if instruction_type not in payload:
-        raise KeyError(f"Instruction type {instruction_type!r} not found in {instruction_path}")
-    values = payload[instruction_type]
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"Instruction payload must be a non-empty list: {instruction_path}")
+    return payload
+
+
+def _resolve_smolvla_dataset_name(task_name: str, task_config: str) -> str:
+    dataset_name = f"robotwin_{task_name}_{task_config}_50_cam_high"
+    dataset_root = REPO_ROOT / "data" / dataset_name
+    if not dataset_root.is_dir():
+        raise FileNotFoundError(f"SmolVLA dataset directory not found: {dataset_root}")
+    return dataset_name
+
+
+def load_episode_instruction(task_name: str, task_config: str, episode_id: int, instruction_type: str) -> str:
+    if instruction_type != "seen":
+        raise ValueError(f"Unsupported instruction_type for SmolVLA dataset: {instruction_type}")
+
+    dataset_name = _resolve_smolvla_dataset_name(task_name=task_name, task_config=task_config)
+    instruction_table = _load_episode_instruction_table(dataset_name)
+    episode_id = int(episode_id)
+    if episode_id < 0 or episode_id >= len(instruction_table):
+        raise IndexError(
+            f"episode_id={episode_id} out of range for {dataset_name}, num_episodes={len(instruction_table)}"
+        )
+    record = instruction_table[episode_id]
+    if int(record.get("episode_index", -1)) != episode_id:
+        raise ValueError(
+            f"Episode instruction index mismatch in {dataset_name}: expected {episode_id}, "
+            f"got {record.get('episode_index')}"
+        )
+    values = record.get("instructions")
     if not isinstance(values, list) or not values:
-        raise ValueError(f"Instruction list for {instruction_type!r} is empty in {instruction_path}")
+        raise ValueError(f"Instruction list is empty for episode_id={episode_id} in {dataset_name}")
     instruction = str(values[0]).strip()
     if not instruction:
-        raise ValueError(f"First instruction for {instruction_type!r} is empty in {instruction_path}")
+        raise ValueError(f"First instruction is empty for episode_id={episode_id} in {dataset_name}")
     return instruction
 
 
@@ -109,4 +139,3 @@ def stack_smolvla_batches(samples: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             batch[key] = [sample[key] for sample in samples]
     return batch
-

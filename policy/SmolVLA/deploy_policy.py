@@ -47,20 +47,20 @@ def _extract_qpos(observation):
 
 class SmolVLAEvalWrapper:
     def __init__(self, policy_config):
-        self.model_path = policy_config["model_path"]
+        self.model_path = str(policy_config["model_path"])
         self.device = _resolve_device(policy_config.get("device", "cuda"))
         self.camera_sources = policy_config.get(
             "camera_sources",
             ["head_camera"],
         )
 
-        self.policy = SmolVLAPolicy.from_pretrained(self.model_path)
+        self.policy, processor_path = self._load_policy()
         self.policy.to(self.device)
         self.policy.eval()
 
         self.preprocess, self.postprocess = make_pre_post_processors(
             self.policy.config,
-            self.model_path,
+            processor_path,
             preprocessor_overrides={"device_processor": {"device": str(self.device)}},
         )
 
@@ -79,6 +79,40 @@ class SmolVLAEvalWrapper:
             raise ValueError("SmolVLA policy has no visual input features.")
         if len(self.state_feature_keys) == 0:
             raise ValueError("SmolVLA policy has no state input features.")
+
+    def _load_policy(self):
+        model_path = Path(self.model_path)
+        if model_path.is_dir():
+            return SmolVLAPolicy.from_pretrained(str(model_path)), str(model_path)
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        if model_path.suffix != ".pt":
+            raise ValueError(f"Unsupported SmolVLA model path format: {model_path}")
+
+        checkpoint = torch.load(str(model_path), map_location="cpu")
+        if "args" not in checkpoint:
+            raise KeyError(f"Missing 'args' in SmolVLA checkpoint: {model_path}")
+        if "model" not in checkpoint:
+            raise KeyError(f"Missing 'model' in SmolVLA checkpoint: {model_path}")
+        base_model_path = checkpoint["args"].get("smolvla_pretrained_path")
+        if not base_model_path:
+            raise KeyError(f"Missing args.smolvla_pretrained_path in SmolVLA checkpoint: {model_path}")
+        if not Path(base_model_path).is_dir():
+            raise FileNotFoundError(f"Base pretrained_model directory not found: {base_model_path}")
+
+        policy = SmolVLAPolicy.from_pretrained(str(base_model_path))
+        base_state = {}
+        for key, value in checkpoint["model"].items():
+            if key.startswith("base_policy."):
+                base_state[key.removeprefix("base_policy.")] = value
+        if not base_state:
+            raise ValueError(f"No base_policy.* weights found in checkpoint: {model_path}")
+        missing, unexpected = policy.load_state_dict(base_state, strict=False)
+        if unexpected:
+            raise RuntimeError(f"Unexpected base policy keys when loading {model_path}: {unexpected}")
+        if missing:
+            raise RuntimeError(f"Missing base policy keys when loading {model_path}: {missing}")
+        return policy, str(base_model_path)
 
     def _build_model_input(self, observation, instruction):
         qpos = _extract_qpos(observation)

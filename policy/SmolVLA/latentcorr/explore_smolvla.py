@@ -10,8 +10,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent.parent
-SMOLVLA_SRC_DIR = THIS_DIR / "src"
+REPO_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = REPO_ROOT / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(SMOLVLA_SRC_DIR) not in sys.path:

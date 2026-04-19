@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent.parent
-SMOLVLA_SRC_DIR = THIS_DIR / "src"
+REPO_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = REPO_ROOT / "src"
 if not SMOLVLA_SRC_DIR.is_dir():
     raise FileNotFoundError(f"SmolVLA src directory not found: {SMOLVLA_SRC_DIR}")
 if str(REPO_ROOT) not in sys.path:

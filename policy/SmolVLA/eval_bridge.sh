@@ -13,15 +13,17 @@ conda activate smolvla
 cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
-POLICY_NAME="SmolVLA"
+POLICY_NAME="SmolVLA.deploy_policy_bridge"
 TASK_NAME="put_bottles_dustbin"
 TASK_CONFIG="demo_clean"
-CKPT_SETTING="ckpt55000"
+CKPT_SETTING="bridge"
 SEED=0
 GPU_ID=2
 INSTRUCTION_TYPE="seen"
 MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
-EVAL_TAG="ckpt55000_seen"
+BRIDGE_CKPT="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_005743-stage1_1345/stage1_step_000250.pt"
+CONDITION_SCALE="1.0"
+EVAL_TAG="bridge_seen"
 SEED_FILE=""
 POLICY_CONDA_ENV=""
 PYTHONNOUSERSITE=1
@@ -35,6 +37,16 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
+if [ ! -d "${MODEL_PATH}" ]; then
+  echo "Model path does not exist: ${MODEL_PATH}" >&2
+  exit 1
+fi
+
+if [ ! -f "${BRIDGE_CKPT}" ]; then
+  echo "Bridge checkpoint does not exist: ${BRIDGE_CKPT}" >&2
+  exit 1
+fi
+
 if [[ -t 1 ]]; then
   YELLOW=$'\033[33m'
   RESET=$'\033[0m'
@@ -43,56 +55,21 @@ else
   RESET=""
 fi
 
-resolve_model_path() {
-  local requested_path="$1"
-  local candidate_path=""
-
-  if [[ -d "${requested_path}" ]]; then
-    printf '%s\n' "${requested_path}"
-    return 0
-  fi
-
-  if [[ "${requested_path}" =~ ^(.*/checkpoints)/([0-9]{6})/pretrained_model$ ]]; then
-    candidate_path="${BASH_REMATCH[1]}/checkpoints/${BASH_REMATCH[2]}/pretrained_model"
-    if [[ -d "${candidate_path}" ]]; then
-      printf '%s\n' "${candidate_path}"
-      return 0
-    fi
-  fi
-
-  if [[ -f "${requested_path}" && "${requested_path}" == *.pt ]]; then
-    printf '%s\n' "${requested_path}"
-    return 0
-  fi
-
-  return 1
-}
-
-if ! RESOLVED_MODEL_PATH=$(resolve_model_path "${MODEL_PATH}"); then
-  echo "Model path does not exist: ${MODEL_PATH}" >&2
-  echo "Expected a local pretrained_model directory or a stage1/stage2 .pt checkpoint." >&2
-  exit 1
-fi
-
-if [[ "${RESOLVED_MODEL_PATH}" != "${MODEL_PATH}" ]]; then
-  echo -e "${YELLOW}resolved model path: ${RESOLVED_MODEL_PATH}${RESET}"
-fi
-
-MODEL_PATH="${RESOLVED_MODEL_PATH}"
-
 echo -e "${YELLOW}task: ${TASK_NAME}${RESET}"
 echo -e "${YELLOW}task config: ${TASK_CONFIG}${RESET}"
 echo -e "${YELLOW}gpu id: ${GPU_ID}${RESET}"
 echo -e "${YELLOW}ckpt setting: ${CKPT_SETTING}${RESET}"
 echo -e "${YELLOW}model path: ${MODEL_PATH}${RESET}"
+echo -e "${YELLOW}bridge ckpt: ${BRIDGE_CKPT}${RESET}"
 echo -e "${YELLOW}instruction type: ${INSTRUCTION_TYPE}${RESET}"
+echo -e "${YELLOW}condition scale: ${CONDITION_SCALE}${RESET}"
 echo -e "${YELLOW}eval tag: ${EVAL_TAG}${RESET}"
 
 cd "${ROOT_DIR}"
 
 cmd=(
   python script/eval_policy.py
-  --config "policy/${POLICY_NAME}/deploy_policy.yml"
+  --config "policy/SmolVLA/deploy_policy_bridge.yml"
   --overrides
   --task_name "${TASK_NAME}"
   --task_config "${TASK_CONFIG}"
@@ -100,6 +77,8 @@ cmd=(
   --seed "${SEED}"
   --instruction_type "${INSTRUCTION_TYPE}"
   --model_path "${MODEL_PATH}"
+  --bridge_ckpt "${BRIDGE_CKPT}"
+  --condition_scale "${CONDITION_SCALE}"
   --policy_name "${POLICY_NAME}"
   --eval_tag "${EVAL_TAG}"
 )
