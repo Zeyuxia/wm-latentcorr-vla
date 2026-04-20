@@ -14,14 +14,14 @@ cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
 POLICY_NAME="SmolVLA"
-TASK_NAME="put_bottles_dustbin"
+TASK_NAME="place_burger_fries"
 TASK_CONFIG="demo_clean"
-CKPT_SETTING="ckpt55000"
+CKPT_SETTING="stage1_step_001500_base"
 SEED=0
-GPU_ID=2
+GPU_ID=7
 INSTRUCTION_TYPE="seen"
-MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
-EVAL_TAG="ckpt55000_seen"
+MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_005743-stage1_1345/stage1_step_001500.pt"
+EVAL_TAG="stage1_step_001500_base_seen"
 SEED_FILE=""
 POLICY_CONDA_ENV=""
 PYTHONNOUSERSITE=1
