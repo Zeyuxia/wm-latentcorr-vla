@@ -358,6 +358,7 @@ def initialize_latent_policy_from_sample(
     preprocess,
     instruction_type: str,
     raw_sample: dict[str, Any],
+    teacher: EvacLatentTeacher | None = None,
 ) -> None:
     init_batch = build_smolvla_batch_from_raw_sample(
         latent_policy=latent_policy,
@@ -369,7 +370,11 @@ def initialize_latent_policy_from_sample(
         action_chunk_raw=raw_sample["act_action_chunk_raw"],
         episode_id=int(raw_sample["episode_id"].item()),
     )
-    latent_policy.initialize_from_batch(init_batch)
+    teacher_latent = None
+    if teacher is not None:
+        teacher_input = raw_sample["image_t"][0].unsqueeze(0).to(device=latent_policy.device, dtype=torch.float32)
+        teacher_latent = teacher.encode_image(teacher_input)
+    latent_policy.initialize_from_batch(init_batch, teacher_latent=teacher_latent)
 
 
 def run_stage1(args: argparse.Namespace) -> None:
@@ -410,13 +415,19 @@ def run_stage1(args: argparse.Namespace) -> None:
         warmup_cfg=build_warmup_config(args),
     )
     model.to(torch.device(args.device))
-    teacher = EvacLatentTeacher(evac_ckpt=args.evac_ckpt, evac_config=args.evac_config, device=args.device)
+    teacher = EvacLatentTeacher(
+        evac_ckpt=args.evac_ckpt,
+        evac_config=args.evac_config,
+        device=args.device,
+        load_rollout_model=False,
+    )
 
     initialize_latent_policy_from_sample(
         latent_policy=model,
         preprocess=preprocess,
         instruction_type=args.instruction_type,
         raw_sample=dataset[0],
+        teacher=teacher,
     )
     optimizer_cfg, optimizer, lr_scheduler = configure_optimizer(
         model=model,
@@ -510,6 +521,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                         lr_scheduler=lr_scheduler,
                         extra_state={
                             "norm_stats": dataset.stats if hasattr(dataset, "stats") else None,
+                            "target_hw": latent_model.target_hw,
                             "epoch": epoch,
                             "args": vars(args),
                         },
@@ -527,6 +539,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                 lr_scheduler=lr_scheduler,
                 extra_state={
                     "norm_stats": dataset.stats if hasattr(dataset, "stats") else None,
+                    "target_hw": latent_model.target_hw,
                     "epoch": epoch,
                     "args": vars(args),
                 },
@@ -602,17 +615,22 @@ def run_stage2(args: argparse.Namespace) -> None:
         bridge_cfg=build_bridge_config(args),
         warmup_cfg=build_warmup_config(args),
     )
+    teacher = EvacLatentTeacher(
+        evac_ckpt=args.evac_ckpt,
+        evac_config=args.evac_config,
+        device=args.device,
+        load_rollout_model=True,
+    )
     initialize_latent_policy_from_sample(
         latent_policy=model,
         preprocess=preprocess,
         instruction_type=args.instruction_type,
         raw_sample=normal_dataset[0],
+        teacher=teacher,
     )
     stage1_checkpoint = torch.load(args.stage1_ckpt, map_location="cpu")
     model.load_state_dict(stage1_checkpoint["model"], strict=True)
     model.to(torch.device(args.device))
-
-    teacher = EvacLatentTeacher(evac_ckpt=args.evac_ckpt, evac_config=args.evac_config, device=args.device)
     correction_builder = ACTAlignedCorrectionBuilder(
         cfg=build_act_aligned_cfg_from_args(args, max_action_len=int(args.act_chunk_size)),
         urdf_path=args.urdf_path,
@@ -830,6 +848,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                         lr_scheduler=lr_scheduler,
                         extra_state={
                             "norm_stats": norm_stats,
+                            "target_hw": latent_model.target_hw,
                             "failure_table_paths": failure_table_paths,
                             "epoch": epoch,
                             "args": vars(args),
@@ -848,6 +867,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                 lr_scheduler=lr_scheduler,
                 extra_state={
                     "norm_stats": norm_stats,
+                    "target_hw": latent_model.target_hw,
                     "failure_table_paths": failure_table_paths,
                     "epoch": epoch,
                     "args": vars(args),

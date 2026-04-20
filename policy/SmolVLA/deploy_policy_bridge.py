@@ -55,8 +55,11 @@ class SmolVLABridgeEvalWrapper:
         self.policy.eval()
 
         self.preprocess, self.postprocess = make_smolvla_processors(self.policy.base_policy, self.model_path)
-        self.bridge_state_dict = torch.load(self.bridge_ckpt, map_location="cpu")["model"]
+        bridge_payload = torch.load(self.bridge_ckpt, map_location="cpu")
+        self.bridge_state_dict = bridge_payload["model"]
         self.bridge_loaded = False
+        target_hw = bridge_payload.get("target_hw")
+        self.target_hw: tuple[int, int] | None = tuple(target_hw) if target_hw is not None else None
         self.visual_feature_keys = [
             key
             for key, feature in self.policy.base_policy.config.input_features.items()
@@ -100,6 +103,8 @@ class SmolVLABridgeEvalWrapper:
             return
         self.policy.initialize_from_batch(batch)
         self.policy.load_state_dict(self.bridge_state_dict, strict=True)
+        if self.target_hw is None:
+            raise KeyError(f"Missing target_hw in bridge checkpoint: {self.bridge_ckpt}")
         self.policy.eval()
         self.bridge_loaded = True
 
@@ -110,7 +115,9 @@ class SmolVLABridgeEvalWrapper:
         with torch.inference_mode():
             raw_action_chunk = self.policy.predict_action_chunk(model_input)
             action_prefix = raw_action_chunk[:, : int(self.bridge_args.prefix_steps), :]
-            predicted_latent = self.policy.predict_next_latent(model_input, action_prefix)
+            if self.target_hw is None:
+                raise RuntimeError("Bridge target_hw not initialized.")
+            predicted_latent = self.policy.predict_next_latent(model_input, action_prefix, target_hw=self.target_hw)
             conditioned_chunk = self.policy.predict_action_chunk_conditioned(
                 model_input,
                 predicted_latent,

@@ -235,26 +235,32 @@ def main() -> None:
     )
     init_sample = init_dataset[0]
     init_task_only, init_task_config = parse_task_parts(init_spec.task_name)
-    model.initialize_from_batch(
-        SampleBoundSmolVLAAdapter(
-            latent_policy=model,
-            preprocess=preprocess,
-            task_name=init_task_only,
-            task_config=init_task_config,
-            episode_id=int(init_sample["episode_id"]),
-            instruction_type=args.instruction_type,
-        ).build_batch(
-            image_t=init_sample["image_t"],
-            qpos_raw=init_sample["qpos_raw"],
-            action_chunk_raw=init_sample["act_action_chunk_raw"],
-        )
+    init_batch = SampleBoundSmolVLAAdapter(
+        latent_policy=model,
+        preprocess=preprocess,
+        task_name=init_task_only,
+        task_config=init_task_config,
+        episode_id=int(init_sample["episode_id"]),
+        instruction_type=args.instruction_type,
+    ).build_batch(
+        image_t=init_sample["image_t"],
+        qpos_raw=init_sample["qpos_raw"],
+        action_chunk_raw=init_sample["act_action_chunk_raw"],
     )
+    teacher = EvacLatentTeacher(
+        evac_ckpt=args.evac_ckpt,
+        evac_config=args.evac_config,
+        device=args.device,
+        load_rollout_model=True,
+    )
+    init_teacher_latent = teacher.encode_image(
+        init_sample["image_t"][0].unsqueeze(0).to(device=torch.device(args.device), dtype=torch.float32)
+    )
+    model.initialize_from_batch(init_batch, teacher_latent=init_teacher_latent)
     stage1_ckpt = torch.load(args.stage1_ckpt, map_location="cpu")
     model.load_state_dict(stage1_ckpt["model"], strict=True)
     model.to(torch.device(args.device))
     model.eval()
-
-    teacher = EvacLatentTeacher(evac_ckpt=args.evac_ckpt, evac_config=args.evac_config, device=args.device)
     correction_builder = ACTAlignedCorrectionBuilder(
         cfg=build_act_aligned_cfg_from_args(args, max_action_len=int(args.act_chunk_size)),
         urdf_path=args.urdf_path,

@@ -32,9 +32,12 @@ from .train_stage1_latent import (
     init_distributed_if_needed,
     is_main_process,
 )
-from .stage2_failure_dataset import build_failure_table_dataset
+from .stage2_failure_dataset import build_failure_table_dataset, build_multitask_failure_table_dataset
 from .utils_latent import build_stage1_dataset, load_raw_episode, resolve_raw_data_dir
+from .utils_multitask_latent import resolve_multitask_specs
 from .wandb_utils import finish_wandb, init_wandb_run, log_wandb, update_wandb_summary
+
+from policy.ACT.constants import SIM_TASK_CONFIGS
 
 
 def str2bool(v):
@@ -122,6 +125,7 @@ def _load_base_act_from_ckpt(base_act, ckpt_path: str, device: str):
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("ACT latent correction stage-2 minimal closed loop")
     parser.add_argument("--task_name", type=str, required=True)
+    parser.add_argument("--multi_task_names", nargs="+", default=None)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--evac_ckpt", type=str, required=True)
     parser.add_argument("--evac_config", type=str, required=True)
@@ -244,6 +248,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--act_aligned_sample_timeout_sec", type=float, default=30.0)
     parser.add_argument("--failure_mode", type=str, default="off", choices=["off", "train", "explore"])
     parser.add_argument("--failure_table_path", type=str, default="")
+    parser.add_argument("--failure_table_paths", nargs="+", default=None)
     parser.add_argument("--failure_table_dir", type=str, default="")
     parser.add_argument("--failure_phase_bins", type=int, default=3)
     parser.add_argument("--failure_translation_dir_bins", type=int, default=6)
@@ -479,15 +484,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    dataset_dir, num_episodes, camera_names = _resolve_dataset_info(args.task_name)
-    if args.dataset_dir is not None:
-        dataset_dir = os.path.realpath(args.dataset_dir)
-    if args.num_episodes is not None:
-        num_episodes = int(args.num_episodes)
-    if args.camera_names is not None:
-        camera_names = list(args.camera_names)
     future_offset = args.future_offset if args.future_offset is not None else args.prefix_steps
-    raw_data_dir = resolve_raw_data_dir(args.task_name, args.raw_data_dir)
     source_ckpt_args = {}
     source_ckpt_path = args.resume_ckpt or args.stage1_ckpt
     source_ckpt = None
@@ -498,9 +495,44 @@ def main():
     if act_chunk_size < args.prefix_steps:
         raise ValueError(f"act_chunk_size ({act_chunk_size}) must be >= prefix_steps ({args.prefix_steps})")
 
+    is_multitask = bool(args.multi_task_names)
+    task_specs = None
+    failure_table_paths = list(args.failure_table_paths or [])
+    if args.failure_table_path and not failure_table_paths:
+        failure_table_paths = [args.failure_table_path]
+
+    if is_multitask:
+        if args.dataset_dir is not None or args.raw_data_dir is not None or args.num_episodes is not None:
+            raise ValueError("multitask stage2 resolves dataset/raw dirs from task configs; do not pass single-task overrides")
+        task_specs = resolve_multitask_specs(list(args.multi_task_names), SIM_TASK_CONFIGS)
+        camera_names = list(task_specs[0].camera_names)
+        for spec in task_specs[1:]:
+            if list(spec.camera_names) != camera_names:
+                raise ValueError("All multitask camera_names must match for current stage2 pipeline")
+        dataset_dir = "<multitask>"
+        raw_data_dir = "<multitask>"
+        num_episodes = sum(int(spec.num_episodes) for spec in task_specs)
+    else:
+        dataset_dir, num_episodes, camera_names = _resolve_dataset_info(args.task_name)
+        if args.dataset_dir is not None:
+            dataset_dir = os.path.realpath(args.dataset_dir)
+        if args.num_episodes is not None:
+            num_episodes = int(args.num_episodes)
+        if args.camera_names is not None:
+            camera_names = list(args.camera_names)
+        raw_data_dir = resolve_raw_data_dir(args.task_name, args.raw_data_dir)
+
     print(f"[stage2] dataset_dir={dataset_dir}")
     print(f"[stage2] raw_data_dir={raw_data_dir}")
     print(f"[stage2] num_episodes={num_episodes}, cameras={camera_names}")
+    if is_multitask:
+        print("[stage2] multitask specs:")
+        for spec in task_specs:
+            print(
+                f"  - {spec.task_name} dataset_dir={spec.dataset_dir} raw_data_dir={spec.raw_data_dir} "
+                f"num_episodes={spec.num_episodes}",
+                flush=True,
+            )
     print(
         f"[stage2] act_chunk_size={act_chunk_size}, "
         f"prefix_steps={args.prefix_steps}, future_offset={future_offset}"
@@ -535,19 +567,59 @@ def main():
         future_offset=future_offset,
     )
 
-    dataset, norm_stats = build_stage1_dataset(
-        dataset_dir=dataset_dir,
-        num_episodes=num_episodes,
-        camera_names=camera_names,
-        act_chunk_size=act_chunk_size,
-        prefix_steps=args.prefix_steps,
-        future_offset=future_offset,
-    )
     use_failure_explore = str(args.failure_mode).strip().lower() == "explore"
     use_failure_train = str(args.failure_mode).strip().lower() == "train"
     corr_dataset = None
-    if use_failure_explore or (args.correction_batch_size > 0 and args.failure_mode in {"train", "explore"}):
-        corr_start_margin = int(max(0, args.max_rollout_steps)) * int(max(1, args.act_aligned_rollout_exec_steps))
+    corr_start_margin = int(max(0, args.max_rollout_steps)) * int(max(1, args.act_aligned_rollout_exec_steps))
+    if is_multitask:
+        assert task_specs is not None
+        dataset, norm_stats = build_multitask_failure_table_dataset(
+            task_specs=task_specs,
+            act_chunk_size=act_chunk_size,
+            prefix_steps=args.prefix_steps,
+            future_offset=future_offset,
+            sample_phase_window_len=args.act_aligned_sample_pregrasp_phase_window_len,
+            sample_skip_head_ratio=args.failure_sample_skip_head_ratio,
+            start_margin=0,
+            failure_mode="off",
+            failure_table_paths=[],
+            failure_phase_bins=args.failure_phase_bins,
+            failure_translation_dir_bins=args.failure_translation_dir_bins,
+            failure_translation_mag_bins=args.failure_translation_mag_bins,
+            failure_rotation_dir_bins=args.failure_rotation_dir_bins,
+            failure_rotation_mag_bins=args.failure_rotation_mag_bins,
+            failure_explore_k=args.failure_explore_k,
+        )
+        if use_failure_explore or (args.correction_batch_size > 0 and args.failure_mode in {"train", "explore"}):
+            corr_dataset, corr_norm_stats = build_multitask_failure_table_dataset(
+                task_specs=task_specs,
+                act_chunk_size=act_chunk_size,
+                prefix_steps=args.prefix_steps,
+                future_offset=future_offset,
+                sample_phase_window_len=args.act_aligned_sample_pregrasp_phase_window_len,
+                sample_skip_head_ratio=args.failure_sample_skip_head_ratio,
+                start_margin=corr_start_margin,
+                failure_mode=args.failure_mode,
+                failure_table_paths=failure_table_paths,
+                failure_phase_bins=args.failure_phase_bins,
+                failure_translation_dir_bins=args.failure_translation_dir_bins,
+                failure_translation_mag_bins=args.failure_translation_mag_bins,
+                failure_rotation_dir_bins=args.failure_rotation_dir_bins,
+                failure_rotation_mag_bins=args.failure_rotation_mag_bins,
+                failure_explore_k=args.failure_explore_k,
+            )
+    else:
+        dataset, norm_stats = build_stage1_dataset(
+            dataset_dir=dataset_dir,
+            num_episodes=num_episodes,
+            camera_names=camera_names,
+            act_chunk_size=act_chunk_size,
+            prefix_steps=args.prefix_steps,
+            future_offset=future_offset,
+        )
+    if (not is_multitask) and (
+        use_failure_explore or (args.correction_batch_size > 0 and args.failure_mode in {"train", "explore"})
+    ):
         corr_dataset, corr_norm_stats = build_failure_table_dataset(
             dataset_dir=dataset_dir,
             num_episodes=num_episodes,
@@ -825,7 +897,7 @@ def main():
             find_unused_parameters=True,
         )
 
-    raw_cache: dict[int, dict] = {}
+    raw_cache: dict[tuple[str, int], dict] = {}
     if args.correction_builder_mode == "legacy":
         planner_cfg = PlannerCorrectionConfig(
             correction_horizon=args.prefix_steps,
@@ -989,6 +1061,10 @@ def main():
                     qpos_t = batch["qpos_t"].to(args.device, non_blocking=True)
                     episode_ids = batch["episode_id"].tolist()
                     start_ts_list = batch["start_ts"].tolist()
+                    task_names = list(batch["task_name"]) if "task_name" in batch else [args.task_name] * image_t.shape[0]
+                    raw_data_dirs = (
+                        list(batch["raw_data_dir"]) if "raw_data_dir" in batch else [raw_data_dir] * image_t.shape[0]
+                    )
                     sampled_phase_ids = batch["sampled_phase_id"].tolist()
                     pregrasp_seg_starts = batch["pregrasp_seg_start"].tolist()
                     pregrasp_seg_ends = batch["pregrasp_seg_end"].tolist()
@@ -1006,9 +1082,12 @@ def main():
 
                     for i in range(image_t.shape[0]):
                         ep_id = int(episode_ids[i])
-                        if ep_id not in raw_cache:
-                            raw_cache[ep_id] = load_raw_episode(raw_data_dir, ep_id)
-                        raw_data = raw_cache[ep_id]
+                        task_i = str(task_names[i])
+                        raw_dir_i = str(raw_data_dirs[i])
+                        cache_key = (task_i, ep_id)
+                        if cache_key not in raw_cache:
+                            raw_cache[cache_key] = load_raw_episode(raw_dir_i, ep_id)
+                        raw_data = raw_cache[cache_key]
                         correction_policy_model = error_policy_model if error_policy_model is not None else raw_model_for_mode
                         corr = correction_builder.build(
                             latent_model=correction_policy_model,
@@ -1242,6 +1321,12 @@ def main():
                     act_is_pad_batch = batch_src["act_is_pad"].to(args.device, non_blocking=True)
                     episode_ids = batch_src["episode_id"].tolist()
                     start_ts_list = batch_src["start_ts"].tolist()
+                    task_names = (
+                        list(batch_src["task_name"]) if "task_name" in batch_src else [args.task_name] * image_t.shape[0]
+                    )
+                    raw_data_dirs = (
+                        list(batch_src["raw_data_dir"]) if "raw_data_dir" in batch_src else [raw_data_dir] * image_t.shape[0]
+                    )
                     sampled_phase_ids = (
                         batch_src["sampled_phase_id"].tolist()
                         if "sampled_phase_id" in batch_src
@@ -1322,10 +1407,13 @@ def main():
                     for i in range(image_t.shape[0]):
                         ep_id = int(episode_ids[i])
                         t_raw0 = time.perf_counter()
-                        if ep_id not in raw_cache:
-                            raw_cache[ep_id] = load_raw_episode(raw_data_dir, ep_id)
+                        task_i = str(task_names[i])
+                        raw_dir_i = str(raw_data_dirs[i])
+                        cache_key = (task_i, ep_id)
+                        if cache_key not in raw_cache:
+                            raw_cache[cache_key] = load_raw_episode(raw_dir_i, ep_id)
                         step_t_raw += time.perf_counter() - t_raw0
-                        raw_data = raw_cache[ep_id]
+                        raw_data = raw_cache[cache_key]
                         qpos_raw = qpos_t[i : i + 1] * qpos_std.view(1, -1) + qpos_mean.view(1, -1)
                         if batch_failure_mode == "off":
                             correction_target_chunk = act_action_chunk_batch[i].detach().clone()
@@ -1443,7 +1531,7 @@ def main():
                         cache_relpath = None
                         if args.stage2_latent_cache_dir and external_action_dev_raw is not None:
                             cache_relpath = build_stage2_latent_cache_relpath(
-                                task_name=args.task_name,
+                                task_name=task_i,
                                 episode_id=ep_id,
                                 start_ts=int(start_ts_list[i]),
                                 prefix_steps=args.prefix_steps,

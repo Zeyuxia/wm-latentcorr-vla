@@ -20,6 +20,7 @@ from .failure_utils import (
     set_failure_param_bins,
 )
 from .utils_latent import get_norm_stats, list_valid_episode_ids, load_processed_episode_window
+from .utils_multitask_latent import MultiTaskSpec, get_multitask_norm_stats
 
 _FAILURE_ERROR_MODES = tuple(ERROR_MODE_KEYS)
 _ACTIVE_ARM_PATTERNS = set(ACTIVE_ARM_PATTERN_KEYS)
@@ -667,6 +668,66 @@ class FailureAwareStage2Dataset(Dataset):
         return sample
 
 
+class MultiTaskFailureAwareStage2Dataset(Dataset):
+    """Thin multitask wrapper around per-task stage2 datasets.
+
+    The per-task datasets keep all failure-table sampling semantics unchanged.
+    This wrapper only adds task metadata so the trainer can load the correct
+    raw episode and build task-scoped latent-cache keys.
+    """
+
+    def __init__(self, datasets: list[FailureAwareStage2Dataset], task_specs: list[MultiTaskSpec]):
+        if len(datasets) != len(task_specs):
+            raise ValueError("datasets and task_specs must have the same length")
+        if not datasets:
+            raise ValueError("MultiTaskFailureAwareStage2Dataset requires at least one dataset")
+        self.datasets = list(datasets)
+        self.task_specs = list(task_specs)
+        self._cumulative = np.cumsum([len(ds) for ds in self.datasets]).astype(np.int64)
+
+    def __len__(self) -> int:
+        return int(self._cumulative[-1])
+
+    @property
+    def norm_stats(self) -> dict[str, np.ndarray]:
+        return self.datasets[0].norm_stats
+
+    @norm_stats.setter
+    def norm_stats(self, stats: dict[str, np.ndarray]) -> None:
+        self.set_norm_stats(stats)
+
+    @property
+    def stats(self) -> dict[str, np.ndarray]:
+        return self.norm_stats
+
+    @stats.setter
+    def stats(self, stats: dict[str, np.ndarray]) -> None:
+        self.set_norm_stats(stats)
+
+    def set_norm_stats(self, stats: dict[str, np.ndarray]) -> None:
+        for ds in self.datasets:
+            ds.norm_stats = stats
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        task_idx = int(np.searchsorted(self._cumulative, index, side="right"))
+        prev = 0 if task_idx == 0 else int(self._cumulative[task_idx - 1])
+        return task_idx, index - prev
+
+    def __getitem__(self, index: int):
+        task_idx, local_index = self._locate(index)
+        spec = self.task_specs[task_idx]
+        sample = self.datasets[task_idx][local_index]
+        sample["task_idx"] = torch.tensor(task_idx, dtype=torch.int64)
+        sample["task_name"] = spec.task_name
+        sample["raw_data_dir"] = "" if spec.raw_data_dir is None else spec.raw_data_dir
+        return sample
+
+
 def build_failure_table_dataset(
     dataset_dir: str,
     num_episodes: int,
@@ -709,3 +770,65 @@ def build_failure_table_dataset(
         failure_explore_k=failure_explore_k,
     )
     return dataset, stats
+
+
+def build_multitask_failure_table_dataset(
+    task_specs: list[MultiTaskSpec],
+    act_chunk_size: int,
+    prefix_steps: int,
+    future_offset: int,
+    sample_phase_window_len: int,
+    sample_skip_head_ratio: float | None,
+    start_margin: int,
+    failure_mode: str,
+    failure_table_paths: list[str],
+    failure_phase_bins: int,
+    failure_translation_dir_bins: int,
+    failure_translation_mag_bins: int,
+    failure_rotation_dir_bins: int,
+    failure_rotation_mag_bins: int,
+    failure_explore_k: int = 1,
+) -> tuple[MultiTaskFailureAwareStage2Dataset, dict[str, np.ndarray]]:
+    stats = get_multitask_norm_stats(task_specs)
+    if failure_mode == "train":
+        if not failure_table_paths:
+            raise ValueError("failure_mode=train requires failure_table_paths for multitask stage2")
+        if len(failure_table_paths) == 1 and len(task_specs) > 1:
+            failure_table_paths = list(failure_table_paths) * len(task_specs)
+        if len(failure_table_paths) != len(task_specs):
+            raise ValueError(
+                f"Expected 1 or {len(task_specs)} failure_table_paths, got {len(failure_table_paths)}"
+            )
+    else:
+        failure_table_paths = list(failure_table_paths or [""] * len(task_specs))
+        if len(failure_table_paths) == 1 and len(task_specs) > 1:
+            failure_table_paths = list(failure_table_paths) * len(task_specs)
+        if len(failure_table_paths) < len(task_specs):
+            failure_table_paths.extend([""] * (len(task_specs) - len(failure_table_paths)))
+
+    datasets: list[FailureAwareStage2Dataset] = []
+    for idx, spec in enumerate(task_specs):
+        valid_ids = list_valid_episode_ids(spec.dataset_dir, spec.num_episodes, prefix_steps, future_offset)
+        datasets.append(
+            FailureAwareStage2Dataset(
+                dataset_dir=spec.dataset_dir,
+                episode_ids=valid_ids,
+                camera_names=list(spec.camera_names),
+                norm_stats=stats,
+                act_chunk_size=act_chunk_size,
+                prefix_steps=prefix_steps,
+                future_offset=future_offset,
+                sample_phase_window_len=sample_phase_window_len,
+                sample_skip_head_ratio=sample_skip_head_ratio,
+                start_margin=start_margin,
+                failure_mode=failure_mode,
+                failure_table_path=failure_table_paths[idx],
+                failure_phase_bins=failure_phase_bins,
+                failure_translation_dir_bins=failure_translation_dir_bins,
+                failure_translation_mag_bins=failure_translation_mag_bins,
+                failure_rotation_dir_bins=failure_rotation_dir_bins,
+                failure_rotation_mag_bins=failure_rotation_mag_bins,
+                failure_explore_k=failure_explore_k,
+            )
+        )
+    return MultiTaskFailureAwareStage2Dataset(datasets, task_specs), stats

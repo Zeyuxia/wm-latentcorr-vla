@@ -52,33 +52,110 @@ class SmolVLAStage2LossOutput:
     beta_dynamics: float
 
 
-class ResidualMLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+def _pick_num_groups(num_channels: int, max_groups: int = 32) -> int:
+    groups = min(max_groups, num_channels)
+    while groups > 1 and (num_channels % groups != 0):
+        groups -= 1
+    return max(1, groups)
+
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, dim))
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+        mean = x.mean(dim=1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return x * self.weight[:, None, None] + self.bias[:, None, None]
 
 
-class ActionConditionedLatentPredictor(nn.Module):
-    def __init__(self, latent_dim: int, prefix_steps: int, action_dim: int, hidden_dim: int):
+class LatentProjector(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, mid_channels: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1),
+            nn.GroupNorm(_pick_num_groups(mid_channels), mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=1),
+            nn.GroupNorm(_pick_num_groups(out_channels), out_channels),
+        )
+
+    def forward(self, z_visual: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+        z = F.interpolate(z_visual, size=target_hw, mode="bilinear", align_corners=False)
+        return self.proj(z)
+
+
+class ResidualLatentAdapter(nn.Module):
+    def __init__(self, channels: int, mid_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, kernel_size=1),
+            nn.GroupNorm(_pick_num_groups(mid_channels), mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, kernel_size=1),
+            nn.GroupNorm(_pick_num_groups(channels), channels),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return z + self.net(z)
+
+
+class ActionPrefixEncoder(nn.Module):
+    def __init__(self, prefix_steps: int, action_dim: int, out_channels: int, hidden_dim: int):
         super().__init__()
         self.prefix_steps = int(prefix_steps)
         self.action_dim = int(action_dim)
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + prefix_steps * action_dim, hidden_dim),
+        in_dim = self.prefix_steps * self.action_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
+            nn.Linear(hidden_dim, out_channels * 2),
         )
 
-    def forward(self, latent: torch.Tensor, action_prefix: torch.Tensor) -> torch.Tensor:
-        if action_prefix.ndim != 3:
-            raise ValueError(f"action_prefix must be (B, K, A), got {tuple(action_prefix.shape)}")
-        flat_prefix = action_prefix.reshape(action_prefix.shape[0], -1)
-        return self.net(torch.cat([latent, flat_prefix], dim=1))
+    def forward(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if actions.ndim != 3:
+            raise ValueError(f"actions must be (B, K, A), got {tuple(actions.shape)}")
+        x = actions.reshape(actions.shape[0], -1)
+        gamma_beta = self.mlp(x)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+        return gamma[:, :, None, None], beta[:, :, None, None]
+
+
+class AdaLNResBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.act = nn.GELU()
+
+    def forward(self, z: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        h = self.norm(z)
+        h = gamma * h + beta
+        h = self.conv1(h)
+        h = self.act(h)
+        h = self.conv2(h)
+        return z + h
+
+
+class ActionConditionedPredictor(nn.Module):
+    def __init__(self, channels: int, prefix_steps: int, action_dim: int, hidden_dim: int, num_blocks: int = 3):
+        super().__init__()
+        self.encoder = ActionPrefixEncoder(prefix_steps, action_dim, channels, hidden_dim)
+        self.blocks = nn.ModuleList([AdaLNResBlock(channels) for _ in range(num_blocks)])
+
+    def forward(self, z_t: torch.Tensor, action_prefix: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.encoder(action_prefix)
+        z = z_t
+        for block in self.blocks:
+            z = block(z, gamma, beta)
+        return z
 
 
 class SmolVLALatentPolicy(nn.Module):
@@ -87,10 +164,11 @@ class SmolVLALatentPolicy(nn.Module):
         self.base_policy = base_policy
         self.bridge_cfg = bridge_cfg
         self.beta_scheduler = DynamicsWarmup(warmup_cfg)
-        self.visual_adapter: nn.Linear | None = None
-        self.wm_adapter: ResidualMLP | None = None
-        self.predictor: ActionConditionedLatentPredictor | None = None
-        self.latent_to_token: nn.Linear | None = None
+        self.projector: LatentProjector | None = None
+        self.wm_adapter: ResidualLatentAdapter | None = None
+        self.predictor: ActionConditionedPredictor | None = None
+        self.condition_proj: nn.Linear | None = None
+        self._target_hw: tuple[int, int] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -105,52 +183,104 @@ class SmolVLALatentPolicy(nn.Module):
             raise KeyError(f"Missing required key: {OBS_LANGUAGE_ATTENTION_MASK}")
         return images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK], state
 
-    def _ensure_bridge_modules(self, visual_dim: int, hidden_size: int) -> None:
-        if self.visual_adapter is not None:
+    def _extract_preconnector_visual_map(self, batch: dict) -> tuple[torch.Tensor, int]:
+        images, img_masks, _, _, _ = self._policy_inputs_from_batch(batch)
+        if len(images) != len(img_masks):
+            raise ValueError(f"images/img_masks length mismatch: {len(images)} vs {len(img_masks)}")
+        if len(images) == 0:
+            raise ValueError("At least one image tensor is required.")
+
+        img = images[0]
+        img_mask = img_masks[0]
+        if img.ndim != 4:
+            raise ValueError(f"Primary image tensor must be (B, C, H, W), got {tuple(img.shape)}")
+        if img_mask.ndim != 1:
+            raise ValueError(f"Primary image mask must be (B,), got {tuple(img_mask.shape)}")
+
+        vision_model = self.base_policy.model.vlm_with_expert.get_vlm_model().vision_model
+        image_hidden_states = vision_model(
+            pixel_values=img.to(dtype=vision_model.dtype),
+            patch_attention_mask=None,
+        ).last_hidden_state
+        if image_hidden_states.ndim != 3:
+            raise ValueError(
+                f"Expected pre-connector visual states to be (B, N, C), got {tuple(image_hidden_states.shape)}"
+            )
+
+        batch_size, seq_len, channels = image_hidden_states.shape
+        grid_size = int(seq_len**0.5)
+        if grid_size * grid_size != seq_len:
+            raise ValueError(f"Visual token sequence length is not a square grid: {seq_len}")
+        visual_map = image_hidden_states.transpose(1, 2).reshape(batch_size, channels, grid_size, grid_size)
+        visual_map = visual_map * img_mask[:, None, None, None].to(dtype=visual_map.dtype)
+        return visual_map, int(self.base_policy.model.vlm_with_expert.config.text_config.hidden_size)
+
+    def _ensure_bridge_modules(self, visual_channels: int, hidden_size: int) -> None:
+        if self.projector is not None:
             return
         latent_dim = int(self.bridge_cfg.latent_dim)
-        self.visual_adapter = nn.Linear(visual_dim, latent_dim).to(self.device)
-        self.wm_adapter = ResidualMLP(latent_dim, int(self.bridge_cfg.adapter_hidden_dim)).to(self.device)
-        self.predictor = ActionConditionedLatentPredictor(
-            latent_dim=latent_dim,
+        self.projector = LatentProjector(
+            in_channels=visual_channels,
+            out_channels=latent_dim,
+            mid_channels=int(self.bridge_cfg.adapter_hidden_dim),
+        ).to(self.device)
+        self.wm_adapter = ResidualLatentAdapter(
+            channels=latent_dim,
+            mid_channels=int(self.bridge_cfg.adapter_hidden_dim),
+        ).to(self.device)
+        self.predictor = ActionConditionedPredictor(
+            channels=latent_dim,
             prefix_steps=int(self.bridge_cfg.prefix_steps),
             action_dim=int(self.bridge_cfg.action_dim),
             hidden_dim=int(self.bridge_cfg.predictor_hidden_dim),
+            num_blocks=3,
         ).to(self.device)
-        self.latent_to_token = nn.Linear(latent_dim, hidden_size).to(self.device)
+        self.condition_proj = nn.Linear(latent_dim, hidden_size).to(self.device)
+        nn.init.zeros_(self.condition_proj.weight)
+        nn.init.zeros_(self.condition_proj.bias)
 
-    def extract_visual_latent(self, batch: dict) -> torch.Tensor:
-        images, img_masks, _, _, _ = self._policy_inputs_from_batch(batch)
-        image_embedding, image_mask = self.base_policy.model.extract_primary_visual_embedding(images, img_masks)
-        if image_embedding.ndim != 3:
-            raise ValueError(f"Expected primary visual embedding to be (B, N, H), got {tuple(image_embedding.shape)}")
-        if image_mask.ndim != 2:
-            raise ValueError(f"Expected primary visual mask to be (B, N), got {tuple(image_mask.shape)}")
-        mask = image_mask.to(dtype=image_embedding.dtype).unsqueeze(-1)
-        pooled = (image_embedding * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        hidden_size = int(image_embedding.shape[-1])
-        self._ensure_bridge_modules(int(pooled.shape[-1]), hidden_size)
-        assert self.visual_adapter is not None
-        assert self.wm_adapter is not None
-        pooled = pooled.to(dtype=self.visual_adapter.weight.dtype)
-        return self.wm_adapter(self.visual_adapter(pooled))
-
-    @torch.no_grad()
-    def initialize_from_batch(self, batch: dict) -> None:
-        _ = self.extract_visual_latent(batch)
+    def extract_visual_latent_map(self, batch: dict, target_hw: tuple[int, int]) -> torch.Tensor:
+        visual_map, hidden_size = self._extract_preconnector_visual_map(batch)
+        self._ensure_bridge_modules(int(visual_map.shape[1]), hidden_size)
+        assert self.projector is not None
+        self._target_hw = (int(target_hw[0]), int(target_hw[1]))
+        visual_map = visual_map.to(dtype=self.projector.proj[0].weight.dtype)
+        return self.projector(visual_map, target_hw=target_hw)
 
     @staticmethod
-    def teacher_latent_to_vector(teacher_latent: torch.Tensor) -> torch.Tensor:
+    def teacher_latent_to_map(teacher_latent: torch.Tensor) -> torch.Tensor:
         if teacher_latent.ndim != 4:
             raise ValueError(f"Teacher latent must be (B, C, H, W), got {tuple(teacher_latent.shape)}")
-        return F.adaptive_avg_pool2d(teacher_latent, output_size=1).flatten(1)
+        return teacher_latent
 
-    def build_condition_token(self, latent: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if latent.ndim != 2:
-            raise ValueError(f"latent must be (B, D), got {tuple(latent.shape)}")
-        assert self.latent_to_token is not None
-        latent = latent.to(dtype=self.latent_to_token.weight.dtype)
-        token = self.latent_to_token(latent) * float(scale)
+    def shared_teacher_latent(self, teacher_latent: torch.Tensor) -> torch.Tensor:
+        teacher_map = self.teacher_latent_to_map(teacher_latent)
+        if self.projector is None:
+            raise RuntimeError("Bridge modules must be initialized before calling shared_teacher_latent.")
+        assert self.wm_adapter is not None
+        teacher_map = teacher_map.to(dtype=self.wm_adapter.net[0].weight.dtype)
+        return self.wm_adapter(teacher_map)
+
+    @torch.no_grad()
+    def initialize_from_batch(self, batch: dict, teacher_latent: torch.Tensor | None = None) -> None:
+        if teacher_latent is None:
+            visual_map, hidden_size = self._extract_preconnector_visual_map(batch)
+            self._ensure_bridge_modules(int(visual_map.shape[1]), hidden_size)
+            return
+        teacher_map = self.teacher_latent_to_map(teacher_latent)
+        _ = self.extract_visual_latent_map(batch, target_hw=(teacher_map.shape[-2], teacher_map.shape[-1]))
+
+    @property
+    def target_hw(self) -> tuple[int, int] | None:
+        return self._target_hw
+
+    def build_condition_token(self, latent_map: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if latent_map.ndim != 4:
+            raise ValueError(f"latent_map must be (B, C, H, W), got {tuple(latent_map.shape)}")
+        assert self.condition_proj is not None
+        pooled = F.adaptive_avg_pool2d(latent_map, output_size=1).flatten(1)
+        pooled = pooled.to(dtype=self.condition_proj.weight.dtype)
+        token = self.condition_proj(pooled) * float(scale)
         token = token[:, None, :]
         mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
         att_mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
@@ -189,12 +319,13 @@ class SmolVLALatentPolicy(nn.Module):
                 f"action_prefix shape mismatch: expected (*, {expected_shape[0]}, {expected_shape[1]}), got {tuple(action_prefix.shape)}"
             )
 
-    def predict_next_latent(self, batch: dict, action_prefix: torch.Tensor) -> torch.Tensor:
+    def predict_next_latent(self, batch: dict, action_prefix: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
         self._require_action_prefix(action_prefix)
         assert self.predictor is not None
-        predictor_dtype = self.predictor.net[0].weight.dtype
+        z_proj = self.extract_visual_latent_map(batch, target_hw=target_hw)
+        predictor_dtype = next(self.predictor.parameters()).dtype
         return self.predictor(
-            self.extract_visual_latent(batch).to(dtype=predictor_dtype),
+            z_proj.to(dtype=predictor_dtype),
             action_prefix.to(dtype=predictor_dtype),
         )
 
@@ -208,17 +339,15 @@ class SmolVLALatentPolicy(nn.Module):
         if ACTION not in batch:
             raise KeyError(f"Missing required key: {ACTION}")
         self._require_action_prefix(action_prefix)
-        teacher_vector = self.teacher_latent_to_vector(future_teacher_latent)
-        visual_latent = self.extract_visual_latent(batch)
-        if teacher_vector.shape[1] != visual_latent.shape[1]:
-            raise ValueError(f"Teacher latent vector and visual bridge latent dimension mismatch: {teacher_vector.shape[1]} vs {visual_latent.shape[1]}")
-        teacher_vector = teacher_vector.to(dtype=visual_latent.dtype)
+
+        teacher_shared = self.shared_teacher_latent(future_teacher_latent)
+        target_hw = (teacher_shared.shape[-2], teacher_shared.shape[-1])
+        predicted_latent = self.predict_next_latent(batch, action_prefix, target_hw=target_hw)
 
         beta_dynamics = self.beta_scheduler.weight(global_step)
         beta_condition = beta_dynamics
-        predicted_latent = self.predict_next_latent(batch, action_prefix)
         loss_action = self._action_loss(batch=batch, actions=batch[ACTION])
-        cond_token, cond_mask, cond_att_mask = self.build_condition_token(predicted_latent.detach(), scale=1.0)
+        cond_token, cond_mask, cond_att_mask = self.build_condition_token(teacher_shared.detach(), scale=1.0)
         loss_action_conditioned = self._action_loss(
             batch=batch,
             actions=batch[ACTION],
@@ -226,7 +355,7 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_mask=cond_mask,
             external_prefix_att_mask=cond_att_mask,
         )
-        loss_dynamics = F.mse_loss(predicted_latent, teacher_vector)
+        loss_dynamics = F.mse_loss(predicted_latent, teacher_shared.detach())
         loss = loss_action + (beta_condition * loss_action_conditioned) + (beta_dynamics * loss_dynamics)
         return SmolVLAStage1LossOutput(
             loss=loss,
@@ -259,19 +388,18 @@ class SmolVLALatentPolicy(nn.Module):
             raise KeyError(f"Missing required key in normal_batch: {ACTION}")
         self._require_action_prefix(correction_action_prefix)
 
-        correction_teacher_vector = self.teacher_latent_to_vector(correction_teacher_latent)
-        rollout_teacher_vector = self.teacher_latent_to_vector(rollout_teacher_latent)
-        if correction_teacher_vector.shape[1] != rollout_teacher_vector.shape[1]:
+        correction_shared = self.shared_teacher_latent(correction_teacher_latent)
+        rollout_shared = self.shared_teacher_latent(rollout_teacher_latent)
+        if correction_shared.shape[1:] != rollout_shared.shape[1:]:
             raise ValueError(
-                "Correction teacher latent and rollout teacher latent dimension mismatch: "
-                f"{correction_teacher_vector.shape[1]} vs {rollout_teacher_vector.shape[1]}"
+                "Correction teacher latent and rollout teacher latent shape mismatch: "
+                f"{tuple(correction_shared.shape[1:])} vs {tuple(rollout_shared.shape[1:])}"
             )
 
-        predicted_latent = self.predict_next_latent(correction_batch, correction_action_prefix)
-        correction_teacher_vector = correction_teacher_vector.to(dtype=predicted_latent.dtype)
-        rollout_teacher_vector = rollout_teacher_vector.to(dtype=predicted_latent.dtype)
+        target_hw = (rollout_shared.shape[-2], rollout_shared.shape[-1])
+        predicted_latent = self.predict_next_latent(correction_batch, correction_action_prefix, target_hw=target_hw)
         beta_dynamics = self.beta_scheduler.weight(global_step)
-        corr_token, corr_mask, corr_att_mask = self.build_condition_token(correction_teacher_vector, scale=1.0)
+        corr_token, corr_mask, corr_att_mask = self.build_condition_token(correction_shared.detach(), scale=1.0)
         loss_correct = self._action_loss(
             batch=correction_batch,
             actions=correction_actions,
@@ -280,7 +408,7 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_att_mask=corr_att_mask,
         )
         loss_retain = self._action_loss(batch=normal_batch, actions=normal_batch[ACTION])
-        loss_dynamics = F.mse_loss(predicted_latent, rollout_teacher_vector)
+        loss_dynamics = F.mse_loss(predicted_latent, rollout_shared.detach())
         loss = loss_correct + (float(retain_weight) * loss_retain) + (beta_dynamics * loss_dynamics)
         return SmolVLAStage2LossOutput(
             loss=loss,
@@ -295,8 +423,8 @@ class SmolVLALatentPolicy(nn.Module):
         return self.base_policy.predict_action_chunk(batch)
 
     @torch.no_grad()
-    def predict_action_chunk_conditioned(self, batch: dict, latent: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-        token, mask, att_mask = self.build_condition_token(latent, scale=scale)
+    def predict_action_chunk_conditioned(self, batch: dict, latent_map: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        token, mask, att_mask = self.build_condition_token(latent_map, scale=scale)
         images, img_masks, lang_tokens, lang_masks, state = self._policy_inputs_from_batch(batch)
         return self.base_policy.model.sample_actions(
             images,

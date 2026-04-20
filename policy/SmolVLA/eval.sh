@@ -16,12 +16,12 @@ cd "${SCRIPT_DIR}"
 POLICY_NAME="SmolVLA"
 TASK_NAME="place_burger_fries"
 TASK_CONFIG="demo_clean"
-CKPT_SETTING="stage1_step_001500_base"
+CKPT_SETTING="stage1_step_001250_base"
 SEED=0
 GPU_ID=7
 INSTRUCTION_TYPE="seen"
-MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_005743-stage1_1345/stage1_step_001500.pt"
-EVAL_TAG="stage1_step_001500_base_seen"
+MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_005743-stage1_1345/stage1_step_001250.pt"
+EVAL_TAG="stage1_step_001250_base_seen"
 SEED_FILE=""
 POLICY_CONDA_ENV=""
 PYTHONNOUSERSITE=1

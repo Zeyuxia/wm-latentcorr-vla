@@ -19,14 +19,21 @@ class EvacLatentTeacher:
     single-chunk rollout latent used by stage-2.
     """
 
-    def __init__(self, evac_ckpt: str, evac_config: str, device: str | torch.device = "cuda:0"):
+    def __init__(
+        self,
+        evac_ckpt: str,
+        evac_config: str,
+        device: str | torch.device = "cuda:0",
+        load_rollout_model: bool = True,
+    ):
         self.device = torch.device(device)
-        self.model, self.cfg = self._load_model(evac_ckpt, evac_config)
+        self.load_rollout_model = bool(load_rollout_model)
+        self.model, self.cfg = self._load_model(evac_ckpt, evac_config, load_rollout_model=self.load_rollout_model)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
 
-    def _load_model(self, evac_ckpt: str, evac_config: str) -> tuple[Any, Any]:
+    def _load_model(self, evac_ckpt: str, evac_config: str, load_rollout_model: bool) -> tuple[Any, Any]:
         if not os.path.exists(evac_ckpt):
             raise FileNotFoundError(f"EVAC checkpoint not found: {evac_ckpt}")
         if not os.path.exists(evac_config):
@@ -45,8 +52,38 @@ class EvacLatentTeacher:
 
         model = instantiate_from_config(config.model)
         model = load_checkpoints(model, config.model, ignore_mismatched_sizes=False)
+        if not load_rollout_model:
+            self._trim_to_first_stage_encoder(model)
         model = model.to(self.device)
         return model, config
+
+    @staticmethod
+    def _trim_to_first_stage_encoder(model: Any) -> None:
+        # Keep only the first-stage autoencoder encoder path for image->latent.
+        removable_attrs = [
+            "model",
+            "diffusion_model",
+            "cond_stage_model",
+            "control_model",
+            "_dc_ddim_sampler",
+        ]
+        for attr in removable_attrs:
+            if hasattr(model, attr):
+                try:
+                    setattr(model, attr, None)
+                except Exception:
+                    pass
+
+        first_stage = getattr(model, "first_stage_model", None)
+        if first_stage is None:
+            return
+
+        for attr in ["decoder", "loss"]:
+            if hasattr(first_stage, attr):
+                try:
+                    setattr(first_stage, attr, None)
+                except Exception:
+                    pass
 
     @torch.no_grad()
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
@@ -235,6 +272,8 @@ class EvacLatentTeacher:
         dataset_name: str = "agibotworld",
         inference_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
+        if not self.load_rollout_model:
+            raise RuntimeError("rollout_latent_from_actions_batch requires load_rollout_model=True")
         from evac.lvdm.data.domain_table import DomainTable
 
         if curr_image.ndim == 3:
@@ -372,6 +411,8 @@ class EvacLatentTeacher:
         dataset_name: str = "agibotworld",
         inference_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
+        if not self.load_rollout_model:
+            raise RuntimeError("rollout_latent_from_actions requires load_rollout_model=True")
         return self.rollout_latent_from_actions_batch(
             curr_image=curr_image,
             curr_qpos_raw=curr_qpos_raw,
