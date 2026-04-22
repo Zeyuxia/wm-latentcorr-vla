@@ -16,7 +16,6 @@ class MultiTaskFailureDatasetConfig:
     prefix_steps: int
     future_offset: int
     sample_phase_window_len: int
-    sample_skip_head_ratio: float
     start_margin: int
     failure_table_paths: dict[str, str]
     failure_phase_bins: int
@@ -52,7 +51,6 @@ class MultiTaskFailureDataset(Dataset):
                 prefix_steps=int(config.prefix_steps),
                 future_offset=int(config.future_offset),
                 sample_phase_window_len=int(config.sample_phase_window_len),
-                sample_skip_head_ratio=float(config.sample_skip_head_ratio),
                 start_margin=int(config.start_margin),
                 failure_mode=self.mode,
                 failure_table_path=self._resolve_failure_table_path(spec.task_name),
@@ -99,4 +97,3 @@ def build_multitask_failure_dataset(
 ) -> tuple[MultiTaskFailureDataset, dict[str, np.ndarray]]:
     dataset = MultiTaskFailureDataset(task_specs=task_specs, config=config, mode=mode)
     return dataset, dataset.norm_stats
-

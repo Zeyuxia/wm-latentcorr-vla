@@ -1,0 +1,278 @@
+{
+  "phase_units": [
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "active_arm_pattern": "right_only"
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "active_arm_pattern": "left_only"
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 1,
+      "active_arm_pattern": "right_only"
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 1,
+      "active_arm_pattern": "left_only"
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 2,
+      "active_arm_pattern": "right_only"
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 2,
+      "active_arm_pattern": "left_only"
+    },
+    {
+      "phase_key": "approach",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 2,
+      "active_arm_pattern": "right_only"
+    },
+    {
+      "phase_key": "approach",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 2,
+      "active_arm_pattern": "left_only"
+    },
+    {
+      "phase_key": "transport",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "active_arm_pattern": "both"
+    },
+    {
+      "phase_key": "transport",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "active_arm_pattern": "right_only"
+    },
+    {
+      "phase_key": "transport",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "active_arm_pattern": "left_only"
+    },
+    {
+      "phase_key": "transport",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 1,
+      "active_arm_pattern": "both"
+    }
+  ],
+  "first_20_explore_units": [
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 0,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 0,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 1,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 1,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 2,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 2,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 3,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 3,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 4,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 4,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 5,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "translation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 5,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 0,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 0,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 1,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 1,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 2,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 2,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 3,
+      "mag_bin_id": 0,
+      "weight": 1.0
+    },
+    {
+      "phase_key": "pregrasp",
+      "phase_instance_idx": 1,
+      "phase_bin_id": 0,
+      "error_mode": "rotation",
+      "active_arm_pattern": "right_only",
+      "dir_bin_id": 3,
+      "mag_bin_id": 1,
+      "weight": 1.0
+    }
+  ]
+}

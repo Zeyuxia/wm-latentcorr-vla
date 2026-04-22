@@ -9,3 +9,9 @@ class DynamicsWarmupConfig:
     ramp_steps: int
     max_weight: float
     curve: str
+
+
+@dataclass(frozen=True)
+class Stage1WarmupConfig:
+    dynamics: DynamicsWarmupConfig
+    condition: DynamicsWarmupConfig

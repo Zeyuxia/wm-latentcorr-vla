@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from contextlib import contextmanager
 from typing import Any
-import signal
 
 import numpy as np
 import torch
@@ -11,11 +9,13 @@ import os
 import sys
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_ROBOTWIN_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", ".."))
-_SMOLVLA_EVAC_ROOT = os.path.join(_THIS_DIR, "evac")
-for _path in (_ROBOTWIN_ROOT, _SMOLVLA_EVAC_ROOT):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+_ROBOTWIN_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", "..", ".."))
+_SMOLVLA_EVAC_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", "evac"))
+_SMOLVLA_EVAC_MODULE_ROOT = os.path.join(_SMOLVLA_EVAC_ROOT, "evac")
+for _path in (_ROBOTWIN_ROOT, _SMOLVLA_EVAC_ROOT, _SMOLVLA_EVAC_MODULE_ROOT):
+    if _path in sys.path:
+        sys.path.remove(_path)
+    sys.path.insert(0, _path)
 
 from policy.SmolVLA.latentcorr.correction_step import correction_step
 from policy.SmolVLA.latentcorr.correction_utils import build_evac_infer_kwargs
@@ -34,9 +34,11 @@ def _init_act_correction_modules(
     from policy.ACT.util.fk_sapien import SapienFK
 
     # EVAC has its own `utils` package; keep it ahead of ACT's `utils.py`.
-    _evac_pkg_root = os.path.join(_SMOLVLA_EVAC_ROOT, "evac")
-    if _evac_pkg_root not in sys.path:
-        sys.path.insert(0, _evac_pkg_root)
+    for _path in (_SMOLVLA_EVAC_ROOT, _SMOLVLA_EVAC_MODULE_ROOT):
+        if _path in sys.path:
+            sys.path.remove(_path)
+    sys.path.insert(0, _SMOLVLA_EVAC_ROOT)
+    sys.path.insert(0, _SMOLVLA_EVAC_MODULE_ROOT)
     _act_utils = sys.modules.pop("utils", None)
     try:
         from evac.utils.general_utils import load_checkpoints, instantiate_from_config
@@ -123,63 +125,36 @@ def _init_act_correction_modules_without_loading_evac(
 class ACTAlignedCorrectionConfig:
     max_rollout_steps: int = 1
     correction_force_generate: bool = False
-    target_mode: str = "backward"
-    target_lookahead_steps: int = 4
-    min_dist_fallback_force_correction: bool = True
-    min_dist_recover_ratio: float = 0.75
-    real_error_trigger_enable: bool = True
-    real_error_min_dist_thresh: float = 0.01
-    real_error_min_dist_delta_thresh: float = 0.005
-    debug_recover_eval_rollout: bool = False
-    debug_correction_evac_rollout: bool = False
-    recover_eval_enable: bool = False
+    recover_eval_enable: bool = True
     recover_eval_save_video: bool = False
-    recover_eval_gripper_open_thresh: float = 0.8
+    recover_eval_gripper_open_thresh: float = 0.2
     recover_eval_pos_thresh_m: float = 0.03
     recover_eval_rot_thresh_deg: float = 10.0
     recover_eval_nearest_window_radius: int = 16
     recover_eval_video_bridge_steps: int = 16
-    correction_interp_nearest_enable: bool = False
-    correction_interp_prefix_ratio: float = 0.6
-    correction_planner_prefix_ratio: float = 0.5
-    correction_gripper_close_prefix_ratio: float = 0.32
-    correction_compose_gt_tail_enable: bool = True
-    correction_gripper_switch_ratio: float = 0.5
     rollout_exec_steps: int = 16
     chunk_size: int = 50
     max_action_len: int = 50
     orient_weight: float = 0.0573
     gripper_penalty: float = 1.0
-    recover_gripper_penalty: float = 0.0
     enable_perturb: bool = True
-    perturb_prob: float = 1.0
-    perturb_error_mode: str = "open_laptop_pregrasp"
-    perturb_open_laptop_pregrasp_close_prob: float = 0.5
-    perturb_open_laptop_pregrasp_translation_prob: float = 0.0
-    perturb_open_laptop_pregrasp_rotation_prob: float = 0.0
-    perturb_eef_fail_gain: float = 0.10
+    perturb_eef_fail_gain: float = 0.08
     perturb_rot_max_deg: float = 15.0
-    perturb_mag_random: bool = False
-    perturb_mag_rand_min: float = 1.0
-    perturb_mag_rand_max: float = 1.4
-    perturb_reject_sampling_enable: bool = True
-    perturb_reject_max_trials: int = 4
-    perturb_reject_dir_jitter_eps: float = 0.2
     nearest_window_radius: int = 12
     perturb_gripper_close_min: float = 0.10
-    perturb_gripper_open_max: float = 0.90
-    perturb_gripper_fast_ratio: float = 0.20
     perturb_active_joint_delta_thresh: float = 0.01
     perturb_active_gripper_delta_thresh: float = 0.05
+    evac_blur_filter_enable: bool = False
+    evac_blur_filter_min_ratio: float = 0.25
+    evac_blur_filter_patch_pad_px: int = 24
     sample_phase_window_len: int = 30
-    sample_pregrasp_phase_window_len: int = 30
-    sample_timeout_sec: float = 30.0
     failure_mode: str = "off"
     failure_phase_bins: int = 3
     failure_translation_dir_bins: int = 6
-    failure_translation_mag_bins: int = 3
+    failure_translation_mag_bins: int = 1
     failure_rotation_dir_bins: int = 6
-    failure_rotation_mag_bins: int = 3
+    failure_rotation_mag_bins: int = 1
+    fail_fast_on_error: bool = False
 
     def to_runtime_dict(self) -> dict[str, Any]:
         runtime = self.__dict__.copy()
@@ -189,85 +164,38 @@ class ACTAlignedCorrectionConfig:
 
 def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorrectionConfig:
     return ACTAlignedCorrectionConfig(
-        max_rollout_steps=int(getattr(args, "max_rollout_steps", 1)),
+        max_rollout_steps=1,
         correction_force_generate=bool(getattr(args, "correction_force_generate", False)),
-        target_mode=str(getattr(args, "planner_target_mode", "backward")),
-        target_lookahead_steps=int(getattr(args, "planner_target_lookahead_steps", 4)),
-        min_dist_fallback_force_correction=bool(
-            getattr(args, "act_aligned_min_dist_fallback_force_correction", True)
-        ),
-        min_dist_recover_ratio=float(getattr(args, "act_aligned_min_dist_recover_ratio", 0.75)),
-        real_error_trigger_enable=bool(getattr(args, "act_aligned_real_error_trigger_enable", True)),
-        real_error_min_dist_thresh=float(getattr(args, "act_aligned_real_error_min_dist_thresh", 0.01)),
-        real_error_min_dist_delta_thresh=float(
-            getattr(args, "act_aligned_real_error_min_dist_delta_thresh", 0.005)
-        ),
-        debug_recover_eval_rollout=bool(getattr(args, "act_aligned_debug_recover_eval_rollout", False)),
-        debug_correction_evac_rollout=bool(getattr(args, "act_aligned_debug_correction_evac_rollout", False)),
-        recover_eval_enable=bool(getattr(args, "recover_eval_enable", False)),
+        recover_eval_enable=True,
         recover_eval_save_video=bool(getattr(args, "recover_eval_save_video", False)),
-        recover_eval_gripper_open_thresh=float(getattr(args, "recover_eval_gripper_open_thresh", 0.8)),
+        recover_eval_gripper_open_thresh=float(getattr(args, "recover_eval_gripper_open_thresh", 0.2)),
         recover_eval_pos_thresh_m=float(getattr(args, "recover_eval_pos_thresh_m", 0.03)),
         recover_eval_rot_thresh_deg=float(getattr(args, "recover_eval_rot_thresh_deg", 10.0)),
         recover_eval_nearest_window_radius=int(getattr(args, "recover_eval_nearest_window_radius", 16)),
         recover_eval_video_bridge_steps=int(getattr(args, "recover_eval_video_bridge_steps", 16)),
-        correction_interp_nearest_enable=bool(
-            getattr(args, "act_aligned_correction_interp_nearest_enable", False)
-        ),
-        correction_interp_prefix_ratio=float(getattr(args, "act_aligned_correction_interp_prefix_ratio", 0.6)),
-        correction_planner_prefix_ratio=float(getattr(args, "act_aligned_correction_planner_prefix_ratio", 0.5)),
-        correction_gripper_close_prefix_ratio=float(
-            getattr(args, "act_aligned_correction_gripper_close_prefix_ratio", 0.32)
-        ),
-        correction_compose_gt_tail_enable=bool(
-            getattr(args, "act_aligned_correction_compose_gt_tail_enable", True)
-        ),
-        correction_gripper_switch_ratio=float(
-            getattr(args, "act_aligned_correction_gripper_switch_ratio", 0.5)
-        ),
         rollout_exec_steps=int(getattr(args, "act_aligned_rollout_exec_steps", getattr(args, "prefix_steps", 16))),
         chunk_size=int(getattr(args, "act_chunk_size", 50) or 50),
         max_action_len=int(max_action_len),
         orient_weight=float(getattr(args, "planner_orient_weight", 0.0573)),
         gripper_penalty=float(getattr(args, "planner_gripper_penalty", 1.0)),
-        recover_gripper_penalty=float(getattr(args, "act_aligned_recover_gripper_penalty", 0.0)),
         enable_perturb=bool(getattr(args, "act_aligned_enable_perturb", True)),
-        perturb_prob=float(getattr(args, "act_aligned_perturb_prob", 1.0)),
-        perturb_error_mode=str(getattr(args, "act_aligned_perturb_error_mode", "open_laptop_pregrasp")),
-        perturb_open_laptop_pregrasp_close_prob=float(
-            getattr(args, "act_aligned_perturb_open_laptop_pregrasp_close_prob", 0.5)
-        ),
-        perturb_open_laptop_pregrasp_translation_prob=float(
-            getattr(args, "act_aligned_perturb_open_laptop_pregrasp_translation_prob", 0.0)
-        ),
-        perturb_open_laptop_pregrasp_rotation_prob=float(
-            getattr(args, "act_aligned_perturb_open_laptop_pregrasp_rotation_prob", 0.0)
-        ),
-        perturb_eef_fail_gain=float(getattr(args, "act_aligned_perturb_eef_fail_gain", 0.10)),
+        perturb_eef_fail_gain=float(getattr(args, "act_aligned_perturb_eef_fail_gain", 0.08)),
         perturb_rot_max_deg=float(getattr(args, "act_aligned_perturb_rot_max_deg", 15.0)),
-        perturb_mag_random=bool(getattr(args, "act_aligned_perturb_mag_random", False)),
-        perturb_mag_rand_min=float(getattr(args, "act_aligned_perturb_mag_rand_min", 1.0)),
-        perturb_mag_rand_max=float(getattr(args, "act_aligned_perturb_mag_rand_max", 1.4)),
-        perturb_reject_sampling_enable=bool(
-            getattr(args, "act_aligned_perturb_reject_sampling_enable", True)
-        ),
-        perturb_reject_max_trials=int(getattr(args, "act_aligned_perturb_reject_max_trials", 4)),
-        perturb_reject_dir_jitter_eps=float(getattr(args, "act_aligned_perturb_reject_dir_jitter_eps", 0.2)),
         nearest_window_radius=int(getattr(args, "planner_nearest_window_radius", 12)),
         perturb_gripper_close_min=float(getattr(args, "act_aligned_perturb_gripper_close_min", 0.10)),
-        perturb_gripper_open_max=float(getattr(args, "act_aligned_perturb_gripper_open_max", 0.90)),
-        perturb_gripper_fast_ratio=float(getattr(args, "act_aligned_perturb_gripper_fast_ratio", 0.20)),
         perturb_active_joint_delta_thresh=float(getattr(args, "planner_active_joint_delta_thresh", 0.01)),
         perturb_active_gripper_delta_thresh=float(getattr(args, "planner_active_gripper_delta_thresh", 0.05)),
+        evac_blur_filter_enable=bool(getattr(args, "evac_blur_filter_enable", False)),
+        evac_blur_filter_min_ratio=float(getattr(args, "evac_blur_filter_min_ratio", 0.25)),
+        evac_blur_filter_patch_pad_px=int(getattr(args, "evac_blur_filter_patch_pad_px", 24)),
         sample_phase_window_len=int(getattr(args, "sample_phase_window_len", 30)),
-        sample_pregrasp_phase_window_len=int(getattr(args, "act_aligned_sample_pregrasp_phase_window_len", 30)),
-        sample_timeout_sec=float(getattr(args, "act_aligned_sample_timeout_sec", 30.0)),
         failure_mode=str(getattr(args, "failure_mode", "off")),
         failure_phase_bins=int(getattr(args, "failure_phase_bins", 3)),
         failure_translation_dir_bins=int(getattr(args, "failure_translation_dir_bins", 6)),
-        failure_translation_mag_bins=int(getattr(args, "failure_translation_mag_bins", 3)),
+        failure_translation_mag_bins=int(getattr(args, "failure_translation_mag_bins", 1)),
         failure_rotation_dir_bins=int(getattr(args, "failure_rotation_dir_bins", 6)),
-        failure_rotation_mag_bins=int(getattr(args, "failure_rotation_mag_bins", 3)),
+        failure_rotation_mag_bins=int(getattr(args, "failure_rotation_mag_bins", 1)),
+        fail_fast_on_error=bool(getattr(args, "fail_fast_on_error", False)),
     )
 
 
@@ -287,34 +215,27 @@ class _ACTChunkPolicyAdapter:
         self.latent_model.train(mode)
         return self
 
+    def build_batch(self, image_t, qpos_raw, action_chunk_raw):
+        if not hasattr(self.latent_model, "build_batch"):
+            raise AttributeError("Underlying latent_model does not implement build_batch")
+        return self.latent_model.build_batch(
+            image_t=image_t,
+            qpos_raw=qpos_raw,
+            action_chunk_raw=action_chunk_raw,
+        )
+
+    def predict_base_action_chunk(self, batch):
+        if not hasattr(self.latent_model, "latent_policy"):
+            raise AttributeError("Underlying latent_model does not expose latent_policy")
+        return self.latent_model.latent_policy.base_policy.predict_action_chunk(batch)
+
+    def postprocess_action_chunk(self, action_chunk):
+        if not hasattr(self.latent_model, "postprocess_action_chunk"):
+            raise AttributeError("Underlying latent_model does not implement postprocess_action_chunk")
+        return self.latent_model.postprocess_action_chunk(action_chunk)
+
     def __call__(self, qpos, image):
         return self.latent_model.predict_act_chunk(qpos, image)
-
-
-class _CorrectionBuildTimeout(RuntimeError):
-    pass
-
-
-@contextmanager
-def _sample_timeout_guard(timeout_sec: float):
-    if timeout_sec <= 0:
-        yield
-        return
-    if not hasattr(signal, "setitimer"):
-        yield
-        return
-
-    def _handle_timeout(signum, frame):
-        raise _CorrectionBuildTimeout(f"correction build timed out after {timeout_sec:.1f}s")
-
-    old_handler = signal.getsignal(signal.SIGALRM)
-    try:
-        signal.signal(signal.SIGALRM, _handle_timeout)
-        signal.setitimer(signal.ITIMER_REAL, float(timeout_sec))
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, old_handler)
 
 
 class ACTAlignedCorrectionBuilder:
@@ -371,8 +292,6 @@ class ACTAlignedCorrectionBuilder:
         start_ts: int,
         failure_mode_override: str | None = None,
         sampled_phase_id: int | None = None,
-        pregrasp_seg_start: int | None = None,
-        pregrasp_seg_end: int | None = None,
         sampled_phase_bin_id: int | None = None,
         sampled_phase_instance_id: int | None = None,
         forced_error_mode_id: int | None = None,
@@ -410,42 +329,38 @@ class ACTAlignedCorrectionBuilder:
             precomputed_action_chunk_raw = precomputed_action_chunk_raw.numpy()
             precomputed_action_chunk_raw[..., 6] = np.clip(precomputed_action_chunk_raw[..., 6], 0.0, 1.0)
             precomputed_action_chunk_raw[..., 13] = np.clip(precomputed_action_chunk_raw[..., 13], 0.0, 1.0)
+        if precomputed_action_chunk_raw is None:
+            raise ValueError(
+                "ACTAlignedCorrectionBuilder.build requires precomputed_action_chunk_norm. "
+                "Explore/correction generation should always start from the dataset GT action chunk."
+            )
         try:
-            with _sample_timeout_guard(float(self.cfg.sample_timeout_sec)):
-                corr = correction_step(
-                    adapter,
-                    image_t,
-                    qpos_t,
-                    raw_data,
-                    norm_stats,
-                    self.modules,
-                    runtime_cfg,
-                    self.device,
-                    debug_dir=debug_dir,
-                    start_ts=int(start_ts),
-                    sampled_phase_id=sampled_phase_id,
-                    pregrasp_seg_start=pregrasp_seg_start,
-                    pregrasp_seg_end=pregrasp_seg_end,
-                    sampled_phase_bin_id=sampled_phase_bin_id,
-                    sampled_phase_instance_id=sampled_phase_instance_id,
-                    forced_error_mode_id=forced_error_mode_id,
-                    sampled_active_arm_pattern_id=sampled_active_arm_pattern_id,
-                    forced_dir_bin_id=forced_dir_bin_id,
-                    forced_mag_bin_id=forced_mag_bin_id,
-                    sampled_mode_prob=sampled_mode_prob,
-                    sampled_entry_prob_within_mode=sampled_entry_prob_within_mode,
-                    sampled_unit_prob=sampled_unit_prob,
-                    precomputed_action_chunk_raw=precomputed_action_chunk_raw,
-                )
-        except _CorrectionBuildTimeout as exc:
-            self._last_skip_meta = {
-                "correction_generated": False,
-                "correction_branch": "timeout",
-                "skip_reason": "sample_timeout",
-                "skip_error": str(exc),
-            }
-            return None
+            corr = correction_step(
+                adapter,
+                image_t,
+                qpos_t,
+                raw_data,
+                norm_stats,
+                self.modules,
+                runtime_cfg,
+                self.device,
+                debug_dir=debug_dir,
+                start_ts=int(start_ts),
+                sampled_phase_id=sampled_phase_id,
+                sampled_phase_bin_id=sampled_phase_bin_id,
+                sampled_phase_instance_id=sampled_phase_instance_id,
+                forced_error_mode_id=forced_error_mode_id,
+                sampled_active_arm_pattern_id=sampled_active_arm_pattern_id,
+                forced_dir_bin_id=forced_dir_bin_id,
+                forced_mag_bin_id=forced_mag_bin_id,
+                sampled_mode_prob=sampled_mode_prob,
+                sampled_entry_prob_within_mode=sampled_entry_prob_within_mode,
+                sampled_unit_prob=sampled_unit_prob,
+                precomputed_action_chunk_raw=precomputed_action_chunk_raw,
+            )
         except Exception as exc:
+            if bool(runtime_cfg.get("fail_fast_on_error", False)):
+                raise
             self._last_skip_meta = {
                 "correction_generated": False,
                 "correction_branch": "error",

@@ -17,10 +17,11 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent
-SMOLVLA_SRC_DIR = REPO_ROOT / "src"
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+PROJECT_ROOT = THIS_DIR.parents[2]
+SMOLVLA_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = SMOLVLA_ROOT / "src"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SMOLVLA_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SMOLVLA_SRC_DIR))
 
@@ -30,7 +31,7 @@ from policy.SmolVLA.latentcorr.act_aligned_correction import ACTAlignedCorrectio
 from policy.SmolVLA.latentcorr.correction_policy_adapter import SampleBoundSmolVLAAdapter
 from policy.SmolVLA.latentcorr.evac_interface import EvacLatentTeacher
 from policy.SmolVLA.latentcorr.failure_manifest_utils import load_failure_table_paths
-from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig
+from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig, Stage1WarmupConfig
 from policy.SmolVLA.latentcorr.latent_dataset_utils import load_raw_episode
 from policy.SmolVLA.latentcorr.multitask_failure_dataset import MultiTaskFailureDatasetConfig, build_multitask_failure_dataset
 from policy.SmolVLA.latentcorr.multitask_latent_utils import build_multitask_stage1_dataset, resolve_multitask_specs
@@ -125,6 +126,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dyn_ramp_steps", type=int, required=True)
     parser.add_argument("--dyn_max_weight", type=float, required=True)
     parser.add_argument("--dyn_warmup_curve", type=str, required=True, choices=["linear", "cosine"])
+    parser.add_argument("--cond_zero_steps", type=int, default=None)
+    parser.add_argument("--cond_ramp_steps", type=int, default=None)
+    parser.add_argument("--cond_max_weight", type=float, default=None)
+    parser.add_argument("--cond_warmup_curve", type=str, default=None, choices=["linear", "cosine"])
     parser.add_argument("--act_chunk_size", type=int, required=True)
 
 
@@ -147,55 +152,58 @@ def add_stage2_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--failure_rotation_mag_bins", type=int, required=True)
     parser.add_argument("--failure_explore_k", type=int, required=True)
     parser.add_argument("--sample_phase_window_len", type=int, required=True)
-    parser.add_argument("--sample_skip_head_ratio", type=float, required=True)
     parser.add_argument("--start_margin", type=int, required=True)
-    parser.add_argument("--max_rollout_steps", type=int, required=True)
     parser.add_argument("--act_aligned_rollout_exec_steps", type=int, required=True)
-    parser.add_argument("--planner_target_mode", type=str, required=True)
-    parser.add_argument("--planner_target_lookahead_steps", type=int, required=True)
     parser.add_argument("--planner_orient_weight", type=float, required=True)
     parser.add_argument("--planner_gripper_penalty", type=float, required=True)
     parser.add_argument("--planner_nearest_window_radius", type=int, required=True)
     parser.add_argument("--planner_active_joint_delta_thresh", type=float, required=True)
     parser.add_argument("--planner_active_gripper_delta_thresh", type=float, required=True)
-    parser.add_argument("--act_aligned_min_dist_fallback_force_correction", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_min_dist_recover_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_real_error_trigger_enable", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_real_error_min_dist_thresh", type=float, required=True)
-    parser.add_argument("--act_aligned_real_error_min_dist_delta_thresh", type=float, required=True)
-    parser.add_argument("--recover_eval_enable", type=str2bool, required=True)
     parser.add_argument("--recover_eval_save_video", type=str2bool, required=True)
     parser.add_argument("--recover_eval_gripper_open_thresh", type=float, required=True)
     parser.add_argument("--recover_eval_pos_thresh_m", type=float, required=True)
     parser.add_argument("--recover_eval_rot_thresh_deg", type=float, required=True)
     parser.add_argument("--recover_eval_nearest_window_radius", type=int, required=True)
     parser.add_argument("--recover_eval_video_bridge_steps", type=int, required=True)
-    parser.add_argument("--act_aligned_correction_interp_nearest_enable", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_correction_interp_prefix_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_correction_planner_prefix_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_correction_gripper_close_prefix_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_correction_compose_gt_tail_enable", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_correction_gripper_switch_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_recover_gripper_penalty", type=float, required=True)
     parser.add_argument("--act_aligned_enable_perturb", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_perturb_prob", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_error_mode", type=str, required=True)
-    parser.add_argument("--act_aligned_perturb_open_laptop_pregrasp_close_prob", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_open_laptop_pregrasp_translation_prob", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_open_laptop_pregrasp_rotation_prob", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_mag_random", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_perturb_mag_rand_min", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_mag_rand_max", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_reject_sampling_enable", type=str2bool, required=True)
-    parser.add_argument("--act_aligned_perturb_reject_max_trials", type=int, required=True)
-    parser.add_argument("--act_aligned_perturb_reject_dir_jitter_eps", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_gripper_open_max", type=float, required=True)
-    parser.add_argument("--act_aligned_perturb_gripper_fast_ratio", type=float, required=True)
-    parser.add_argument("--act_aligned_sample_pregrasp_phase_window_len", type=int, required=True)
-    parser.add_argument("--act_aligned_sample_timeout_sec", type=float, required=True)
+
+
+def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--failure_mode", type=str, default="off", choices=["off", "train"])
+    parser.add_argument("--failure_table_paths_json", type=str, default="")
+    parser.add_argument("--failure_corr_batch_ratio", type=float, default=0.0)
+    parser.add_argument("--failure_phase_bins", type=int, default=3)
+    parser.add_argument("--failure_translation_dir_bins", type=int, default=6)
+    parser.add_argument("--failure_translation_mag_bins", type=int, default=1)
+    parser.add_argument("--failure_rotation_dir_bins", type=int, default=6)
+    parser.add_argument("--failure_rotation_mag_bins", type=int, default=1)
+    parser.add_argument("--failure_explore_k", type=int, default=4)
+    parser.add_argument("--sample_phase_window_len", type=int, default=20)
+    parser.add_argument("--start_margin", type=int, default=16)
+    parser.add_argument("--urdf_path", type=str, default="")
+    parser.add_argument("--curobo_left_yml", type=str, default="")
+    parser.add_argument("--curobo_right_yml", type=str, default="")
+    parser.add_argument("--act_aligned_rollout_exec_steps", type=int, default=16)
+    parser.add_argument("--planner_orient_weight", type=float, default=0.0573)
+    parser.add_argument("--planner_gripper_penalty", type=float, default=1.0)
+    parser.add_argument("--planner_nearest_window_radius", type=int, default=12)
+    parser.add_argument("--planner_active_joint_delta_thresh", type=float, default=0.01)
+    parser.add_argument("--planner_active_gripper_delta_thresh", type=float, default=0.05)
+    parser.add_argument("--recover_eval_save_video", type=str2bool, default=False)
+    parser.add_argument("--recover_eval_gripper_open_thresh", type=float, default=0.2)
+    parser.add_argument("--recover_eval_pos_thresh_m", type=float, default=0.04)
+    parser.add_argument("--recover_eval_rot_thresh_deg", type=float, default=8.0)
+    parser.add_argument("--recover_eval_nearest_window_radius", type=int, default=16)
+    parser.add_argument("--recover_eval_video_bridge_steps", type=int, default=16)
+    parser.add_argument("--act_aligned_enable_perturb", type=str2bool, default=True)
+    parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, default=0.08)
+    parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, default=15.0)
+    parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, default=0.10)
+    parser.add_argument("--debug_wm_correction", type=str2bool, default=False)
+    parser.add_argument("--debug_wm_all_ranks", type=str2bool, default=False)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -204,6 +212,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     stage1_parser = subparsers.add_parser("stage1")
     add_common_args(stage1_parser)
+    add_failure_train_args(stage1_parser)
 
     stage2_parser = subparsers.add_parser("stage2")
     add_common_args(stage2_parser)
@@ -231,6 +240,17 @@ def build_warmup_config(args: argparse.Namespace) -> DynamicsWarmupConfig:
     )
 
 
+def build_stage1_warmup_config(args: argparse.Namespace) -> Stage1WarmupConfig:
+    dynamics = build_warmup_config(args)
+    condition = DynamicsWarmupConfig(
+        zero_steps=int(args.cond_zero_steps if args.cond_zero_steps is not None else args.dyn_zero_steps),
+        ramp_steps=int(args.cond_ramp_steps if args.cond_ramp_steps is not None else args.dyn_ramp_steps),
+        max_weight=float(args.cond_max_weight if args.cond_max_weight is not None else args.dyn_max_weight),
+        curve=str(args.cond_warmup_curve if args.cond_warmup_curve is not None else args.dyn_warmup_curve),
+    )
+    return Stage1WarmupConfig(dynamics=dynamics, condition=condition)
+
+
 def build_base_policy(args: argparse.Namespace) -> tuple[SmolVLAPolicy, Any]:
     base_policy = SmolVLAPolicy.from_pretrained(args.smolvla_pretrained_path)
     base_policy.config.freeze_vision_encoder = parse_bool_flag(args.freeze_vision_encoder)
@@ -241,7 +261,7 @@ def build_base_policy(args: argparse.Namespace) -> tuple[SmolVLAPolicy, Any]:
     base_policy.model.vlm_with_expert.set_requires_grad()
     base_policy.model.set_requires_grad()
     base_policy.to(torch.device(args.device))
-    preprocess, _ = make_smolvla_processors(base_policy, args.smolvla_pretrained_path)
+    preprocess, postprocess = make_smolvla_processors(base_policy, args.smolvla_pretrained_path)
     return base_policy, preprocess
 
 
@@ -377,6 +397,133 @@ def initialize_latent_policy_from_sample(
     latent_policy.initialize_from_batch(init_batch, teacher_latent=teacher_latent)
 
 
+def build_stage1_samples_from_raw_batch(
+    raw_batch: dict[str, Any],
+    latent_model: SmolVLALatentPolicy,
+    preprocess,
+    instruction_type: str,
+    prefix_steps: int,
+) -> tuple[list[dict[str, Any]], list[torch.Tensor], list[torch.Tensor]]:
+    samples = []
+    future_images = []
+    action_prefix = []
+    for batch_index in range(raw_batch["image_t"].shape[0]):
+        task_name = raw_batch["task_name"][batch_index]
+        task_only, task_config = parse_task_parts(task_name)
+        sample = build_smolvla_batch(
+            policy=latent_model.base_policy,
+            preprocess=preprocess,
+            image_t=raw_batch["image_t"][batch_index],
+            qpos_raw=raw_batch["qpos_raw"][batch_index],
+            action_chunk_raw=raw_batch["act_action_chunk_raw"][batch_index],
+            task_name=task_only,
+            task_config=task_config,
+            episode_id=int(raw_batch["episode_id"][batch_index].item()),
+            instruction_type=instruction_type,
+        )
+        samples.append(sample)
+        future_images.append(raw_batch["image_t_future"][batch_index, 0])
+        action_prefix.append(sample["action"][:, : int(prefix_steps), :])
+    return samples, future_images, action_prefix
+
+
+def build_stage1_correction_samples(
+    correction_raw_batch: dict[str, Any],
+    latent_model: SmolVLALatentPolicy,
+    preprocess,
+    instruction_type: str,
+    args: argparse.Namespace,
+    correction_builder: ACTAlignedCorrectionBuilder,
+    teacher: EvacLatentTeacher,
+    norm_stats: dict[str, Any],
+    raw_cache: dict[tuple[str, int], dict[str, Any]],
+    step_debug_dir: str | None = None,
+) -> tuple[list[dict[str, Any]], list[torch.Tensor], list[torch.Tensor], Counter[str]]:
+    device = torch.device(args.device)
+    qpos_mean = torch.as_tensor(norm_stats["qpos_mean"], dtype=torch.float32, device=device)
+    qpos_std = torch.as_tensor(norm_stats["qpos_std"], dtype=torch.float32, device=device)
+    action_mean = torch.as_tensor(norm_stats["action_mean"], dtype=torch.float32, device=device)
+    action_std = torch.as_tensor(norm_stats["action_std"], dtype=torch.float32, device=device)
+
+    samples = []
+    future_images = []
+    action_prefix = []
+    skip_reasons: Counter[str] = Counter()
+    for sample_index in range(correction_raw_batch["image_t"].shape[0]):
+        task_name_full = correction_raw_batch["task_name"][sample_index]
+        task_only, task_config = parse_task_parts(task_name_full)
+        episode_id = int(correction_raw_batch["episode_id"][sample_index].item())
+        adapter = SampleBoundSmolVLAAdapter(
+            latent_policy=latent_model,
+            preprocess=preprocess,
+            postprocess=postprocess,
+            task_name=task_only,
+            task_config=task_config,
+            episode_id=episode_id,
+            instruction_type=instruction_type,
+        )
+        raw_cache_key = (str(correction_raw_batch["raw_data_dir"][sample_index]), episode_id)
+        if raw_cache_key not in raw_cache:
+            raw_cache[raw_cache_key] = load_raw_episode(
+                correction_raw_batch["raw_data_dir"][sample_index],
+                episode_id,
+            )
+        correction = correction_builder.build(
+            latent_model=adapter,
+            image_t=correction_raw_batch["image_t"][sample_index].to(device),
+            qpos_t=correction_raw_batch["qpos_t"][sample_index].to(device),
+            raw_data=raw_cache[raw_cache_key],
+            norm_stats=norm_stats,
+            start_ts=int(correction_raw_batch["start_ts"][sample_index].item()),
+            failure_mode_override="train",
+            sampled_phase_id=int(correction_raw_batch["sampled_phase_id"][sample_index].item()),
+            sampled_phase_bin_id=int(correction_raw_batch["sampled_phase_bin_id"][sample_index].item()),
+            sampled_phase_instance_id=int(correction_raw_batch["sampled_phase_instance_id"][sample_index].item()),
+            forced_error_mode_id=int(correction_raw_batch["forced_error_mode_id"][sample_index].item()),
+            sampled_active_arm_pattern_id=int(correction_raw_batch["sampled_active_arm_pattern_id"][sample_index].item()),
+            forced_dir_bin_id=int(correction_raw_batch["forced_dir_bin_id"][sample_index].item()),
+            forced_mag_bin_id=int(correction_raw_batch["forced_mag_bin_id"][sample_index].item()),
+            sampled_mode_prob=float(correction_raw_batch["sampled_mode_prob"][sample_index].item()),
+            sampled_entry_prob_within_mode=float(correction_raw_batch["sampled_entry_prob_within_mode"][sample_index].item()),
+            sampled_unit_prob=float(correction_raw_batch["sampled_unit_prob"][sample_index].item()),
+            debug_dir=(None if step_debug_dir is None else str(Path(step_debug_dir) / f"bi{sample_index}")),
+            precomputed_action_chunk_norm=correction_raw_batch["act_action_chunk"][sample_index],
+        )
+        if correction is None:
+            skip_meta = correction_builder.pop_last_skip_meta()
+            skip_reason = "unknown_skip"
+            if isinstance(skip_meta, dict) and skip_meta.get("skip_reason") is not None:
+                skip_reason = str(skip_meta["skip_reason"]).strip() or "unknown_skip"
+            skip_reasons[skip_reason] += 1
+            continue
+        if correction["corr_image"] is None or correction["corr_qpos_norm"] is None or correction["corr_action_chunk_norm"] is None:
+            skip_reasons["missing_correction_targets"] += 1
+            continue
+
+        corr_qpos_raw = correction["corr_qpos_norm"] * qpos_std + qpos_mean
+        corr_action_raw = correction["corr_action_chunk_norm"] * action_std.view(1, -1) + action_mean.view(1, -1)
+        corr_image = correction["corr_image"]
+        if corr_image.ndim != 4 or int(corr_image.shape[0]) != 1:
+            raise ValueError(f"Expected single-camera correction image, got {tuple(corr_image.shape)}")
+        smolvla_batch = build_smolvla_batch_from_raw_sample(
+            latent_policy=latent_model,
+            preprocess=preprocess,
+            instruction_type=instruction_type,
+            task_name_full=task_name_full,
+            image_t=corr_image.detach().cpu(),
+            qpos_raw=corr_qpos_raw.detach().cpu(),
+            action_chunk_raw=corr_action_raw.detach().cpu(),
+            episode_id=episode_id,
+        )
+        samples.append(smolvla_batch)
+        future_images.append(corr_image[0].detach().cpu())
+        if correction["error_action_prefix_norm"] is not None:
+            action_prefix.append(correction["error_action_prefix_norm"][None, ...])
+        else:
+            action_prefix.append(smolvla_batch["action"][:, : int(args.prefix_steps), :])
+    return samples, future_images, action_prefix, skip_reasons
+
+
 def run_stage1(args: argparse.Namespace) -> None:
     accelerator = build_accelerator()
     is_main = bool(accelerator.is_main_process)
@@ -407,19 +554,65 @@ def run_stage1(args: argparse.Namespace) -> None:
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
     )
+    failure_mode = str(args.failure_mode).strip().lower()
+    use_failure_corr_loader = bool(failure_mode == "train")
+    if use_failure_corr_loader:
+        if not str(args.failure_table_paths_json).strip():
+            raise ValueError("stage1 failure_mode=train requires --failure_table_paths_json")
+        for path_arg, name in (
+            (args.urdf_path, "urdf_path"),
+            (args.curobo_left_yml, "curobo_left_yml"),
+            (args.curobo_right_yml, "curobo_right_yml"),
+        ):
+            if not str(path_arg).strip():
+                raise ValueError(f"stage1 failure_mode=train requires --{name}")
+        failure_table_paths = load_failure_table_paths(args.failure_table_paths_json)
+        corr_batch_size = int(max(1, round(float(args.batch_size) * float(args.failure_corr_batch_ratio))))
+        failure_cfg = MultiTaskFailureDatasetConfig(
+            act_chunk_size=int(args.act_chunk_size),
+            prefix_steps=int(args.prefix_steps),
+            future_offset=int(args.future_offset),
+            sample_phase_window_len=int(args.sample_phase_window_len),
+            start_margin=int(args.start_margin),
+            failure_table_paths={str(key): str(value) for key, value in failure_table_paths.items()},
+            failure_phase_bins=int(args.failure_phase_bins),
+            failure_translation_dir_bins=int(args.failure_translation_dir_bins),
+            failure_translation_mag_bins=int(args.failure_translation_mag_bins),
+            failure_rotation_dir_bins=int(args.failure_rotation_dir_bins),
+            failure_rotation_mag_bins=int(args.failure_rotation_mag_bins),
+            failure_explore_k=int(args.failure_explore_k),
+        )
+        correction_dataset, norm_stats = build_multitask_failure_dataset(
+            task_specs=task_specs,
+            config=failure_cfg,
+            mode="train",
+        )
+        correction_loader = DataLoader(
+            correction_dataset,
+            batch_size=corr_batch_size,
+            shuffle=True,
+            num_workers=int(args.num_workers),
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+        )
+    else:
+        failure_table_paths = {}
+        correction_dataset = None
+        correction_loader = None
+        norm_stats = dataset.stats if hasattr(dataset, "stats") else None
 
     base_policy, preprocess = build_base_policy(args)
     model = SmolVLALatentPolicy(
         base_policy=base_policy,
         bridge_cfg=build_bridge_config(args),
-        warmup_cfg=build_warmup_config(args),
+        warmup_cfg=build_stage1_warmup_config(args),
     )
     model.to(torch.device(args.device))
     teacher = EvacLatentTeacher(
         evac_ckpt=args.evac_ckpt,
         evac_config=args.evac_config,
         device=args.device,
-        load_rollout_model=False,
+        load_rollout_model=use_failure_corr_loader,
     )
 
     initialize_latent_policy_from_sample(
@@ -429,16 +622,48 @@ def run_stage1(args: argparse.Namespace) -> None:
         raw_sample=dataset[0],
         teacher=teacher,
     )
+    correction_builder = None
+    if use_failure_corr_loader:
+        correction_builder = ACTAlignedCorrectionBuilder(
+            cfg=build_act_aligned_cfg_from_args(args, max_action_len=int(args.act_chunk_size)),
+            urdf_path=args.urdf_path,
+            curobo_left_yml=args.curobo_left_yml,
+            curobo_right_yml=args.curobo_right_yml,
+            device=args.device,
+            shared_evac_model=teacher.model,
+            shared_evac_config=teacher.cfg,
+        )
+
     optimizer_cfg, optimizer, lr_scheduler = configure_optimizer(
         model=model,
         args=args,
         total_training_steps=int(args.max_steps),
     )
-    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(model, optimizer, dataloader, lr_scheduler)
+    if use_failure_corr_loader:
+        model, optimizer, dataloader, correction_loader, lr_scheduler = accelerator.prepare(
+            model, optimizer, dataloader, correction_loader, lr_scheduler
+        )
+    else:
+        model, optimizer, dataloader, lr_scheduler = accelerator.prepare(model, optimizer, dataloader, lr_scheduler)
     latent_model = accelerator.unwrap_model(model)
     if is_main:
         save_train_args(output_dir, args)
 
+    correction_iter = iter(correction_loader) if use_failure_corr_loader else None
+    raw_cache: dict[tuple[str, int], dict[str, Any]] = {}
+    skip_reason_counter: Counter[str] = Counter()
+    debug_wm = bool(getattr(args, "debug_wm_correction", False))
+    debug_wm_all_ranks = bool(getattr(args, "debug_wm_all_ranks", False))
+    debug_wm_root = (output_dir / "debug_wm") if debug_wm else None
+    debug_wm_dir = None
+    if debug_wm_root is not None:
+        debug_wm_dir = (
+            debug_wm_root / f"rank{int(accelerator.process_index):02d}"
+            if debug_wm_all_ranks else debug_wm_root
+        )
+    debug_wm_should_save = bool(debug_wm_dir is not None and (debug_wm_all_ranks or accelerator.is_main_process))
+    if debug_wm_should_save:
+        debug_wm_dir.mkdir(parents=True, exist_ok=True)
     global_step, epoch = resume_training_checkpoint(
         checkpoint_path=str(args.resume_ckpt),
         model=latent_model,
@@ -450,31 +675,49 @@ def run_stage1(args: argparse.Namespace) -> None:
     try:
         while global_step < max_steps:
             for raw_batch in dataloader:
-                samples = []
-                future_images = []
-                action_prefix = []
-                for batch_index in range(raw_batch["image_t"].shape[0]):
-                    task_name = raw_batch["task_name"][batch_index]
-                    task_only, task_config = parse_task_parts(task_name)
-                    sample = build_smolvla_batch(
-                        policy=latent_model.base_policy,
+                samples, future_images, action_prefix = build_stage1_samples_from_raw_batch(
+                    raw_batch=raw_batch,
+                    latent_model=latent_model,
+                    preprocess=preprocess,
+                    instruction_type=args.instruction_type,
+                    prefix_steps=int(args.prefix_steps),
+                )
+                if use_failure_corr_loader:
+                    assert correction_iter is not None
+                    assert correction_builder is not None
+                    assert norm_stats is not None
+                    try:
+                        correction_raw_batch = next(correction_iter)
+                    except StopIteration:
+                        correction_iter = iter(correction_loader)
+                        correction_raw_batch = next(correction_iter)
+                    step_debug_dir = None
+                    if debug_wm_should_save:
+                        step_debug_dir = str(debug_wm_dir / f"step_{global_step:06d}")
+                        Path(step_debug_dir).mkdir(parents=True, exist_ok=True)
+                    corr_samples, corr_future_images, corr_action_prefix, corr_skip_reasons = build_stage1_correction_samples(
+                        correction_raw_batch=correction_raw_batch,
+                        latent_model=latent_model,
                         preprocess=preprocess,
-                        image_t=raw_batch["image_t"][batch_index],
-                        qpos_raw=raw_batch["qpos_raw"][batch_index],
-                        action_chunk_raw=raw_batch["act_action_chunk_raw"][batch_index],
-                        task_name=task_only,
-                        task_config=task_config,
-                        episode_id=int(raw_batch["episode_id"][batch_index].item()),
                         instruction_type=args.instruction_type,
+                        args=args,
+                        correction_builder=correction_builder,
+                        teacher=teacher,
+                        norm_stats=norm_stats,
+                        raw_cache=raw_cache,
+                        step_debug_dir=step_debug_dir,
                     )
-                    samples.append(sample)
-                    future_images.append(raw_batch["image_t_future"][batch_index, 0])
-                    action_prefix.append(sample["action"][:, : int(args.prefix_steps), :])
+                    skip_reason_counter.update(corr_skip_reasons)
+                    samples.extend(corr_samples)
+                    future_images.extend(corr_future_images)
+                    action_prefix.extend(corr_action_prefix)
+                    if not corr_samples:
+                        continue
 
                 batch = stack_smolvla_batches(samples)
                 future_image_tensor = torch.stack(future_images, dim=0).to(device=accelerator.device, dtype=torch.float32)
                 future_teacher_latent = teacher.encode_image(future_image_tensor)
-                action_prefix_tensor = torch.cat(action_prefix, dim=0)
+                action_prefix_tensor = torch.cat(action_prefix, dim=0).to(device=accelerator.device)
 
                 output = model(
                     train_stage="stage1",
@@ -507,6 +750,8 @@ def run_stage1(args: argparse.Namespace) -> None:
                     beta_cond=f"{output.beta_condition:.4f}",
                     beta=f"{output.beta_dynamics:.4f}",
                     lr=f"{current_lr:.2e}",
+                    corr=(len(samples) - int(raw_batch["image_t"].shape[0])),
+                    skip=(skip_reason_counter.most_common(1)[0][0] if skip_reason_counter else "none"),
                     step=global_step,
                 )
                 global_step += 1
@@ -522,6 +767,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                         extra_state={
                             "norm_stats": dataset.stats if hasattr(dataset, "stats") else None,
                             "target_hw": latent_model.target_hw,
+                            "failure_table_paths": failure_table_paths,
                             "epoch": epoch,
                             "args": vars(args),
                         },
@@ -540,6 +786,7 @@ def run_stage1(args: argparse.Namespace) -> None:
                 extra_state={
                     "norm_stats": dataset.stats if hasattr(dataset, "stats") else None,
                     "target_hw": latent_model.target_hw,
+                    "failure_table_paths": failure_table_paths,
                     "epoch": epoch,
                     "args": vars(args),
                 },
@@ -589,7 +836,6 @@ def run_stage2(args: argparse.Namespace) -> None:
         prefix_steps=int(args.prefix_steps),
         future_offset=int(args.future_offset),
         sample_phase_window_len=int(args.sample_phase_window_len),
-        sample_skip_head_ratio=float(args.sample_skip_head_ratio),
         start_margin=int(args.start_margin),
         failure_table_paths={str(key): str(value) for key, value in failure_table_paths.items()},
         failure_phase_bins=int(args.failure_phase_bins),
@@ -706,6 +952,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                     adapter = SampleBoundSmolVLAAdapter(
                         latent_policy=latent_model,
                         preprocess=preprocess,
+                        postprocess=postprocess,
                         task_name=task_only,
                         task_config=task_config,
                         episode_id=episode_id,
@@ -726,8 +973,6 @@ def run_stage2(args: argparse.Namespace) -> None:
                         start_ts=int(correction_raw_batch["start_ts"][sample_index].item()),
                         failure_mode_override="train",
                         sampled_phase_id=int(correction_raw_batch["sampled_phase_id"][sample_index].item()),
-                        pregrasp_seg_start=int(correction_raw_batch["pregrasp_seg_start"][sample_index].item()),
-                        pregrasp_seg_end=int(correction_raw_batch["pregrasp_seg_end"][sample_index].item()),
                         sampled_phase_bin_id=int(correction_raw_batch["sampled_phase_bin_id"][sample_index].item()),
                         sampled_phase_instance_id=int(correction_raw_batch["sampled_phase_instance_id"][sample_index].item()),
                         forced_error_mode_id=int(correction_raw_batch["forced_error_mode_id"][sample_index].item()),

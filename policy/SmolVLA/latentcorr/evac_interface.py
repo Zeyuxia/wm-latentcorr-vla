@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SMOLVLA_EVAC_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", "evac"))
+_SMOLVLA_EVAC_MODULE_ROOT = os.path.join(_SMOLVLA_EVAC_ROOT, "evac")
+
 
 class EvacLatentTeacher:
     """
@@ -33,6 +37,18 @@ class EvacLatentTeacher:
         for param in self.model.parameters():
             param.requires_grad = False
 
+    @staticmethod
+    def _resolve_dataset_name_from_cfg(cfg: Any, dataset_name: str | None = None) -> str:
+        if dataset_name:
+            return str(dataset_name)
+        try:
+            domains = cfg.data.params.train.params.domains
+            if domains and len(domains) > 0:
+                return str(domains[0])
+        except Exception:
+            pass
+        return "agibotworld"
+
     def _load_model(self, evac_ckpt: str, evac_config: str, load_rollout_model: bool) -> tuple[Any, Any]:
         if not os.path.exists(evac_ckpt):
             raise FileNotFoundError(f"EVAC checkpoint not found: {evac_ckpt}")
@@ -44,9 +60,15 @@ class EvacLatentTeacher:
 
         evac_pkg_root = os.path.realpath(os.path.join(os.path.dirname(evac_config), "..", ".."))
         evac_module_root = os.path.join(evac_pkg_root, "evac")
-        for path in (evac_module_root, evac_pkg_root):
-            if path not in sys.path:
-                sys.path.insert(0, path)
+        for path in (evac_pkg_root, evac_module_root, _SMOLVLA_EVAC_ROOT, _SMOLVLA_EVAC_MODULE_ROOT):
+            if path in sys.path:
+                sys.path.remove(path)
+        # Prefer the vendored EVAC package used by SmolVLA. It carries the
+        # RobotWin domain statistics required by this explore pipeline. EVAC
+        # also imports bare `utils.*`/`lvdm.*`, so keep its module root too.
+        sys.path.insert(0, evac_pkg_root)
+        sys.path.insert(0, _SMOLVLA_EVAC_ROOT)
+        sys.path.insert(0, _SMOLVLA_EVAC_MODULE_ROOT)
 
         from evac.utils.general_utils import instantiate_from_config, load_checkpoints  # noqa: WPS433
 
@@ -107,7 +129,7 @@ class EvacLatentTeacher:
         raw_data: dict[str, Any],
         fk,
         ddim_steps: int = 27,
-        dataset_name: str = "agibotworld",
+        dataset_name: str | None = None,
         inference_dtype: torch.dtype = torch.float16,
     ) -> dict[str, torch.Tensor | int]:
         from einops import rearrange
@@ -129,6 +151,7 @@ class EvacLatentTeacher:
         if action_prefix_raw.ndim != 2:
             raise ValueError(f"action_prefix_raw must be (K,14), got {tuple(action_prefix_raw.shape)}")
 
+        dataset_name = self._resolve_dataset_name_from_cfg(self.cfg, dataset_name)
         chunk = int(self.cfg.chunk)
         n_previous = int(self.cfg.n_previous)
         n_valid = int(action_prefix_raw.shape[0])
@@ -180,10 +203,11 @@ class EvacLatentTeacher:
 
         action_abs = torch.from_numpy(action_abs).float()
         delta_action = torch.from_numpy(delta_action).float()
+        sep = 2.0
         stat_mean = torch.tensor(StatisticInfo[dataset_name]["mean"]).unsqueeze(0)
         stat_std = torch.tensor(StatisticInfo[dataset_name]["std"]).unsqueeze(0)
-        delta_action[:, :6] = (delta_action[:, :6] - stat_mean[:, :6]) / stat_std[:, :6]
-        delta_action[:, 7:13] = (delta_action[:, 7:13] - stat_mean[:, 6:]) / stat_std[:, 6:]
+        delta_action[:, :6] = (delta_action[:, :6] - sep * stat_mean[:, :6]) / (sep * stat_std[:, :6])
+        delta_action[:, 7:13] = (delta_action[:, 7:13] - sep * stat_mean[:, 6:]) / (sep * stat_std[:, 6:])
 
         h_native, w_native = raw_data["native_resolution"]
         img_rgb = curr_image[[2, 1, 0]]
@@ -269,12 +293,14 @@ class EvacLatentTeacher:
         raw_data: list[dict[str, Any]] | dict[str, Any],
         fk,
         ddim_steps: int = 27,
-        dataset_name: str = "agibotworld",
+        dataset_name: str | None = None,
         inference_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         if not self.load_rollout_model:
             raise RuntimeError("rollout_latent_from_actions_batch requires load_rollout_model=True")
         from evac.lvdm.data.domain_table import DomainTable
+
+        dataset_name = self._resolve_dataset_name_from_cfg(self.cfg, dataset_name)
 
         if curr_image.ndim == 3:
             curr_image = curr_image.unsqueeze(0)
@@ -408,7 +434,7 @@ class EvacLatentTeacher:
         raw_data: dict[str, Any],
         fk,
         ddim_steps: int = 27,
-        dataset_name: str = "agibotworld",
+        dataset_name: str | None = None,
         inference_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         if not self.load_rollout_model:

@@ -9,12 +9,13 @@ from typing import Any
 import torch
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent
-SMOLVLA_SRC_DIR = REPO_ROOT / "src"
+PROJECT_ROOT = THIS_DIR.parents[2]
+SMOLVLA_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = SMOLVLA_ROOT / "src"
 if not SMOLVLA_SRC_DIR.is_dir():
     raise FileNotFoundError(f"SmolVLA src directory not found: {SMOLVLA_SRC_DIR}")
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SMOLVLA_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SMOLVLA_SRC_DIR))
 
@@ -25,7 +26,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 @lru_cache(maxsize=None)
 def _load_episode_instruction_table(dataset_name: str) -> list[dict[str, Any]]:
-    instruction_path = REPO_ROOT / "data" / dataset_name / "meta" / "episode_instructions.json"
+    instruction_path = SMOLVLA_ROOT / "data" / dataset_name / "meta" / "episode_instructions.json"
     if not instruction_path.is_file():
         raise FileNotFoundError(f"Instruction file not found: {instruction_path}")
     with open(instruction_path, "r", encoding="utf-8") as f:
@@ -37,7 +38,7 @@ def _load_episode_instruction_table(dataset_name: str) -> list[dict[str, Any]]:
 
 def _resolve_smolvla_dataset_name(task_name: str, task_config: str) -> str:
     dataset_name = f"robotwin_{task_name}_{task_config}_50_cam_high"
-    dataset_root = REPO_ROOT / "data" / dataset_name
+    dataset_root = SMOLVLA_ROOT / "data" / dataset_name
     if not dataset_root.is_dir():
         raise FileNotFoundError(f"SmolVLA dataset directory not found: {dataset_root}")
     return dataset_name

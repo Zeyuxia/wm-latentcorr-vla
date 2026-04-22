@@ -10,6 +10,18 @@ import numpy as np
 import torch
 
 
+def resolve_evac_dataset_name(evac_cfg, dataset_name=None):
+    if dataset_name:
+        return str(dataset_name)
+    try:
+        domains = evac_cfg.data.params.train.params.domains
+        if domains and len(domains) > 0:
+            return str(domains[0])
+    except Exception:
+        pass
+    return "agibotworld"
+
+
 def find_nearest_traj_point(
     fk_left_pos,
     fk_left_quat,
@@ -79,12 +91,14 @@ def evac_inference(
     save_dir=None,
     ddim_steps=27,
     infer_kwargs=None,
+    dataset_name=None,
 ):
     import cv2
     import torchvision.transforms as tvt
     from evac.lvdm.data.get_actions import get_actions
     from evac.lvdm.data.statistics import StatisticInfo
 
+    dataset_name = resolve_evac_dataset_name(evac_cfg, dataset_name)
     chunk = evac_cfg.chunk
     n_prev = evac_cfg.n_previous
     n_states = len(fk_poses)
@@ -119,10 +133,11 @@ def evac_inference(
     )
     action = torch.FloatTensor(action)
     delta_action = torch.FloatTensor(delta_action)
-    mean_v = torch.tensor(StatisticInfo["agibotworld"]["mean"]).unsqueeze(0)
-    std_v = torch.tensor(StatisticInfo["agibotworld"]["std"]).unsqueeze(0)
-    delta_action[:, :6] = (delta_action[:, :6] - mean_v[:, :6]) / std_v[:, :6]
-    delta_action[:, 7:13] = (delta_action[:, 7:13] - mean_v[:, 6:]) / std_v[:, 6:]
+    sep = 2.0
+    mean_v = torch.tensor(StatisticInfo[dataset_name]["mean"]).unsqueeze(0)
+    std_v = torch.tensor(StatisticInfo[dataset_name]["std"]).unsqueeze(0)
+    delta_action[:, :6] = (delta_action[:, :6] - sep * mean_v[:, :6]) / (sep * std_v[:, :6])
+    delta_action[:, 7:13] = (delta_action[:, 7:13] - sep * mean_v[:, 6:]) / (sep * std_v[:, 6:])
 
     ext_cv = raw_data["extrinsic_cv"]
     w2c = np.eye(4, dtype=np.float32)
@@ -165,7 +180,7 @@ def evac_inference(
                     unconditional_guidance_scale=1.0,
                     guidance_rescale=0.7,
                     ddim_steps=ddim_steps,
-                    dataset_name="agibotworld",
+                    dataset_name=dataset_name,
                     saving_video=(save_dir is not None),
                     saving_fps=30,
                     video_dir=target_dir,

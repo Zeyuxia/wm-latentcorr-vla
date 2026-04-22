@@ -138,6 +138,8 @@ FAILURE_ROTATION_MAG_BINS=${FAILURE_ROTATION_MAG_BINS:-3}
 FAILURE_EXPLORE_K=${FAILURE_EXPLORE_K:-4}
 FAILURE_FAIL_RECOVER_RATE_THRESH=${FAILURE_FAIL_RECOVER_RATE_THRESH:-0.5}
 FAILURE_SAMPLE_SKIP_HEAD_RATIO=${FAILURE_SAMPLE_SKIP_HEAD_RATIO:-0.6}
+EXPLORE_DEBUG_MAX_SAMPLES=${EXPLORE_DEBUG_MAX_SAMPLES:-0}
+EXPLORE_DEBUG_DIR=${EXPLORE_DEBUG_DIR:-}
 STAGE2_LATENT_CACHE_DIR=${STAGE2_LATENT_CACHE_DIR:-}
 STAGE2_LATENT_CACHE_STRICT=${STAGE2_LATENT_CACHE_STRICT:-false}
 STAGE2_LATENT_CACHE_WRITEBACK=${STAGE2_LATENT_CACHE_WRITEBACK:-true}
@@ -209,6 +211,10 @@ fi
 if [ -n "${STAGE2_LATENT_CACHE_DIR}" ]; then
   EXTRA_ARGS+=(--stage2_latent_cache_dir "${STAGE2_LATENT_CACHE_DIR}")
 fi
+IS_MULTITASK=false
+if [ -n "${MULTI_TASK_NAMES}" ]; then
+  IS_MULTITASK=true
+fi
 
 if [ -z "${VULKAN_ICD_JSON}" ]; then
   if [ -f /etc/vulkan/icd.d/nvidia_icd.json ]; then
@@ -223,6 +229,130 @@ if [ -n "${VULKAN_ICD_JSON}" ] && [ -f "${VULKAN_ICD_JSON}" ]; then
 fi
 export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
 
+CMD_ARGS=(
+  --task_name "${TASK_NAME}"
+  --output_dir "${OUTPUT_DIR}"
+  --evac_ckpt "${EVAC_CKPT}"
+  --evac_config "${EVAC_CONFIG}"
+  --urdf_path "${URDF_PATH}"
+  --device cuda:0
+  --num_epochs "${NUM_EPOCHS}"
+  --max_steps "${MAX_STEPS}"
+  --batch_size "${BATCH_SIZE}"
+  --correction_batch_size "${CORRECTION_BATCH_SIZE}"
+  --num_workers "${NUM_WORKERS}"
+  --lr "${LR}"
+  --weight_decay "${WEIGHT_DECAY}"
+  --save_freq "${SAVE_FREQ}"
+  --prefix_steps "${PREFIX_STEPS}"
+  --act_chunk_size "${ACT_CHUNK_SIZE}"
+  --future_offset "${FUTURE_OFFSET}"
+  --max_rollout_steps "${MAX_ROLLOUT_STEPS}"
+  --lambda_align "${LAMBDA_ALIGN}"
+  --beta_dynamics_max "${BETA_DYNAMICS_MAX}"
+  --lambda_wm_action_current "${LAMBDA_WM_ACTION_CURRENT}"
+  --lambda_wm_action_future "${LAMBDA_WM_ACTION_FUTURE}"
+  --lambda_bridge_future "${LAMBDA_BRIDGE_FUTURE}"
+  --dyn_zero_steps "${DYN_ZERO_STEPS}"
+  --dyn_ramp_steps "${DYN_RAMP_STEPS}"
+  --dyn_warmup_curve "${DYN_WARMUP_CURVE}"
+  --dyn_schedule_unit "${DYN_SCHEDULE_UNIT}"
+  --reference_global_batch_size "${REFERENCE_GLOBAL_BATCH_SIZE}"
+  --projector_mid_channels "${PROJECTOR_MID_CHANNELS}"
+  --wm_adapter_mid_channels "${WM_ADAPTER_MID_CHANNELS}"
+  --readout_adapter_mid_channels "${READOUT_ADAPTER_MID_CHANNELS}"
+  --predictor_num_blocks "${PREDICTOR_NUM_BLOCKS}"
+  --ddim_steps "${DDIM_STEPS}"
+  --retain_weight "${RETAIN_WEIGHT}"
+  --retain_decay_start_epoch "${RETAIN_DECAY_START_EPOCH}"
+  --retain_decay_end_epoch "${RETAIN_DECAY_END_EPOCH}"
+  --retain_decay_curve "${RETAIN_DECAY_CURVE}"
+  --bridge_weight "${BRIDGE_WEIGHT}"
+  --freeze_base_act "${FREEZE_BASE_ACT}"
+  --detach_act_feature_for_latent "${DETACH_ACT_FEATURE_FOR_LATENT}"
+  --use_act_head_correction "${USE_ACT_HEAD_CORRECTION}"
+  --planner_target_mode "${PLANNER_TARGET_MODE}"
+  --planner_target_lookahead_steps "${PLANNER_TARGET_LOOKAHEAD_STEPS}"
+  --planner_orient_weight "${PLANNER_ORIENT_WEIGHT}"
+  --planner_gripper_penalty "${PLANNER_GRIPPER_PENALTY}"
+  --planner_nearest_window_radius "${PLANNER_NEAREST_WINDOW_RADIUS}"
+  --planner_active_joint_delta_thresh "${PLANNER_ACTIVE_JOINT_DELTA_THRESH}"
+  --planner_active_gripper_delta_thresh "${PLANNER_ACTIVE_GRIPPER_DELTA_THRESH}"
+  --planner_gripper_switch_ratio "${PLANNER_GRIPPER_SWITCH_RATIO}"
+  --planner_interp_fallback "${PLANNER_INTERP_FALLBACK}"
+  --planner_warmup "${PLANNER_WARMUP}"
+  --correction_interp_nearest_enable "${CORRECTION_INTERP_NEAREST_ENABLE}"
+  --correction_interp_prefix_ratio "${CORRECTION_INTERP_PREFIX_RATIO}"
+  --correction_builder_mode "${CORRECTION_BUILDER_MODE}"
+  --act_aligned_rollout_exec_steps "${ACT_ALIGNED_ROLLOUT_EXEC_STEPS}"
+  --act_aligned_min_dist_fallback_force_correction "${ACT_ALIGNED_MIN_DIST_FALLBACK_FORCE_CORRECTION}"
+  --act_aligned_min_dist_recover_ratio "${ACT_ALIGNED_MIN_DIST_RECOVER_RATIO}"
+  --act_aligned_real_error_trigger_enable "${ACT_ALIGNED_REAL_ERROR_TRIGGER_ENABLE}"
+  --act_aligned_real_error_min_dist_thresh "${ACT_ALIGNED_REAL_ERROR_MIN_DIST_THRESH}"
+  --act_aligned_real_error_min_dist_delta_thresh "${ACT_ALIGNED_REAL_ERROR_MIN_DIST_DELTA_THRESH}"
+  --act_aligned_debug_recover_eval_rollout "${ACT_ALIGNED_DEBUG_RECOVER_EVAL_ROLLOUT}"
+  --act_aligned_debug_correction_evac_rollout "${ACT_ALIGNED_DEBUG_CORRECTION_EVAC_ROLLOUT}"
+  --recover_eval_enable "${RECOVER_EVAL_ENABLE}"
+  --recover_eval_save_video "${RECOVER_EVAL_SAVE_VIDEO}"
+  --recover_eval_gripper_open_thresh "${RECOVER_EVAL_GRIPPER_OPEN_THRESH}"
+  --recover_eval_pos_thresh_m "${RECOVER_EVAL_POS_THRESH_M}"
+  --recover_eval_rot_thresh_deg "${RECOVER_EVAL_ROT_THRESH_DEG}"
+  --recover_eval_nearest_window_radius "${RECOVER_EVAL_NEAREST_WINDOW_RADIUS}"
+  --recover_eval_video_bridge_steps "${RECOVER_EVAL_VIDEO_BRIDGE_STEPS}"
+  --act_aligned_correction_interp_nearest_enable "${ACT_ALIGNED_CORRECTION_INTERP_NEAREST_ENABLE}"
+  --act_aligned_correction_interp_prefix_ratio "${ACT_ALIGNED_CORRECTION_INTERP_PREFIX_RATIO}"
+  --act_aligned_correction_planner_prefix_ratio "${ACT_ALIGNED_CORRECTION_PLANNER_PREFIX_RATIO}"
+  --act_aligned_correction_gripper_close_prefix_ratio "${ACT_ALIGNED_CORRECTION_GRIPPER_CLOSE_PREFIX_RATIO}"
+  --act_aligned_correction_compose_gt_tail_enable "${ACT_ALIGNED_CORRECTION_COMPOSE_GT_TAIL_ENABLE}"
+  --act_aligned_correction_gripper_switch_ratio "${ACT_ALIGNED_CORRECTION_GRIPPER_SWITCH_RATIO}"
+  --act_aligned_recover_gripper_penalty "${ACT_ALIGNED_RECOVER_GRIPPER_PENALTY}"
+  --act_aligned_enable_perturb "${ACT_ALIGNED_ENABLE_PERTURB}"
+  --act_aligned_perturb_prob "${ACT_ALIGNED_PERTURB_PROB}"
+  --act_aligned_perturb_error_mode "${ACT_ALIGNED_PERTURB_ERROR_MODE}"
+  --act_aligned_perturb_open_laptop_pregrasp_close_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_CLOSE_PROB}"
+  --act_aligned_perturb_open_laptop_pregrasp_translation_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_TRANSLATION_PROB}"
+  --act_aligned_perturb_open_laptop_pregrasp_rotation_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_ROTATION_PROB}"
+  --act_aligned_perturb_eef_fail_gain "${ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN}"
+  --act_aligned_perturb_rot_max_deg "${ACT_ALIGNED_PERTURB_ROT_MAX_DEG}"
+  --act_aligned_perturb_mag_random "${ACT_ALIGNED_PERTURB_MAG_RANDOM}"
+  --act_aligned_perturb_mag_rand_min "${ACT_ALIGNED_PERTURB_MAG_RAND_MIN}"
+  --act_aligned_perturb_mag_rand_max "${ACT_ALIGNED_PERTURB_MAG_RAND_MAX}"
+  --act_aligned_perturb_reject_sampling_enable "${ACT_ALIGNED_PERTURB_REJECT_SAMPLING_ENABLE}"
+  --act_aligned_perturb_reject_max_trials "${ACT_ALIGNED_PERTURB_REJECT_MAX_TRIALS}"
+  --act_aligned_perturb_reject_dir_jitter_eps "${ACT_ALIGNED_PERTURB_REJECT_DIR_JITTER_EPS}"
+  --act_aligned_perturb_gripper_close_min "${ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN}"
+  --act_aligned_perturb_gripper_open_max "${ACT_ALIGNED_PERTURB_GRIPPER_OPEN_MAX}"
+  --act_aligned_perturb_gripper_fast_ratio "${ACT_ALIGNED_PERTURB_GRIPPER_FAST_RATIO}"
+  --act_aligned_sample_pregrasp_phase_window_len "${ACT_ALIGNED_SAMPLE_PREGRASP_PHASE_WINDOW_LEN}"
+  --act_aligned_sample_timeout_sec "${ACT_ALIGNED_SAMPLE_TIMEOUT_SEC}"
+  --failure_mode "${FAILURE_MODE}"
+  --failure_table_path "${FAILURE_TABLE_PATH}"
+  --failure_table_dir "${FAILURE_TABLE_DIR}"
+  --failure_phase_bins "${FAILURE_PHASE_BINS}"
+  --failure_translation_dir_bins "${FAILURE_TRANSLATION_DIR_BINS}"
+  --failure_translation_mag_bins "${FAILURE_TRANSLATION_MAG_BINS}"
+  --failure_rotation_dir_bins "${FAILURE_ROTATION_DIR_BINS}"
+  --failure_rotation_mag_bins "${FAILURE_ROTATION_MAG_BINS}"
+  --failure_explore_k "${FAILURE_EXPLORE_K}"
+  --failure_fail_recover_rate_thresh "${FAILURE_FAIL_RECOVER_RATE_THRESH}"
+  --failure_sample_skip_head_ratio "${FAILURE_SAMPLE_SKIP_HEAD_RATIO}"
+  --explore_debug_max_samples "${EXPLORE_DEBUG_MAX_SAMPLES}"
+  --explore_debug_dir "${EXPLORE_DEBUG_DIR}"
+  --stage2_latent_cache_strict "${STAGE2_LATENT_CACHE_STRICT}"
+  --stage2_latent_cache_writeback "${STAGE2_LATENT_CACHE_WRITEBACK}"
+  --act_like_loss_only "${ACT_LIKE_LOSS_ONLY}"
+  --use_wandb "${USE_WANDB}"
+  --wandb_project "${WANDB_PROJECT}"
+  --wandb_entity "${WANDB_ENTITY}"
+  --wandb_run_name "${WANDB_RUN_NAME}"
+  --wandb_group "${WANDB_GROUP}"
+  --wandb_mode "${WANDB_LOG_MODE}"
+)
+
+if [ "${IS_MULTITASK}" != true ]; then
+  CMD_ARGS+=(--raw_data_dir "${RAW_DATA_DIR}")
+fi
+
 OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} \
 MKL_NUM_THREADS=${MKL_NUM_THREADS:-1} \
 OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1} \
@@ -233,120 +363,5 @@ PYTHONUNBUFFERED=1 \
 "${TORCHRUN_BIN}" \
   "${TORCHRUN_ARGS[@]}" \
   -m policy.ACT_LatentCorr.train_stage2_latent \
-  --task_name "${TASK_NAME}" \
-  --output_dir "${OUTPUT_DIR}" \
-  --evac_ckpt "${EVAC_CKPT}" \
-  --evac_config "${EVAC_CONFIG}" \
-  --raw_data_dir "${RAW_DATA_DIR}" \
-  --urdf_path "${URDF_PATH}" \
-  --device cuda:0 \
-  --num_epochs "${NUM_EPOCHS}" \
-  --max_steps "${MAX_STEPS}" \
-  --batch_size "${BATCH_SIZE}" \
-  --correction_batch_size "${CORRECTION_BATCH_SIZE}" \
-  --num_workers "${NUM_WORKERS}" \
-  --lr "${LR}" \
-  --weight_decay "${WEIGHT_DECAY}" \
-  --save_freq "${SAVE_FREQ}" \
-  --prefix_steps "${PREFIX_STEPS}" \
-  --act_chunk_size "${ACT_CHUNK_SIZE}" \
-  --future_offset "${FUTURE_OFFSET}" \
-  --max_rollout_steps "${MAX_ROLLOUT_STEPS}" \
-  --lambda_align "${LAMBDA_ALIGN}" \
-  --beta_dynamics_max "${BETA_DYNAMICS_MAX}" \
-  --lambda_wm_action_current "${LAMBDA_WM_ACTION_CURRENT}" \
-  --lambda_wm_action_future "${LAMBDA_WM_ACTION_FUTURE}" \
-  --lambda_bridge_future "${LAMBDA_BRIDGE_FUTURE}" \
-  --dyn_zero_steps "${DYN_ZERO_STEPS}" \
-  --dyn_ramp_steps "${DYN_RAMP_STEPS}" \
-  --dyn_warmup_curve "${DYN_WARMUP_CURVE}" \
-  --dyn_schedule_unit "${DYN_SCHEDULE_UNIT}" \
-  --reference_global_batch_size "${REFERENCE_GLOBAL_BATCH_SIZE}" \
-  --projector_mid_channels "${PROJECTOR_MID_CHANNELS}" \
-  --wm_adapter_mid_channels "${WM_ADAPTER_MID_CHANNELS}" \
-  --readout_adapter_mid_channels "${READOUT_ADAPTER_MID_CHANNELS}" \
-  --predictor_num_blocks "${PREDICTOR_NUM_BLOCKS}" \
-  --ddim_steps "${DDIM_STEPS}" \
-  --retain_weight "${RETAIN_WEIGHT}" \
-  --retain_decay_start_epoch "${RETAIN_DECAY_START_EPOCH}" \
-  --retain_decay_end_epoch "${RETAIN_DECAY_END_EPOCH}" \
-  --retain_decay_curve "${RETAIN_DECAY_CURVE}" \
-  --bridge_weight "${BRIDGE_WEIGHT}" \
-  --freeze_base_act "${FREEZE_BASE_ACT}" \
-  --detach_act_feature_for_latent "${DETACH_ACT_FEATURE_FOR_LATENT}" \
-  --use_act_head_correction "${USE_ACT_HEAD_CORRECTION}" \
-  --planner_target_mode "${PLANNER_TARGET_MODE}" \
-  --planner_target_lookahead_steps "${PLANNER_TARGET_LOOKAHEAD_STEPS}" \
-  --planner_orient_weight "${PLANNER_ORIENT_WEIGHT}" \
-  --planner_gripper_penalty "${PLANNER_GRIPPER_PENALTY}" \
-  --planner_nearest_window_radius "${PLANNER_NEAREST_WINDOW_RADIUS}" \
-  --planner_active_joint_delta_thresh "${PLANNER_ACTIVE_JOINT_DELTA_THRESH}" \
-  --planner_active_gripper_delta_thresh "${PLANNER_ACTIVE_GRIPPER_DELTA_THRESH}" \
-  --planner_gripper_switch_ratio "${PLANNER_GRIPPER_SWITCH_RATIO}" \
-  --planner_interp_fallback "${PLANNER_INTERP_FALLBACK}" \
-  --planner_warmup "${PLANNER_WARMUP}" \
-  --correction_interp_nearest_enable "${CORRECTION_INTERP_NEAREST_ENABLE}" \
-  --correction_interp_prefix_ratio "${CORRECTION_INTERP_PREFIX_RATIO}" \
-  --correction_builder_mode "${CORRECTION_BUILDER_MODE}" \
-  --act_aligned_rollout_exec_steps "${ACT_ALIGNED_ROLLOUT_EXEC_STEPS}" \
-  --act_aligned_min_dist_fallback_force_correction "${ACT_ALIGNED_MIN_DIST_FALLBACK_FORCE_CORRECTION}" \
-  --act_aligned_min_dist_recover_ratio "${ACT_ALIGNED_MIN_DIST_RECOVER_RATIO}" \
-  --act_aligned_real_error_trigger_enable "${ACT_ALIGNED_REAL_ERROR_TRIGGER_ENABLE}" \
-  --act_aligned_real_error_min_dist_thresh "${ACT_ALIGNED_REAL_ERROR_MIN_DIST_THRESH}" \
-  --act_aligned_real_error_min_dist_delta_thresh "${ACT_ALIGNED_REAL_ERROR_MIN_DIST_DELTA_THRESH}" \
-  --act_aligned_debug_recover_eval_rollout "${ACT_ALIGNED_DEBUG_RECOVER_EVAL_ROLLOUT}" \
-  --act_aligned_debug_correction_evac_rollout "${ACT_ALIGNED_DEBUG_CORRECTION_EVAC_ROLLOUT}" \
-  --recover_eval_enable "${RECOVER_EVAL_ENABLE}" \
-  --recover_eval_save_video "${RECOVER_EVAL_SAVE_VIDEO}" \
-  --recover_eval_gripper_open_thresh "${RECOVER_EVAL_GRIPPER_OPEN_THRESH}" \
-  --recover_eval_pos_thresh_m "${RECOVER_EVAL_POS_THRESH_M}" \
-  --recover_eval_rot_thresh_deg "${RECOVER_EVAL_ROT_THRESH_DEG}" \
-  --recover_eval_nearest_window_radius "${RECOVER_EVAL_NEAREST_WINDOW_RADIUS}" \
-  --recover_eval_video_bridge_steps "${RECOVER_EVAL_VIDEO_BRIDGE_STEPS}" \
-  --act_aligned_correction_interp_nearest_enable "${ACT_ALIGNED_CORRECTION_INTERP_NEAREST_ENABLE}" \
-  --act_aligned_correction_interp_prefix_ratio "${ACT_ALIGNED_CORRECTION_INTERP_PREFIX_RATIO}" \
-  --act_aligned_correction_planner_prefix_ratio "${ACT_ALIGNED_CORRECTION_PLANNER_PREFIX_RATIO}" \
-  --act_aligned_correction_gripper_close_prefix_ratio "${ACT_ALIGNED_CORRECTION_GRIPPER_CLOSE_PREFIX_RATIO}" \
-  --act_aligned_correction_compose_gt_tail_enable "${ACT_ALIGNED_CORRECTION_COMPOSE_GT_TAIL_ENABLE}" \
-  --act_aligned_correction_gripper_switch_ratio "${ACT_ALIGNED_CORRECTION_GRIPPER_SWITCH_RATIO}" \
-  --act_aligned_recover_gripper_penalty "${ACT_ALIGNED_RECOVER_GRIPPER_PENALTY}" \
-  --act_aligned_enable_perturb "${ACT_ALIGNED_ENABLE_PERTURB}" \
-  --act_aligned_perturb_prob "${ACT_ALIGNED_PERTURB_PROB}" \
-  --act_aligned_perturb_error_mode "${ACT_ALIGNED_PERTURB_ERROR_MODE}" \
-  --act_aligned_perturb_open_laptop_pregrasp_close_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_CLOSE_PROB}" \
-  --act_aligned_perturb_open_laptop_pregrasp_translation_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_TRANSLATION_PROB}" \
-  --act_aligned_perturb_open_laptop_pregrasp_rotation_prob "${ACT_ALIGNED_PERTURB_OPEN_LAPTOP_PREGRASP_ROTATION_PROB}" \
-  --act_aligned_perturb_eef_fail_gain "${ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN}" \
-  --act_aligned_perturb_rot_max_deg "${ACT_ALIGNED_PERTURB_ROT_MAX_DEG}" \
-  --act_aligned_perturb_mag_random "${ACT_ALIGNED_PERTURB_MAG_RANDOM}" \
-  --act_aligned_perturb_mag_rand_min "${ACT_ALIGNED_PERTURB_MAG_RAND_MIN}" \
-  --act_aligned_perturb_mag_rand_max "${ACT_ALIGNED_PERTURB_MAG_RAND_MAX}" \
-  --act_aligned_perturb_reject_sampling_enable "${ACT_ALIGNED_PERTURB_REJECT_SAMPLING_ENABLE}" \
-  --act_aligned_perturb_reject_max_trials "${ACT_ALIGNED_PERTURB_REJECT_MAX_TRIALS}" \
-  --act_aligned_perturb_reject_dir_jitter_eps "${ACT_ALIGNED_PERTURB_REJECT_DIR_JITTER_EPS}" \
-  --act_aligned_perturb_gripper_close_min "${ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN}" \
-  --act_aligned_perturb_gripper_open_max "${ACT_ALIGNED_PERTURB_GRIPPER_OPEN_MAX}" \
-  --act_aligned_perturb_gripper_fast_ratio "${ACT_ALIGNED_PERTURB_GRIPPER_FAST_RATIO}" \
-  --act_aligned_sample_pregrasp_phase_window_len "${ACT_ALIGNED_SAMPLE_PREGRASP_PHASE_WINDOW_LEN}" \
-  --act_aligned_sample_timeout_sec "${ACT_ALIGNED_SAMPLE_TIMEOUT_SEC}" \
-  --failure_mode "${FAILURE_MODE}" \
-  --failure_table_path "${FAILURE_TABLE_PATH}" \
-  --failure_table_dir "${FAILURE_TABLE_DIR}" \
-  --failure_phase_bins "${FAILURE_PHASE_BINS}" \
-  --failure_translation_dir_bins "${FAILURE_TRANSLATION_DIR_BINS}" \
-  --failure_translation_mag_bins "${FAILURE_TRANSLATION_MAG_BINS}" \
-  --failure_rotation_dir_bins "${FAILURE_ROTATION_DIR_BINS}" \
-  --failure_rotation_mag_bins "${FAILURE_ROTATION_MAG_BINS}" \
-  --failure_explore_k "${FAILURE_EXPLORE_K}" \
-  --failure_fail_recover_rate_thresh "${FAILURE_FAIL_RECOVER_RATE_THRESH}" \
-  --failure_sample_skip_head_ratio "${FAILURE_SAMPLE_SKIP_HEAD_RATIO}" \
-  --stage2_latent_cache_strict "${STAGE2_LATENT_CACHE_STRICT}" \
-  --stage2_latent_cache_writeback "${STAGE2_LATENT_CACHE_WRITEBACK}" \
-  --act_like_loss_only "${ACT_LIKE_LOSS_ONLY}" \
-  --use_wandb "${USE_WANDB}" \
-  --wandb_project "${WANDB_PROJECT}" \
-  --wandb_entity "${WANDB_ENTITY}" \
-  --wandb_run_name "${WANDB_RUN_NAME}" \
-  --wandb_group "${WANDB_GROUP}" \
-  --wandb_mode "${WANDB_LOG_MODE}" \
+  "${CMD_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"

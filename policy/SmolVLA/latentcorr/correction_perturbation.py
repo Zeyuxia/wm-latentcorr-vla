@@ -93,6 +93,26 @@ def _eef_forward_dir_from_wxyz(quat_wxyz):
         pass
     return np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
+
+def _eef_local_axis_from_wxyz(quat_wxyz, local_axis, fallback_axis):
+    q = np.asarray(quat_wxyz, dtype=np.float32).reshape(4,)
+    if not np.all(np.isfinite(q)):
+        return np.asarray(fallback_axis, dtype=np.float32)
+    n = float(np.linalg.norm(q))
+    if n < 1e-8:
+        return np.asarray(fallback_axis, dtype=np.float32)
+    q = q / n
+    q_xyzw = np.array([q[1], q[2], q[3], q[0]], dtype=np.float32)
+    try:
+        from scipy.spatial.transform import Rotation as R
+        axis = R.from_quat(q_xyzw).apply(np.asarray(local_axis, dtype=np.float32))
+        uv = _unit_vec3(axis)
+        if uv is not None:
+            return uv.astype(np.float32)
+    except Exception:
+        pass
+    return np.asarray(fallback_axis, dtype=np.float32)
+
 def _sample_in_forward_hemisphere(forward_dir):
     """Sample a random unit direction on the forward hemisphere around forward_dir."""
     fwd = _unit_vec3(forward_dir)
@@ -171,12 +191,44 @@ def _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir, theta_deg=60.0)
 
 def _translation_dir_from_bin(quat_wxyz, dir_bin_id):
     n = int(max(1, get_failure_param_bins()["translation_dir_bins"]))
-    return _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir=n, theta_deg=60.0)
+    del quat_wxyz
+    dirs = (
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        np.array([0.0, -1.0, 0.0], dtype=np.float32),
+        np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        np.array([0.0, 0.0, -1.0], dtype=np.float32),
+    )
+    idx = int(np.clip(int(dir_bin_id), 0, min(n, len(dirs)) - 1))
+    return dirs[idx].copy(), idx
 
 
 def _rotation_axis_from_bin(quat_wxyz, dir_bin_id):
+    # Six orientation directions: +/- roll, +/- yaw, +/- pitch in gripper-local axes.
+    # Local axes are mapped as roll=X, yaw=Z, pitch=Y.
+    axes = (
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),
+    )
     n = int(max(1, get_failure_param_bins()["rotation_dir_bins"]))
-    return _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir=n, theta_deg=60.0)
+    idx = int(np.clip(int(dir_bin_id), 0, min(n, len(axes)) - 1))
+    axis = _eef_local_axis_from_wxyz(
+        quat_wxyz,
+        local_axis=axes[idx],
+        fallback_axis=axes[idx],
+    )
+    return np.asarray(axis, dtype=np.float32), idx
+
+
+def _rotation_sign_from_bin(dir_bin_id, n_dir):
+    n = int(max(1, int(n_dir)))
+    idx = int(np.clip(int(dir_bin_id), 0, n - 1))
+    return (1.0 if idx % 2 == 0 else -1.0), idx
 
 def _perturb_action_chunk_target_pose(
     act_raw, cfg, fk, planner_l, planner_r,
@@ -225,7 +277,7 @@ def _perturb_action_chunk_target_pose(
         n_mag = int(max(1, bin_cfg["rotation_mag_bins"]))
         dir_bin_id = int(np.clip(int(forced_dir_bin_id), 0, n_dir - 1))
         mag_bin_id = int(np.clip(int(forced_mag_bin_id), 0, n_mag - 1))
-        axis_bin_id = int(dir_bin_id)
+        _, axis_bin_id = _rotation_sign_from_bin(dir_bin_id, n_dir)
     else:
         n_dir = 0
         n_mag = 0
@@ -248,7 +300,8 @@ def _perturb_action_chunk_target_pose(
             mag_bin_id,
             n_mag,
         )
-        angle = np.deg2rad(angle_max_deg)
+        rot_sign, _ = _rotation_sign_from_bin(dir_bin_id, n_dir)
+        angle = np.deg2rad(angle_max_deg) * float(rot_sign)
         sampled_rotation_deg = float(angle_max_deg)
         axis_l = None
         axis_r = None
@@ -276,7 +329,7 @@ def _perturb_action_chunk_target_pose(
     elif mode == "translation":
         # Translate from the same sampled-start target pose.
         fail_gain, _ = _mag_value_from_bin(
-            float(cfg.get("perturb_eef_fail_gain", 0.03)),
+            float(cfg.get("perturb_eef_fail_gain", 0.08)),
             mag_bin_id,
             n_mag,
         )
@@ -361,9 +414,10 @@ def _perturb_action_chunk_target_pose(
         out[:, 6] = np.clip(out[:, 6], 0.0, 1.0)
         out[:, 13] = np.clip(out[:, 13], 0.0, 1.0)
     else:
-        # For translation/rotation, keep original gripper sequence unchanged.
-        out[:, 6] = np.asarray(act_raw[:, 6], dtype=np.float32)
-        out[:, 13] = np.asarray(act_raw[:, 13], dtype=np.float32)
+        # For translation/rotation, only arm target is perturbed.
+        # Keep grippers fixed at the sampled start state.
+        out[:, 6] = float(init_left_grip)
+        out[:, 13] = float(init_right_grip)
 
     info = {
         "target_idx": int(idx),

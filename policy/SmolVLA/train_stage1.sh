@@ -13,8 +13,8 @@ cd "${SCRIPT_DIR}"
 # Edit the values in this block directly before launching the script.
 DATASET_REPO_ID="robotwin_multitask_5_cam_high"
 OUTPUT_ROOT="${SCRIPT_DIR}/outputs/stage1/${DATASET_REPO_ID}"
-TRAIN_TAG="stage1"
-RUN_TAG="stage1_spatial_projector_0567"
+TRAIN_TAG="stage1_no_object_contact_correction"
+RUN_TAG="stage1_spatial_projector_only_condition"
 
 PRETRAINED_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
 RESUME_FROM=""
@@ -34,6 +34,9 @@ MULTI_TASK_NAMES=(
 INSTRUCTION_TYPE="seen"
 EVAC_CKPT="/data/yujieyang/EVAC/runs/evac_robotwin_mixed50p12_2026-04-16T19-26-12/checkpoints/epoch=562-step=18000.ckpt"
 EVAC_CONFIG="${SCRIPT_DIR}/evac/configs/robotwin/train_config.yaml"
+URDF_PATH="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf"
+CUROBO_LEFT_YML="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml"
+CUROBO_RIGHT_YML="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml"
 
 SEED=0
 BATCH_SIZE=4
@@ -53,9 +56,42 @@ LATENT_DIM=4
 ADAPTER_HIDDEN_DIM=512
 PREDICTOR_HIDDEN_DIM=512
 DYN_ZERO_STEPS=0
-DYN_RAMP_STEPS=1000
-DYN_MAX_WEIGHT=0.5
+DYN_RAMP_STEPS=0
+DYN_MAX_WEIGHT=0.0
 DYN_WARMUP_CURVE="cosine"
+COND_ZERO_STEPS=0
+COND_RAMP_STEPS=1000
+COND_MAX_WEIGHT=0.5
+COND_WARMUP_CURVE="cosine"
+FAILURE_MODE="train"
+FAILURE_TABLE_PATHS_JSON="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260422_023320-explore_stage1_spatial_projector_accelerate_56/merged/multitask_failure_manifest.json"
+FAILURE_CORR_BATCH_RATIO=0.5
+SAMPLE_PHASE_WINDOW_LEN=20
+START_MARGIN=0
+FAILURE_PHASE_BINS=4
+FAILURE_TRANSLATION_DIR_BINS=6
+FAILURE_TRANSLATION_MAG_BINS=1
+FAILURE_ROTATION_DIR_BINS=6
+FAILURE_ROTATION_MAG_BINS=1
+FAILURE_EXPLORE_K=4
+ACT_ALIGNED_ROLLOUT_EXEC_STEPS=16
+PLANNER_ORIENT_WEIGHT=0.0573
+PLANNER_GRIPPER_PENALTY=1.0
+PLANNER_NEAREST_WINDOW_RADIUS=12
+PLANNER_ACTIVE_JOINT_DELTA_THRESH=0.01
+PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
+RECOVER_EVAL_SAVE_VIDEO=false
+RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.3
+RECOVER_EVAL_POS_THRESH_M=0.04
+RECOVER_EVAL_ROT_THRESH_DEG=8.0
+RECOVER_EVAL_NEAREST_WINDOW_RADIUS=16
+RECOVER_EVAL_VIDEO_BRIDGE_STEPS=16
+ACT_ALIGNED_ENABLE_PERTURB=true
+ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN=0.03
+ACT_ALIGNED_PERTURB_ROT_MAX_DEG=10.0
+ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN=0.10
+DEBUG_WM_CORRECTION=true
+DEBUG_WM_ALL_RANKS=true
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 PYTHONPATH="/data/zhenyangfan/RoboTwin:${LOCAL_SRC_DIR}"
@@ -152,6 +188,9 @@ pythonpath=${PYTHONPATH}
 instruction_type=${INSTRUCTION_TYPE}
 evac_ckpt=${EVAC_CKPT}
 evac_config=${EVAC_CONFIG}
+failure_mode=${FAILURE_MODE}
+failure_table_paths_json=${FAILURE_TABLE_PATHS_JSON}
+failure_corr_batch_ratio=${FAILURE_CORR_BATCH_RATIO}
 seed=${SEED}
 EOF
 
@@ -195,6 +234,42 @@ CMD=(
   --dyn_ramp_steps "${DYN_RAMP_STEPS}"
   --dyn_max_weight "${DYN_MAX_WEIGHT}"
   --dyn_warmup_curve "${DYN_WARMUP_CURVE}"
+  --cond_zero_steps "${COND_ZERO_STEPS}"
+  --cond_ramp_steps "${COND_RAMP_STEPS}"
+  --cond_max_weight "${COND_MAX_WEIGHT}"
+  --cond_warmup_curve "${COND_WARMUP_CURVE}"
+  --failure_mode "${FAILURE_MODE}"
+  --failure_table_paths_json "${FAILURE_TABLE_PATHS_JSON}"
+  --failure_corr_batch_ratio "${FAILURE_CORR_BATCH_RATIO}"
+  --failure_phase_bins "${FAILURE_PHASE_BINS}"
+  --failure_translation_dir_bins "${FAILURE_TRANSLATION_DIR_BINS}"
+  --failure_translation_mag_bins "${FAILURE_TRANSLATION_MAG_BINS}"
+  --failure_rotation_dir_bins "${FAILURE_ROTATION_DIR_BINS}"
+  --failure_rotation_mag_bins "${FAILURE_ROTATION_MAG_BINS}"
+  --failure_explore_k "${FAILURE_EXPLORE_K}"
+  --sample_phase_window_len "${SAMPLE_PHASE_WINDOW_LEN}"
+  --start_margin "${START_MARGIN}"
+  --urdf_path "${URDF_PATH}"
+  --curobo_left_yml "${CUROBO_LEFT_YML}"
+  --curobo_right_yml "${CUROBO_RIGHT_YML}"
+  --act_aligned_rollout_exec_steps "${ACT_ALIGNED_ROLLOUT_EXEC_STEPS}"
+  --planner_orient_weight "${PLANNER_ORIENT_WEIGHT}"
+  --planner_gripper_penalty "${PLANNER_GRIPPER_PENALTY}"
+  --planner_nearest_window_radius "${PLANNER_NEAREST_WINDOW_RADIUS}"
+  --planner_active_joint_delta_thresh "${PLANNER_ACTIVE_JOINT_DELTA_THRESH}"
+  --planner_active_gripper_delta_thresh "${PLANNER_ACTIVE_GRIPPER_DELTA_THRESH}"
+  --recover_eval_save_video "${RECOVER_EVAL_SAVE_VIDEO}"
+  --recover_eval_gripper_open_thresh "${RECOVER_EVAL_GRIPPER_OPEN_THRESH}"
+  --recover_eval_pos_thresh_m "${RECOVER_EVAL_POS_THRESH_M}"
+  --recover_eval_rot_thresh_deg "${RECOVER_EVAL_ROT_THRESH_DEG}"
+  --recover_eval_nearest_window_radius "${RECOVER_EVAL_NEAREST_WINDOW_RADIUS}"
+  --recover_eval_video_bridge_steps "${RECOVER_EVAL_VIDEO_BRIDGE_STEPS}"
+  --act_aligned_enable_perturb "${ACT_ALIGNED_ENABLE_PERTURB}"
+  --act_aligned_perturb_eef_fail_gain "${ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN}"
+  --act_aligned_perturb_rot_max_deg "${ACT_ALIGNED_PERTURB_ROT_MAX_DEG}"
+  --act_aligned_perturb_gripper_close_min "${ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN}"
+  --debug_wm_correction "${DEBUG_WM_CORRECTION}"
+  --debug_wm_all_ranks "${DEBUG_WM_ALL_RANKS}"
 )
 
 printf '%q ' "${CMD[@]}" > "${OUTPUT_DIR}/launch_command.sh"

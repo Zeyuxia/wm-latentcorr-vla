@@ -258,6 +258,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--failure_explore_k", type=int, default=4)
     parser.add_argument("--failure_fail_recover_rate_thresh", type=float, default=0.5)
     parser.add_argument("--failure_sample_skip_head_ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--explore_debug_max_samples",
+        type=int,
+        default=0,
+        help="Save ACT-aligned correction/EVAC rollout debug artifacts for the first N explore samples per rank.",
+    )
+    parser.add_argument(
+        "--explore_debug_dir",
+        type=str,
+        default="",
+        help="Optional root for explore debug artifacts. Defaults to <output_dir>/explore_debug.",
+    )
     parser.add_argument("--stage2_latent_cache_dir", type=str, default="")
     parser.add_argument("--stage2_latent_cache_strict", type=str2bool, default=False)
     parser.add_argument("--stage2_latent_cache_writeback", type=str2bool, default=True)
@@ -345,34 +357,50 @@ def _record_explore_trial_for_loader(loader, unit_idx: int, episode_id: int, sta
 
 def _get_explore_num_units(loader) -> int:
     ds = getattr(loader, "dataset", None)
+    total_units = 0
     for leaf in _iter_leaf_datasets(ds):
         if hasattr(leaf, "_explore_units"):
-            return int(len(getattr(leaf, "_explore_units")))
-    return 0
+            total_units += int(len(getattr(leaf, "_explore_units")))
+    return int(total_units)
 
 
 def _get_current_explore_unit_idx(loader) -> int:
     ds = getattr(loader, "dataset", None)
+    fallback_idx = -1
     for leaf in _iter_leaf_datasets(ds):
-        if hasattr(leaf, "_explore_curr_unit_idx"):
-            return int(getattr(leaf, "_explore_curr_unit_idx"))
-    return -1
+        if not hasattr(leaf, "_explore_curr_unit_idx"):
+            continue
+        curr_idx = int(getattr(leaf, "_explore_curr_unit_idx"))
+        total_units = int(len(getattr(leaf, "_explore_units", [])))
+        completed_units = int(getattr(leaf, "_explore_completed_unit_count", 0))
+        if completed_units < total_units:
+            return curr_idx
+        fallback_idx = curr_idx
+    return int(fallback_idx)
 
 
 def _get_current_explore_trial_count(loader) -> int:
     ds = getattr(loader, "dataset", None)
+    fallback_count = 0
     for leaf in _iter_leaf_datasets(ds):
-        if hasattr(leaf, "_explore_trial_count_local"):
-            return int(getattr(leaf, "_explore_trial_count_local"))
-    return 0
+        if not hasattr(leaf, "_explore_trial_count_local"):
+            continue
+        trial_count = int(getattr(leaf, "_explore_trial_count_local"))
+        total_units = int(len(getattr(leaf, "_explore_units", [])))
+        completed_units = int(getattr(leaf, "_explore_completed_unit_count", 0))
+        if completed_units < total_units:
+            return trial_count
+        fallback_count = trial_count
+    return int(fallback_count)
 
 
 def _get_explore_completed_unit_count(loader) -> int:
     ds = getattr(loader, "dataset", None)
+    completed_units = 0
     for leaf in _iter_leaf_datasets(ds):
         if hasattr(leaf, "_explore_completed_unit_count"):
-            return int(getattr(leaf, "_explore_completed_unit_count"))
-    return 0
+            completed_units += int(getattr(leaf, "_explore_completed_unit_count"))
+    return int(completed_units)
 
 
 def _sync_all_explore_status(
@@ -650,6 +678,11 @@ def main():
         "pin_memory": True,
         "drop_last": True,
     }
+    explore_loader_kwargs = {
+        "num_workers": 0,
+        "pin_memory": True,
+        "drop_last": True,
+    }
     if loader_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
@@ -685,7 +718,7 @@ def main():
                 batch_size=args.batch_size,
                 sampler=explore_sampler,
                 shuffle=False,
-                **loader_kwargs,
+                **explore_loader_kwargs,
             )
         elif args.correction_batch_size > 0:
             corr_source_dataset = corr_dataset if corr_dataset is not None else dataset
@@ -718,7 +751,7 @@ def main():
                 corr_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
-                **loader_kwargs,
+                **explore_loader_kwargs,
             )
         elif args.correction_batch_size > 0:
             corr_source_dataset = corr_dataset if corr_dataset is not None else dataset
@@ -813,7 +846,8 @@ def main():
             print(f"[stage2] missing={len(missing)} unexpected={len(unexpected)}", flush=True)
     elif args.stage1_ckpt:
         ckpt = torch.load(args.stage1_ckpt, map_location="cpu")
-        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        model_state = ckpt.get("model", ckpt)
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
         if is_main_process(rank):
             print(f"[stage2] loaded stage1 checkpoint: {args.stage1_ckpt}", flush=True)
             print(f"[stage2] missing={len(missing)} unexpected={len(unexpected)}", flush=True)
@@ -832,6 +866,14 @@ def main():
             for key, value in anchor_model_state.items()
             if key.startswith("base_act.")
         }
+        if not anchor_state:
+            # Support raw ACT checkpoints whose state_dict keys are stored as
+            # `model.*` instead of our wrapped `base_act.*` format.
+            anchor_state = {
+                key[len("model.") :]: value
+                for key, value in anchor_model_state.items()
+                if key.startswith("model.")
+            }
         if not anchor_state:
             raise ValueError(f"base_anchor_ckpt does not contain base_act weights: {args.base_anchor_ckpt}")
         missing, unexpected = base_anchor_act.load_state_dict(anchor_state, strict=False)
@@ -974,6 +1016,8 @@ def main():
     failure_trials: list[dict] = []
     failure_stats: dict[tuple, dict] = {}
     explore_first_debug_path = os.path.join(args.output_dir, "explore_first_sample_debug.json")
+    explore_debug_dir = str(args.explore_debug_dir).strip() or os.path.join(args.output_dir, "explore_debug")
+    explore_debug_saved = 0
 
     def _write_failure_tables(epoch_idx: int) -> None:
         if not use_failure_explore:
@@ -1041,7 +1085,8 @@ def main():
                 if done_all > 0:
                     explore_pbar.update(done_all)
                 explore_pbar.set_postfix_str(_format_explore_progress(explore_progress))
-            for epoch in range(start_epoch, args.num_epochs):
+            epoch = int(start_epoch)
+            while (not all_explore_done) and (epoch < int(args.num_epochs)):
                 if all_explore_done:
                     break
                 if explore_sampler is not None:
@@ -1089,6 +1134,13 @@ def main():
                             raw_cache[cache_key] = load_raw_episode(raw_dir_i, ep_id)
                         raw_data = raw_cache[cache_key]
                         correction_policy_model = error_policy_model if error_policy_model is not None else raw_model_for_mode
+                        debug_dir_i = None
+                        if use_failure_explore and int(args.explore_debug_max_samples) > int(explore_debug_saved):
+                            debug_dir_i = os.path.join(
+                                explore_debug_dir,
+                                f"rank{int(rank):02d}",
+                                f"sample_{int(explore_debug_saved):04d}_{task_i}_ep{ep_id:04d}_t{int(start_ts_list[i]):04d}",
+                            )
                         corr = correction_builder.build(
                             latent_model=correction_policy_model,
                             image_t=image_t[i],
@@ -1106,7 +1158,10 @@ def main():
                             sampled_active_arm_pattern_id=int(sampled_active_arm_pattern_ids[i]),
                             forced_dir_bin_id=int(forced_dir_bin_ids[i]),
                             forced_mag_bin_id=int(forced_mag_bin_ids[i]),
+                            debug_dir=debug_dir_i,
                         )
+                        if debug_dir_i is not None:
+                            explore_debug_saved += 1
                         corr_meta = None
                         skip_meta = None
                         if isinstance(corr, dict):
@@ -1236,6 +1291,16 @@ def main():
                     dist.barrier()
                 if all_explore_done:
                     break
+                epoch += 1
+
+            if (not all_explore_done) and is_main_process(rank):
+                print(
+                    "[stage2] explore stopped before covering all units: "
+                    f"completed={int(sum(int(x['completed']) for x in explore_progress))} / "
+                    f"total={int(sum(int(x['total']) for x in explore_progress))}, "
+                    f"num_epochs={int(args.num_epochs)}",
+                    flush=True,
+                )
 
             if distributed:
                 dist.barrier()

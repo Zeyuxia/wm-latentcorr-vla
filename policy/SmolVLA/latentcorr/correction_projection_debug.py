@@ -1,11 +1,46 @@
 from __future__ import annotations
 
 import os
+import importlib
+import sys
 
 import numpy as np
 import torch
 
 from policy.SmolVLA.latentcorr.correction_perturbation import _infer_phase_key_from_gt_window
+from policy.SmolVLA.latentcorr.failure_utils import get_failure_param_bins
+
+
+def _debug_relpath(path):
+    if path is None:
+        return None
+    try:
+        return f"./{os.path.relpath(path, start=os.getcwd())}"
+    except Exception:
+        return path
+
+
+def _import_ddpm3d_module():
+    evac_repo_root = os.path.realpath(
+        os.path.join(os.path.dirname(__file__), "..", "evac")
+    )
+    evac_pkg_root = os.path.join(evac_repo_root, "evac")
+    for path in (evac_repo_root, evac_pkg_root):
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+    candidate_modules = [
+        "evac.lvdm.models.ddpm3d",
+        "policy.SmolVLA.evac.evac.lvdm.models.ddpm3d",
+    ]
+    last_error = None
+    for module_name in candidate_modules:
+        try:
+            return importlib.import_module(module_name)
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ImportError("Failed to import ddpm3d module")
 
 
 def _phase_color(phase_key):
@@ -85,8 +120,32 @@ def _build_pose_np_from_raw_indices(raw_data, raw_idx_list):
     return np.stack(pose_list, axis=0)
 
 
+def _endpose_wxyz_to_pose16(left_endpose_wxyz, right_endpose_wxyz, left_grip=120.0, right_grip=120.0):
+    left_pose = np.asarray(left_endpose_wxyz, dtype=np.float32).reshape(7,)
+    right_pose = np.asarray(right_endpose_wxyz, dtype=np.float32).reshape(7,)
+    lq_wxyz = left_pose[3:7]
+    rq_wxyz = right_pose[3:7]
+    lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
+    rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
+    if lq_xyzw[3] < 0:
+        lq_xyzw = -lq_xyzw
+    if rq_xyzw[3] < 0:
+        rq_xyzw = -rq_xyzw
+    return np.concatenate(
+        [
+            left_pose[:3],
+            lq_xyzw,
+            np.array([float(left_grip)], dtype=np.float32),
+            right_pose[:3],
+            rq_xyzw,
+            np.array([float(right_grip)], dtype=np.float32),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+
 def _project_base_uv_from_pose_np(pose_arr, intrinsic, extrinsic):
-    import evac.lvdm.models.ddpm3d as ddpm3d_mod
+    ddpm3d_mod = _import_ddpm3d_module()
 
     w2c_t = torch.from_numpy(extrinsic).float().unsqueeze(0).unsqueeze(0)
     intrinsic_t = torch.from_numpy(intrinsic).float().unsqueeze(0).unsqueeze(0)
@@ -271,7 +330,7 @@ def save_gt_projection_on_original(
 
         out_path = os.path.join(debug_corr_dir, "gt_projection_on_original.png")
         cv2.imwrite(out_path, overlay)
-        return {"path": out_path, "exists": bool(os.path.exists(out_path)), "gt_ref_idx": int(gt_ref_idx)}
+        return {"path": _debug_relpath(out_path), "exists": bool(os.path.exists(out_path)), "gt_ref_idx": int(gt_ref_idx)}
     except Exception:
         try:
             import traceback
@@ -345,7 +404,7 @@ def save_recover_eval_compare_image(
         out_path = os.path.join(debug_corr_dir, f"recover_eval_gtref_vs_rollout_last_step_{int(step_idx):03d}.png")
         cv2.imwrite(out_path, canvas)
         return {
-            "path": out_path,
+            "path": _debug_relpath(out_path),
             "exists": bool(os.path.exists(out_path)),
             "gt_ref_idx": int(gt_idx),
             "step": int(step_idx),
@@ -367,7 +426,13 @@ def save_recover_eval_compare_image(
         return None
 
 
-def save_perturb_compare_image(debug_corr_dir, first_img, last_img, sampled_unit, rollout_last_record=None):
+def save_perturb_compare_image(
+    debug_corr_dir,
+    first_img,
+    last_img,
+    sampled_unit,
+    rollout_last_record=None,
+):
     import cv2
 
     def _put_text_hc(img, text, org, scale=0.5):
@@ -395,6 +460,26 @@ def save_perturb_compare_image(debug_corr_dir, first_img, last_img, sampled_unit
             f"sampled_error_mode={rollout_record.get('sampled_error_mode')}",
             f"translation_gain_m={tr_gain_s} rotation_deg={rot_deg_s}",
         ]
+        blur = rollout_record.get("evac_blur_filter")
+        if isinstance(blur, dict):
+            passed = blur.get("passed")
+            ratio = blur.get("sharpness_ratio")
+            min_ratio = blur.get("min_ratio")
+            pred_s = blur.get("pred_sharpness")
+            ref_s = blur.get("ref_sharpness")
+            region = blur.get("region")
+            bbox = blur.get("bbox_xyxy")
+            ratio_s = "None" if ratio is None else f"{float(ratio):.3f}"
+            min_ratio_s = "None" if min_ratio is None else f"{float(min_ratio):.3f}"
+            pred_s_s = "None" if pred_s is None else f"{float(pred_s):.5f}"
+            ref_s_s = "None" if ref_s is None else f"{float(ref_s):.5f}"
+            lines.extend(
+                [
+                    f"evac_blur_filter passed={passed} region={region} ratio={ratio_s} min_ratio={min_ratio_s}",
+                    f"blur_bbox_xyxy={bbox}",
+                    f"sharpness pred={pred_s_s} ref={ref_s_s}",
+                ]
+            )
 
         panel_h = 28 + 18 * len(lines)
         canvas = np.zeros((compare.shape[0] + panel_h, compare.shape[1], 3), dtype=np.uint8)
@@ -407,7 +492,7 @@ def save_perturb_compare_image(debug_corr_dir, first_img, last_img, sampled_unit
 
         out_path = os.path.join(debug_corr_dir, "perturb_input_vs_last.png")
         cv2.imwrite(out_path, canvas)
-        return {"path": out_path, "exists": bool(os.path.exists(out_path)), "sampled_unit": sample_unit}
+        return {"path": _debug_relpath(out_path), "exists": bool(os.path.exists(out_path)), "sampled_unit": sample_unit}
     except Exception:
         try:
             import traceback

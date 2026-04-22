@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
+import torch
 
 from policy.SmolVLA.latentcorr.failure_utils import (
     active_arm_pattern_id_to_key,
@@ -36,9 +38,142 @@ from policy.SmolVLA.latentcorr.correction_perturbation import (
 )
 
 
+def _debug_relpath(path):
+    if path is None:
+        return None
+    try:
+        return f"./{os.path.relpath(path, start=os.getcwd())}"
+    except Exception:
+        return path
+
+
+def _image_sharpness_score(image_t: torch.Tensor) -> float:
+    """Mean absolute gray-image gradient; lower means blurrier/flatter."""
+    img = torch.clamp(image_t.detach().float(), 0.0, 1.0)
+    if img.ndim != 3:
+        return 0.0
+    if img.shape[0] >= 3:
+        gray = 0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]
+    else:
+        gray = img.mean(dim=0)
+    dx = torch.abs(gray[:, 1:] - gray[:, :-1]).mean() if gray.shape[1] > 1 else torch.tensor(0.0, device=gray.device)
+    dy = torch.abs(gray[1:, :] - gray[:-1, :]).mean() if gray.shape[0] > 1 else torch.tensor(0.0, device=gray.device)
+    return float((dx + dy).detach().cpu().item())
+
+
+def _crop_image_patch(image_t: torch.Tensor, bbox_xyxy: tuple[int, int, int, int] | None) -> torch.Tensor:
+    if bbox_xyxy is None or image_t.ndim != 3:
+        return image_t
+    _, height, width = image_t.shape
+    x0, y0, x1, y1 = [int(v) for v in bbox_xyxy]
+    x0 = int(np.clip(x0, 0, max(0, width - 1)))
+    x1 = int(np.clip(x1, x0 + 1, width))
+    y0 = int(np.clip(y0, 0, max(0, height - 1)))
+    y1 = int(np.clip(y1, y0 + 1, height))
+    return image_t[:, y0:y1, x0:x1]
+
+
+def _evac_blur_filter_result(
+    pred: torch.Tensor,
+    ref: torch.Tensor,
+    cfg: dict,
+    bbox_xyxy: tuple[int, int, int, int] | None = None,
+) -> dict:
+    pred_patch = _crop_image_patch(pred, bbox_xyxy)
+    ref_patch = _crop_image_patch(ref, bbox_xyxy)
+    pred_score = _image_sharpness_score(pred_patch)
+    ref_score = _image_sharpness_score(ref_patch)
+    ratio = pred_score / max(ref_score, 1e-8)
+    min_ratio = float(cfg.get("evac_blur_filter_min_ratio", 0.25))
+    passed = bool(ratio >= min_ratio)
+    return {
+        "passed": passed,
+        "pred_sharpness": float(pred_score),
+        "ref_sharpness": float(ref_score),
+        "sharpness_ratio": float(ratio),
+        "min_ratio": float(min_ratio),
+        "region": "active_gripper_patch" if bbox_xyxy is not None else "full_image",
+        "bbox_xyxy": None if bbox_xyxy is None else [int(v) for v in bbox_xyxy],
+    }
+
+
+def _pose_wxyz_to_matrix_np(position: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation as R
+
+    mat = np.eye(4, dtype=np.float32)
+    q = np.asarray(quat_wxyz, dtype=np.float32).reshape(4,)
+    mat[:3, :3] = R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().astype(np.float32)
+    mat[:3, 3] = np.asarray(position, dtype=np.float32).reshape(3,)
+    return mat
+
+
+def _project_active_gripper_bbox(
+    raw_data: dict,
+    active_arm: str,
+    left_pos: np.ndarray,
+    left_quat_wxyz: np.ndarray,
+    right_pos: np.ndarray,
+    right_quat_wxyz: np.ndarray,
+    image_hw: tuple[int, int],
+    pad_px: int = 24,
+) -> tuple[int, int, int, int] | None:
+    intrinsic = np.asarray(raw_data.get("intrinsic_cv"), dtype=np.float32).copy()
+    ext_cv = np.asarray(raw_data.get("extrinsic_cv"), dtype=np.float32)
+    native_h, native_w = raw_data.get("native_resolution", image_hw)
+    img_h, img_w = int(image_hw[0]), int(image_hw[1])
+    if intrinsic.shape != (3, 3) or ext_cv.shape != (3, 4):
+        return None
+    if int(native_w) > 0 and int(native_h) > 0:
+        intrinsic[0, 0] *= float(img_w) / float(native_w)
+        intrinsic[0, 2] *= float(img_w) / float(native_w)
+        intrinsic[1, 1] *= float(img_h) / float(native_h)
+        intrinsic[1, 2] *= float(img_h) / float(native_h)
+    pose_mat = (
+        _pose_wxyz_to_matrix_np(left_pos, left_quat_wxyz)
+        if str(active_arm) == "left_arm"
+        else _pose_wxyz_to_matrix_np(right_pos, right_quat_wxyz)
+    )
+    end_effector_pts = np.asarray(
+        [[0.0, 0.0, 0.0, 1.0], [0.1, 0.0, 0.0, 1.0], [0.0, 0.1, 0.0, 1.0], [0.0, 0.0, 0.1, 1.0]],
+        dtype=np.float32,
+    ).T
+    gripper_to_eef = np.asarray(
+        [[1.0, 0.0, 0.0, 0.085], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    pts_world = (pose_mat @ gripper_to_eef @ end_effector_pts)[:3, :].T
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :] = ext_cv
+    uvs = []
+    for pt in pts_world:
+        cam = (w2c @ np.append(pt, 1.0).astype(np.float32))[:3]
+        if (not np.all(np.isfinite(cam))) or float(cam[2]) <= 1e-6:
+            continue
+        uvw = intrinsic @ cam
+        if (not np.all(np.isfinite(uvw))) or abs(float(uvw[2])) <= 1e-6:
+            continue
+        uvs.append((float(uvw[0] / uvw[2]), float(uvw[1] / uvw[2])))
+    if not uvs:
+        return None
+    xs = np.asarray([uv[0] for uv in uvs], dtype=np.float32)
+    ys = np.asarray([uv[1] for uv in uvs], dtype=np.float32)
+    x0 = int(np.floor(float(np.min(xs)) - float(pad_px)))
+    y0 = int(np.floor(float(np.min(ys)) - float(pad_px)))
+    x1 = int(np.ceil(float(np.max(xs)) + float(pad_px)))
+    y1 = int(np.ceil(float(np.max(ys)) + float(pad_px)))
+    if x1 <= 0 or y1 <= 0 or x0 >= img_w or y0 >= img_h:
+        return None
+    return (
+        int(np.clip(x0, 0, img_w - 1)),
+        int(np.clip(y0, 0, img_h - 1)),
+        int(np.clip(x1, 1, img_w)),
+        int(np.clip(y1, 1, img_h)),
+    )
+
+
 def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     norm_stats, modules, cfg, device, debug_dir=None, start_ts=0,
-                    sampled_phase_id=None, pregrasp_seg_start=None, pregrasp_seg_end=None,
+                    sampled_phase_id=None,
                     sampled_phase_bin_id=None, sampled_phase_instance_id=None, forced_error_mode_id=None,
                     sampled_active_arm_pattern_id=None, forced_dir_bin_id=None,
                     forced_mag_bin_id=None, sampled_mode_prob=None,
@@ -55,7 +190,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     right_ep = raw_data['right_endpose'][start_ts:]
     max_steps = cfg['max_rollout_steps']
     correction_force_generate = bool(cfg['correction_force_generate'])
-    debug_correction_evac_rollout = bool(cfg.get('debug_correction_evac_rollout'))
     chunk_size = cfg['chunk_size']
     rollout_exec_steps = int(cfg['rollout_exec_steps'])
     max_action_len = cfg['max_action_len']
@@ -64,7 +198,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     recover_eval_enable = bool(cfg.get('recover_eval_enable', False))
     recover_eval_save_video = bool(cfg.get('recover_eval_save_video', False))
     recover_eval_debug = bool(cfg.get('recover_eval_save_video', False))
-    recover_eval_gripper_open_thresh = float(cfg.get('recover_eval_gripper_open_thresh', 0.8))
+    # Historical arg name: now used as GT-aligned gripper absolute-error threshold.
+    recover_eval_gripper_open_thresh = float(cfg.get('recover_eval_gripper_open_thresh', 0.2))
     recover_eval_pos_thresh_m = float(cfg.get('recover_eval_pos_thresh_m', 0.03))
     recover_eval_rot_thresh_deg = float(cfg.get('recover_eval_rot_thresh_deg', 10.0))
 
@@ -148,16 +283,16 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 "Dataloader must provide active_arm_pattern for each sample."
             )
         _pat = str(sampled_active_arm_pattern_key).strip().lower()
-        if _pat == "left_only":
+        if _pat in {"left_only", "left_arm"}:
             left_side_active, right_side_active = True, False
-        elif _pat == "right_only":
+        elif _pat in {"right_only", "right_arm"}:
             left_side_active, right_side_active = False, True
         elif _pat == "both":
             left_side_active, right_side_active = True, True
         else:
             raise RuntimeError(
                 f"Invalid sampled_active_arm_pattern={sampled_active_arm_pattern_key!r} "
-                "in failure_mode. Expected left_only/right_only/both."
+                "in failure_mode. Expected left_arm/right_arm."
             )
         active_info_fixed = {
             "left_arm": bool(left_side_active),
@@ -203,25 +338,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             window_end=min(len(left_ep), expected_idx + near_w + 1),
         )
 
-        if precomputed_action_chunk_raw is not None:
-            act_raw = np.asarray(precomputed_action_chunk_raw, dtype=np.float32).copy()
-        else:
-            qn = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
-            qt = torch.from_numpy(qn).float().unsqueeze(0).to(device)
-            it = curr_image.unsqueeze(0).to(device)
-            # Use eval mode for rollout action generation to match deployment behavior
-            # and avoid training-time dropout noise in correction targets.
-            _was_training = policy_unwrapped.training
-            policy_unwrapped.eval()
-            with torch.no_grad():
-                act_chunk = policy_unwrapped(qt, it)
-            if _was_training:
-                policy_unwrapped.train()
-            act_np = act_chunk.squeeze(0).cpu().numpy()
-            act_raw = act_np * norm_stats['action_std'] + norm_stats['action_mean']
-        # Rollout executes a short online horizon; keep this aligned with rollout_exec_steps.
-        exec_len = int(np.clip(rollout_exec_steps, 1, max(1, act_raw.shape[0])))
-        act_raw = act_raw[:exec_len].copy()
+        # Failure perturbation is defined from the sampled start state only.
+        # Do not inherit future GT/policy chunk values; non-perturbed channels
+        # should stay fixed at the start qpos/gripper.
+        exec_len = int(max(1, int(rollout_exec_steps)))
+        act_raw = np.repeat(curr_qpos_raw[None, :], exec_len, axis=0).astype(np.float32)
 
         active_info = active_info_fixed
         progress = float(t_star) / max(1, len(left_ep) - 1)
@@ -267,7 +388,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _vpath = os.path.join(evac_debug_dir, 'outputs.mp4')
             evac_rollout_videos.append({
                 'step': int(step),
-                'path': _vpath,
+                'path': _debug_relpath(_vpath),
                 'exists': bool(os.path.exists(_vpath)),
             })
         new_img = curr_image.clone()
@@ -279,6 +400,83 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 align_corners=False,
             )[0]
             pred = torch.clamp(pred_rs, 0.0, 1.0)
+        evac_blur_filter = None
+        if bool(cfg.get("evac_blur_filter_enable", False)):
+            active_arm_for_blur = "left_arm" if bool(active_info.get("left_arm", False)) else "right_arm"
+            blur_lp, blur_lq, blur_rp, blur_rq = fk_poses[-1]
+            blur_bbox = _project_active_gripper_bbox(
+                raw_data,
+                active_arm_for_blur,
+                blur_lp,
+                blur_lq,
+                blur_rp,
+                blur_rq,
+                image_hw=(int(pred.shape[-2]), int(pred.shape[-1])),
+                pad_px=int(cfg.get("evac_blur_filter_patch_pad_px", 24)),
+            )
+            evac_blur_filter = _evac_blur_filter_result(pred, curr_image[0], cfg, bbox_xyxy=blur_bbox)
+            if not bool(evac_blur_filter.get("passed", False)):
+                sampled_error_mode = dyn_state.get('error_mode') if isinstance(dyn_state, dict) else None
+                blur_rollout_record = {
+                    "step": int(step),
+                    "t_star": int(t_star),
+                    "min_dist": float(min_dist),
+                    "progress": float(progress),
+                    "phase_key": phase_key,
+                    "action_perturbed": bool(perturbed),
+                    "perturb_mode": pert_mode,
+                    "sampled_error_mode": sampled_error_mode,
+                    "evac_blur_filter": evac_blur_filter,
+                }
+                corr_meta = {
+                    "correction_generated": False,
+                    "closed_loop_fallback_used": False,
+                    "correction_branch": "evac_invalid",
+                    "skip_reason": "evac_blurry_after_perturb",
+                    "invalid_trial": True,
+                    "invalid_reason": "evac_blurry_after_perturb",
+                    "sampled_error_mode": sampled_error_mode,
+                    "forced_error_mode": forced_error_mode_key,
+                    "sampled_phase_key": phase_key_fixed,
+                    "sampled_phase_bin_id": phase_bin_fixed,
+                    "sampled_phase_instance_idx": phase_instance_fixed,
+                    "sampled_active_arm_pattern": sampled_active_arm_pattern_key,
+                    "forced_dir_bin_id": forced_dir_bin_fixed,
+                    "forced_mag_bin_id": forced_mag_bin_fixed,
+                    "nearest_mode": str(sampled_error_mode or ""),
+                    "rollout_exec_steps": int(rollout_exec_steps),
+                    "t_star": int(t_star),
+                    "min_dist": float(min_dist),
+                    "recover_eval_enable": bool(recover_eval_enable),
+                    "recover_eval_last": {"recoverable": None, "mode": sampled_error_mode},
+                    "evac_blur_filter": evac_blur_filter,
+                    "evac_rollout_videos": evac_rollout_videos,
+                    "debug_dir": debug_dir,
+                    "error_action_prefix_raw": np.asarray(act_raw, dtype=np.float32).copy(),
+                }
+                if debug_dir is not None:
+                    _dbg_corr = os.path.join(debug_dir, 'correction')
+                    os.makedirs(_dbg_corr, exist_ok=True)
+                    try:
+                        save_perturb_compare_image(
+                            _dbg_corr,
+                            image_data_s[0],
+                            pred,
+                            sampled_unit,
+                            rollout_last_record=blur_rollout_record,
+                        )
+                    except Exception:
+                        pass
+                    with open(os.path.join(_dbg_corr, 'skipped.json'), 'w', encoding='utf-8') as _f:
+                        json.dump({
+                            'reason': 'evac_blurry_after_perturb',
+                            'sampled_unit': sampled_unit,
+                            'evac_blur_filter': evac_blur_filter,
+                            't_star': int(t_star),
+                            'min_dist': float(min_dist),
+                            'rollout': _dbg_rollout + [blur_rollout_record],
+                        }, _f, indent=2, ensure_ascii=False)
+                return (None, None, None, None, corr_meta)
         new_img[0] = pred
         curr_image = new_img
         # Advance state to the end of executed actions.
@@ -328,19 +526,51 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
         if recover_eval_enable:
             try:
-                qn_eval = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
-                qt_eval = torch.from_numpy(qn_eval).float().unsqueeze(0).to(device)
-                it_eval = curr_image.unsqueeze(0).to(device)
+                recover_eval_use_rollout_state = bool(cfg.get('enable_perturb', True))
+                if recover_eval_use_rollout_state:
+                    qt_eval = torch.from_numpy(curr_qpos_raw).float().unsqueeze(0).to(device)
+                    it_eval = curr_image.unsqueeze(0).to(device)
+                else:
+                    qpos_eval_raw = qpos_data_s.detach().cpu().numpy() * norm_stats['qpos_std'] + norm_stats['qpos_mean']
+                    qt_eval = torch.from_numpy(qpos_eval_raw).float().unsqueeze(0).to(device)
+                    it_eval = image_data_s.unsqueeze(0).to(device)
+                recover_eval_batch = None
+                recover_eval_action_post = None
+
                 _was_training_eval = policy_unwrapped.training
                 policy_unwrapped.eval()
                 try:
                     with torch.no_grad():
-                        act_chunk_eval = policy_unwrapped(qt_eval, it_eval)
+                        if not hasattr(policy_unwrapped, "build_batch"):
+                            raise AttributeError("recover-eval policy adapter must implement build_batch")
+                        if not hasattr(policy_unwrapped, "predict_base_action_chunk"):
+                            raise AttributeError("recover-eval policy adapter must implement predict_base_action_chunk")
+                        if not hasattr(policy_unwrapped, "postprocess_action_chunk"):
+                            raise AttributeError("recover-eval policy adapter must implement postprocess_action_chunk")
+                        if hasattr(policy_unwrapped, "build_eval_batch"):
+                            recover_eval_batch = policy_unwrapped.build_eval_batch(
+                                image_t=it_eval[0],
+                                qpos_raw=qt_eval[0],
+                            )
+                        else:
+                            action_dim = int(qt_eval.shape[-1])
+                            chunk_size_eval = int(cfg.get("chunk_size", rollout_exec_steps))
+                            dummy_action_chunk = torch.zeros(
+                                (chunk_size_eval, action_dim),
+                                dtype=torch.float32,
+                                device=qt_eval.device,
+                            )
+                            recover_eval_batch = policy_unwrapped.build_batch(
+                                image_t=it_eval[0],
+                                qpos_raw=qt_eval[0],
+                                action_chunk_raw=dummy_action_chunk,
+                            )
+                        act_chunk_eval = policy_unwrapped.predict_base_action_chunk(recover_eval_batch)
+                        recover_eval_action_post = policy_unwrapped.postprocess_action_chunk(act_chunk_eval)
                 finally:
                     if _was_training_eval:
                         policy_unwrapped.train()
-                act_eval_np = act_chunk_eval.squeeze(0).cpu().numpy()
-                act_eval_raw = act_eval_np * norm_stats['action_std'] + norm_stats['action_mean']
+                act_eval_raw = recover_eval_action_post.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
                 h_eval = int(np.clip(rollout_exec_steps, 1, max(1, act_eval_raw.shape[0])))
                 act_eval_raw = act_eval_raw[:h_eval].copy()
@@ -438,7 +668,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         )
                         _vpath_recover = os.path.join(evac_recover_eval_dir, 'outputs.mp4')
                         recover_eval_video = {
-                            'path': _vpath_recover,
+                            'path': _debug_relpath(_vpath_recover),
                             'exists': bool(os.path.exists(_vpath_recover)),
                             'bridge_steps': int(_bridge_meta.get('bridge_steps', 0)),
                             'bridge_left_status': _bridge_meta.get('left_status'),
@@ -450,21 +680,52 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                             'exists': False,
                             'error': str(_exc_recover_video),
                         }
+                        if bool(cfg.get('fail_fast_on_error', False)):
+                            raise
 
                 mode_eval = str(recover_eval_mode).strip().lower() if recover_eval_mode is not None else ""
                 if mode_eval == "gripper_close":
-                    recover_eval_gt_ref_idx = int(gt_ref_idx)
-                    open_vals = []
+                    fr_eval = fr_eval_last
+                    near_w_eval = int(max(1, cfg.get('recover_eval_nearest_window_radius', int(max(1, rollout_exec_steps)))))
+                    ws = int(np.clip(gt_ref_idx, 0, raw_data['left_endpose'].shape[0] - 1))
+                    we = int(np.clip(gt_ref_idx + near_w_eval + 1, ws + 1, raw_data['left_endpose'].shape[0]))
+                    nidx_abs, ndist = find_nearest_traj_point(
+                        np.asarray(fr_eval['left'][0], dtype=np.float32),
+                        np.asarray(fr_eval['left'][1], dtype=np.float32),
+                        np.asarray(fr_eval['right'][0], dtype=np.float32),
+                        np.asarray(fr_eval['right'][1], dtype=np.float32),
+                        raw_data['left_endpose'],
+                        raw_data['right_endpose'],
+                        orient_weight=orient_weight,
+                        curr_left_grip=pred_left_grip_eval,
+                        curr_right_grip=pred_right_grip_eval,
+                        left_gripper_traj=raw_data.get('left_gripper'),
+                        right_gripper_traj=raw_data.get('right_gripper'),
+                        gripper_penalty=gripper_penalty,
+                        window_start=ws,
+                        window_end=we,
+                    )
+                    recover_eval_nearest_dist = float(ndist)
+                    recover_eval_window_start = int(ws)
+                    recover_eval_window_end = int(we)
+                    recover_eval_gt_ref_idx = int(nidx_abs)
+                    gripper_errs = []
                     if bool(active_info.get('left_gripper', True)):
-                        open_vals.append(float(np.max(act_eval_raw[:, 6])))
+                        gripper_errs.append(float(abs(
+                            pred_left_grip_eval -
+                            float(np.clip(raw_data['left_gripper'][recover_eval_gt_ref_idx], 0.0, 1.0))
+                        )))
                     if bool(active_info.get('right_gripper', True)):
-                        open_vals.append(float(np.max(act_eval_raw[:, 13])))
-                    recover_eval_metric_name = "gripper_open_max"
-                    recover_eval_metric = (None if len(open_vals) == 0 else float(np.max(open_vals)))
+                        gripper_errs.append(float(abs(
+                            pred_right_grip_eval -
+                            float(np.clip(raw_data['right_gripper'][recover_eval_gt_ref_idx], 0.0, 1.0))
+                        )))
+                    recover_eval_metric_name = "gripper_err"
+                    recover_eval_metric = (None if len(gripper_errs) == 0 else float(np.mean(gripper_errs)))
                     recover_eval_threshold = float(recover_eval_gripper_open_thresh)
                     recover_eval_recoverable = (
                         recover_eval_metric is not None and
-                        float(recover_eval_metric) >= float(recover_eval_threshold)
+                        float(recover_eval_metric) <= float(recover_eval_threshold)
                     )
                 elif mode_eval == "translation":
                     fr_eval = fr_eval_last
@@ -583,6 +844,40 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             except Exception as exc:
                 recover_eval_recoverable = None
                 recover_eval_error = str(exc)
+                if debug_dir is not None:
+                    _dbg_corr = os.path.join(debug_dir, 'correction')
+                    os.makedirs(_dbg_corr, exist_ok=True)
+                    try:
+                        import traceback
+
+                        with open(
+                            os.path.join(_dbg_corr, f'recover_eval_error_step_{step:03d}.txt'),
+                            'w',
+                            encoding='utf-8',
+                        ) as _f:
+                            _f.write(traceback.format_exc())
+                        with open(
+                            os.path.join(_dbg_corr, f'recover_eval_error_step_{step:03d}.json'),
+                            'w',
+                            encoding='utf-8',
+                        ) as _f:
+                            json.dump(
+                                {
+                                    'step': int(step),
+                                    'error': str(exc),
+                                    'input_state': (
+                                        'rollout_state' if bool(cfg.get('enable_perturb', True)) else 'original_state'
+                                    ),
+                                    'recover_eval_video': recover_eval_video,
+                                },
+                                _f,
+                                indent=2,
+                                ensure_ascii=False,
+                            )
+                    except Exception:
+                        pass
+                if bool(cfg.get('fail_fast_on_error', False)):
+                    raise
 
             if recover_eval_recoverable is False:
                 recover_eval_any_unrecoverable = True
@@ -591,6 +886,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             recover_eval_last = {
                 'recoverable': (None if recover_eval_recoverable is None else bool(recover_eval_recoverable)),
                 'mode': recover_eval_mode,
+                'input_state': ('rollout_state' if bool(cfg.get('enable_perturb', True)) else 'original_state'),
                 'metric_name': recover_eval_metric_name,
                 'metric': (None if recover_eval_metric is None else float(recover_eval_metric)),
                 'threshold': (None if recover_eval_threshold is None else float(recover_eval_threshold)),
@@ -663,6 +959,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 'recover_eval_error': recover_eval_error,
                 'recover_eval_video': recover_eval_video,
                 'recover_eval_compare': recover_eval_compare,
+                'evac_blur_filter': evac_blur_filter,
             })
 
     force_generate_correction = False
@@ -710,7 +1007,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     if not force_generate_correction:
         # debug: save rollout info even on skip
         if debug_dir is not None:
-            import json
             _dbg_corr = os.path.join(debug_dir, 'correction')
             os.makedirs(_dbg_corr, exist_ok=True)
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -815,6 +1111,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
             ),
             "recover_eval_last": recover_eval_last,
+            "evac_rollout_videos": evac_rollout_videos,
+            "debug_dir": debug_dir,
             "error_action_prefix_raw": error_action_prefix_raw,
         }
         return (None, None, None, None, corr_meta)
@@ -920,8 +1218,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     elif nearest_mode in {"translation", "rotation"}:
         # Dedicated correction for translation/rotation errors:
         # 1) use rollout_exec_steps actions to pull current perturbed state
-        #    back to the original first GT action pose at sampled start_ts,
-        # 2) then follow GT forward to fill chunk_size.
+        #    back to the original GT pose at sampled start_ts,
+        # 2) then follow GT from start_ts forward to fill the rest of chunk_size.
         import sapien
         _recover_mode = str(nearest_mode)
         prefix_len = int(np.clip(int(rollout_exec_steps), 1, max(1, chunk_size - 1)))
@@ -947,7 +1245,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 res_l = planner_l.plan_path(qpos_full_tr, target_lp_tr, arms_tag='left')
             except Exception as exc:
                 if debug_dir is not None:
-                    import json
                     _dbg_corr = os.path.join(debug_dir, 'correction')
                     os.makedirs(_dbg_corr, exist_ok=True)
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -962,7 +1259,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 return None
             if res_l.get('status') != 'Success':
                 if debug_dir is not None:
-                    import json
                     _dbg_corr = os.path.join(debug_dir, 'correction')
                     os.makedirs(_dbg_corr, exist_ok=True)
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -984,7 +1280,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 res_r = planner_r.plan_path(qpos_full_tr, target_rp_tr, arms_tag='right')
             except Exception as exc:
                 if debug_dir is not None:
-                    import json
                     _dbg_corr = os.path.join(debug_dir, 'correction')
                     os.makedirs(_dbg_corr, exist_ok=True)
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -999,7 +1294,6 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 return None
             if res_r.get('status') != 'Success':
                 if debug_dir is not None:
-                    import json
                     _dbg_corr = os.path.join(debug_dir, 'correction')
                     os.makedirs(_dbg_corr, exist_ok=True)
                     with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -1022,27 +1316,26 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         tl_grip = float(np.clip(left_grip_traj[follow_idx], 0.0, 1.0))
         tr_grip = float(np.clip(right_grip_traj[follow_idx], 0.0, 1.0))
         if corr_left_active:
-            l_tail = _take_tail(gt_left_arm, follow_abs + 1, suffix_len, l_tgt_q)
+            l_tail = _take_tail(gt_left_arm, follow_abs, suffix_len, l_tgt_q)
             lt = np.concatenate([l_prefix, l_tail], axis=0).astype(np.float32)
             if prefix_len <= 1:
                 l_grip_prefix = np.array([tl_grip], dtype=np.float32)
             else:
                 l_grip_prefix = np.linspace(float(left_grip), tl_grip, prefix_len, dtype=np.float32)
-            l_grip_tail = _take_tail(left_grip_traj, follow_idx + 1, suffix_len, np.array([tl_grip], dtype=np.float32))[:, 0]
+            l_grip_tail = _take_tail(left_grip_traj, follow_idx, suffix_len, np.array([tl_grip], dtype=np.float32))[:, 0]
             lg = np.concatenate([l_grip_prefix, l_grip_tail], axis=0).astype(np.float32)
 
         if corr_right_active:
-            r_tail = _take_tail(gt_right_arm, follow_abs + 1, suffix_len, r_tgt_q)
+            r_tail = _take_tail(gt_right_arm, follow_abs, suffix_len, r_tgt_q)
             rt = np.concatenate([r_prefix, r_tail], axis=0).astype(np.float32)
             if prefix_len <= 1:
                 r_grip_prefix = np.array([tr_grip], dtype=np.float32)
             else:
                 r_grip_prefix = np.linspace(float(right_grip), tr_grip, prefix_len, dtype=np.float32)
-            r_grip_tail = _take_tail(right_grip_traj, follow_idx + 1, suffix_len, np.array([tr_grip], dtype=np.float32))[:, 0]
+            r_grip_tail = _take_tail(right_grip_traj, follow_idx, suffix_len, np.array([tr_grip], dtype=np.float32))[:, 0]
             rg = np.concatenate([r_grip_prefix, r_grip_tail], axis=0).astype(np.float32)
     else:
         if debug_dir is not None:
-            import json
             _dbg_corr = os.path.join(debug_dir, 'correction')
             os.makedirs(_dbg_corr, exist_ok=True)
             with open(os.path.join(_dbg_corr, 'skipped.json'), 'w') as _f:
@@ -1071,52 +1364,10 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
 
     # --- debug: save correction summary jsons ---
     if debug_dir is not None:
-        import json
         import cv2
         _dbg_corr = os.path.join(debug_dir, 'correction')
         os.makedirs(_dbg_corr, exist_ok=True)
         evac_corr_video = None
-        if debug_correction_evac_rollout:
-            try:
-                _lq0, _rq0 = curr_qpos_raw[0:6], curr_qpos_raw[7:13]
-                _lg0, _rg0 = curr_qpos_raw[6], curr_qpos_raw[13]
-                _fk0 = fk.forward(_lq0, _rq0)
-                _lp0, _lq0w = _fk0['left']
-                _rp0, _rq0w = _fk0['right']
-                fk_poses_corr = [(_lp0.copy(), _lq0w.copy(), _rp0.copy(), _rq0w.copy())]
-                grip_list_corr = [(float(_lg0), float(_rg0))]
-                for _ai in range(corr.shape[0]):
-                    _ar = corr[_ai]
-                    _fr = fk.forward(_ar[0:6], _ar[7:13])
-                    fk_poses_corr.append((
-                        _fr['left'][0].copy(), _fr['left'][1].copy(),
-                        _fr['right'][0].copy(), _fr['right'][1].copy()
-                    ))
-                    grip_list_corr.append((float(_ar[6]), float(_ar[13])))
-                evac_corr_debug_dir = os.path.join(_dbg_corr, 'evac_correction_generated')
-                _ = evac_inference(
-                    evac_model,
-                    evac_cfg,
-                    curr_image[0],
-                    fk_poses_corr,
-                    grip_list_corr,
-                    raw_data,
-                    device,
-                    save_dir=evac_corr_debug_dir,
-                    infer_kwargs=cfg.get('evac_infer_kwargs'),
-                )
-                _vpath_corr = os.path.join(evac_corr_debug_dir, 'outputs.mp4')
-                evac_corr_video = {
-                    'path': _vpath_corr,
-                    'exists': bool(os.path.exists(_vpath_corr)),
-                }
-            except Exception:
-                try:
-                    import traceback
-                    with open(os.path.join(_dbg_corr, 'evac_correction_generated_error.txt'), 'w') as _f:
-                        _f.write(traceback.format_exc())
-                except Exception:
-                    pass
         # Save correction projection overlays on original/corrected images.
         try:
             _cimg = (curr_image[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
@@ -1568,7 +1819,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         with open(os.path.join(_dbg_corr, 'closed_loop_info.json'), 'w') as _f:
             json.dump(_closed_loop_info, _f, indent=2)
 
-    error_action_prefix_raw = np.asarray(act_raw, dtype=np.float32).copy()
+    prefix_len_meta = int(np.clip(int(rollout_exec_steps), 1, int(corr.shape[0])))
+    error_action_prefix_raw = np.asarray(corr[:prefix_len_meta], dtype=np.float32).copy()
     if nearest_mode == "gripper_close":
         correction_branch = "gripper_close"
     elif nearest_mode == "translation":
@@ -1603,6 +1855,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
         ),
         "recover_eval_last": recover_eval_last,
+        "evac_rollout_videos": evac_rollout_videos,
+        "debug_dir": debug_dir,
         "error_action_prefix_raw": error_action_prefix_raw,
     }
 

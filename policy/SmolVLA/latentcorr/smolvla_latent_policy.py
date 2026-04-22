@@ -9,18 +9,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 THIS_DIR = Path(__file__).resolve().parent
-REPO_ROOT = THIS_DIR.parent
-SMOLVLA_SRC_DIR = REPO_ROOT / "src"
+PROJECT_ROOT = THIS_DIR.parents[2]
+SMOLVLA_ROOT = THIS_DIR.parent
+SMOLVLA_SRC_DIR = SMOLVLA_ROOT / "src"
 if not SMOLVLA_SRC_DIR.is_dir():
     raise FileNotFoundError(f"SmolVLA src directory not found: {SMOLVLA_SRC_DIR}")
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(SMOLVLA_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SMOLVLA_SRC_DIR))
 
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig
+from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig, Stage1WarmupConfig
 from policy.SmolVLA.latentcorr.latent_warmup import DynamicsWarmup
 
 
@@ -159,11 +160,21 @@ class ActionConditionedPredictor(nn.Module):
 
 
 class SmolVLALatentPolicy(nn.Module):
-    def __init__(self, base_policy: SmolVLAPolicy, bridge_cfg: SmolVLALatentBridgeConfig, warmup_cfg: DynamicsWarmupConfig):
+    def __init__(
+        self,
+        base_policy: SmolVLAPolicy,
+        bridge_cfg: SmolVLALatentBridgeConfig,
+        warmup_cfg: DynamicsWarmupConfig | Stage1WarmupConfig,
+    ):
         super().__init__()
         self.base_policy = base_policy
         self.bridge_cfg = bridge_cfg
-        self.beta_scheduler = DynamicsWarmup(warmup_cfg)
+        if isinstance(warmup_cfg, Stage1WarmupConfig):
+            self.beta_dynamics_scheduler = DynamicsWarmup(warmup_cfg.dynamics)
+            self.beta_condition_scheduler = DynamicsWarmup(warmup_cfg.condition)
+        else:
+            self.beta_dynamics_scheduler = DynamicsWarmup(warmup_cfg)
+            self.beta_condition_scheduler = DynamicsWarmup(warmup_cfg)
         self.projector: LatentProjector | None = None
         self.wm_adapter: ResidualLatentAdapter | None = None
         self.predictor: ActionConditionedPredictor | None = None
@@ -344,10 +355,13 @@ class SmolVLALatentPolicy(nn.Module):
         target_hw = (teacher_shared.shape[-2], teacher_shared.shape[-1])
         predicted_latent = self.predict_next_latent(batch, action_prefix, target_hw=target_hw)
 
-        beta_dynamics = self.beta_scheduler.weight(global_step)
-        beta_condition = beta_dynamics
+        beta_dynamics = self.beta_dynamics_scheduler.weight(global_step)
+        beta_condition = self.beta_condition_scheduler.weight(global_step)
         loss_action = self._action_loss(batch=batch, actions=batch[ACTION])
-        cond_token, cond_mask, cond_att_mask = self.build_condition_token(teacher_shared.detach(), scale=1.0)
+        cond_token, cond_mask, cond_att_mask = self.build_condition_token(
+            self.teacher_latent_to_map(future_teacher_latent).detach(),
+            scale=1.0,
+        )
         loss_action_conditioned = self._action_loss(
             batch=batch,
             actions=batch[ACTION],
@@ -398,8 +412,11 @@ class SmolVLALatentPolicy(nn.Module):
 
         target_hw = (rollout_shared.shape[-2], rollout_shared.shape[-1])
         predicted_latent = self.predict_next_latent(correction_batch, correction_action_prefix, target_hw=target_hw)
-        beta_dynamics = self.beta_scheduler.weight(global_step)
-        corr_token, corr_mask, corr_att_mask = self.build_condition_token(correction_shared.detach(), scale=1.0)
+        beta_dynamics = self.beta_dynamics_scheduler.weight(global_step)
+        corr_token, corr_mask, corr_att_mask = self.build_condition_token(
+            self.teacher_latent_to_map(correction_teacher_latent).detach(),
+            scale=1.0,
+        )
         loss_correct = self._action_loss(
             batch=correction_batch,
             actions=correction_actions,

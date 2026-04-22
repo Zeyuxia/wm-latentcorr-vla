@@ -14,6 +14,7 @@ class DynamicsWarmupConfig:
 class LatentLossConfig:
     lambda_action: float = 1.0
     lambda_action_conditioned: float = 0.0
+    schedule_action_conditioned: bool = False
     lambda_align: float = 0.1
     beta_dynamics_max: float = 1.0
     lambda_wm_action_current: float = 0.0

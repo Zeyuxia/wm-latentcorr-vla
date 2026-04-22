@@ -12,6 +12,8 @@ from policy.SmolVLA.latentcorr.failure_utils import (
     ACTIVE_ARM_PATTERN_KEYS,
     ERROR_MODE_KEYS,
     active_arm_pattern_key_to_id,
+    canonicalize_active_arm_pattern_key,
+    error_mode_key_to_id,
     error_mode_key_to_id,
     get_failure_param_bins,
     normalize_error_mode_dir_mag_bins,
@@ -20,9 +22,30 @@ from policy.SmolVLA.latentcorr.failure_utils import (
 )
 from policy.SmolVLA.latentcorr.latent_dataset_utils import get_norm_stats, list_valid_episode_ids, load_processed_episode_window
 from policy.SmolVLA.latentcorr.phase_utils import infer_phase_key_from_gt_window
+from policy.SmolVLA.latentcorr.correction_perturbation import (
+    _mag_value_from_bin,
+    _rotation_axis_from_bin,
+    _rotation_sign_from_bin,
+    _translation_dir_from_bin,
+)
 
 FAILURE_ERROR_MODES = tuple(ERROR_MODE_KEYS)
 ACTIVE_ARM_PATTERNS = set(ACTIVE_ARM_PATTERN_KEYS)
+EXPLORE_ACTIVE_ARM_PATTERN_SORT_KEYS = {
+    "left_arm": 0,
+    "right_arm": 1,
+}
+EXPLORE_PHASE_SORT_KEYS = {
+    "pregrasp": 0,
+    "approach": 1,
+    "transport": 2,
+    "place": 3,
+}
+EXPLORE_ERROR_MODE_SORT_KEYS = {
+    "gripper_close": 0,
+    "translation": 1,
+    "rotation": 2,
+}
 
 
 def _safe_float_or_nan(value) -> float:
@@ -34,10 +57,32 @@ def _safe_float_or_nan(value) -> float:
         return float("nan")
 
 
+def _phase_unit_sort_key(unit: dict) -> tuple[int, int, int, int]:
+    return (
+        int(EXPLORE_PHASE_SORT_KEYS.get(str(unit["phase_key"]), int(phase_key_to_id(str(unit["phase_key"]))))),
+        int(unit["phase_instance_idx"]),
+        int(unit["phase_bin_id"]),
+        int(EXPLORE_ACTIVE_ARM_PATTERN_SORT_KEYS.get(str(unit["active_arm_pattern"]), 999)),
+    )
+
+
+def _explore_unit_sort_key(unit: dict) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        int(EXPLORE_PHASE_SORT_KEYS.get(str(unit["phase_key"]), int(phase_key_to_id(str(unit["phase_key"]))))),
+        int(unit["phase_instance_idx"]),
+        int(unit["phase_bin_id"]),
+        int(EXPLORE_ACTIVE_ARM_PATTERN_SORT_KEYS.get(str(unit["active_arm_pattern"]), 999)),
+        int(EXPLORE_ERROR_MODE_SORT_KEYS.get(str(unit["error_mode"]), int(error_mode_key_to_id(str(unit["error_mode"]))))),
+        int(unit["dir_bin_id"]),
+        int(unit["mag_bin_id"]),
+    )
+
+
 class FailureAwareStage2Dataset(Dataset):
     def __init__(
         self,
         dataset_dir: str,
+        raw_data_dir: str | None,
         episode_ids: list[int],
         camera_names: list[str],
         norm_stats: dict[str, np.ndarray],
@@ -45,7 +90,6 @@ class FailureAwareStage2Dataset(Dataset):
         prefix_steps: int,
         future_offset: int,
         sample_phase_window_len: int,
-        sample_skip_head_ratio: float | None,
         start_margin: int,
         failure_mode: str,
         failure_table_path: str,
@@ -55,9 +99,13 @@ class FailureAwareStage2Dataset(Dataset):
         failure_rotation_dir_bins: int,
         failure_rotation_mag_bins: int,
         failure_explore_k: int,
+        perturb_eef_fail_gain: float = 0.08,
+        perturb_rot_max_deg: float = 15.0,
+        evac_sample_size: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
+        self.raw_data_dir = None if raw_data_dir is None else str(raw_data_dir).strip()
         self.episode_ids = [int(x) for x in episode_ids]
         self.camera_names = list(camera_names)
         self.norm_stats = norm_stats
@@ -65,7 +113,6 @@ class FailureAwareStage2Dataset(Dataset):
         self.prefix_steps = int(prefix_steps)
         self.future_offset = int(future_offset)
         self.sample_phase_window_len = int(max(1, sample_phase_window_len))
-        self.sample_skip_head_ratio = None if sample_skip_head_ratio is None else float(np.clip(sample_skip_head_ratio, 0.0, 0.99))
         self.start_margin = int(max(0, start_margin))
         self.failure_mode = str(failure_mode).strip().lower()
         if self.failure_mode not in {"off", "train", "explore"}:
@@ -73,11 +120,9 @@ class FailureAwareStage2Dataset(Dataset):
         self.failure_table_path = str(failure_table_path).strip()
         self.failure_phase_bins = int(max(1, failure_phase_bins))
         self.failure_explore_k = int(max(1, failure_explore_k))
-        self.failure_skip_approach_bins = 0
-        if self.failure_mode == "explore":
-            skip_bins = int(np.floor(float(self.sample_skip_head_ratio or 0.0) * float(self.failure_phase_bins)))
-            self.failure_skip_approach_bins = int(np.clip(skip_bins, 0, self.failure_phase_bins))
-
+        self.perturb_eef_fail_gain = float(perturb_eef_fail_gain)
+        self.perturb_rot_max_deg = float(perturb_rot_max_deg)
+        self.evac_sample_size = None if evac_sample_size is None else (int(evac_sample_size[0]), int(evac_sample_size[1]))
         set_failure_param_bins(
             translation_dir_bins=failure_translation_dir_bins,
             translation_mag_bins=failure_translation_mag_bins,
@@ -86,7 +131,9 @@ class FailureAwareStage2Dataset(Dataset):
         )
 
         self._phase_scan_cache: dict[tuple[int, int, int, int], dict[int, dict]] = {}
+        self._projection_visible_cache: dict[int, dict[int, dict[str, bool]]] = {}
         self._first_stage_len_cache: dict[tuple[int, int], int] = {}
+        self._episode_len_cache: dict[int, int] = {}
         self._failure_entries: list[dict] = []
         self._failure_entries_by_mode: dict[str, list[dict]] = {}
         self._failure_mode_probs: dict[str, float] | None = None
@@ -97,6 +144,19 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_seen_samples: set[tuple[int, int]] = set()
         self._explore_completed_unit_count = 0
         self._init_failure_units()
+
+    def _is_open_laptop_dataset(self) -> bool:
+        dataset_key = os.path.basename(os.path.normpath(self.dataset_dir)).strip().lower()
+        return "open_laptop" in dataset_key
+
+    def _should_skip_explore_phase_bin(self, phase_key: str, phase_bin_id: int) -> bool:
+        phase_key = str(phase_key).strip().lower()
+        phase_bin_id = int(phase_bin_id)
+        if phase_key in {"approach", "transport"}:
+            return phase_bin_id == 0
+        if phase_key in {"pregrasp", "place"}:
+            return phase_bin_id == int(self.failure_phase_bins) - 1
+        return False
 
     def __len__(self) -> int:
         return len(self.episode_ids)
@@ -112,23 +172,26 @@ class FailureAwareStage2Dataset(Dataset):
             trans_mag_bins = int(bin_cfg["translation_mag_bins"])
             rot_dir_bins = int(bin_cfg["rotation_dir_bins"])
             rot_mag_bins = int(bin_cfg["rotation_mag_bins"])
+            def add_if_valid(unit: dict) -> None:
+                if self._unit_has_local_candidate(unit):
+                    units.append(unit)
+
             for phase_unit in phase_units:
                 phase_key = str(phase_unit["phase_key"])
                 phase_instance_idx = int(phase_unit["phase_instance_idx"])
                 phase_bin_id = int(phase_unit["phase_bin_id"])
+                active_arm_pattern = str(phase_unit["active_arm_pattern"])
                 for mode in FAILURE_ERROR_MODES:
-                    if phase_key == "transport" and mode == "gripper_close":
-                        continue
                     if mode == "translation":
                         for dir_bin_id in range(trans_dir_bins):
                             for mag_bin_id in range(trans_mag_bins):
-                                units.append(
+                                add_if_valid(
                                     {
                                         "phase_key": phase_key,
                                         "phase_instance_idx": phase_instance_idx,
                                         "phase_bin_id": phase_bin_id,
                                         "error_mode": mode,
-                                        "active_arm_pattern": None,
+                                        "active_arm_pattern": active_arm_pattern,
                                         "dir_bin_id": dir_bin_id,
                                         "mag_bin_id": mag_bin_id,
                                         "weight": 1.0,
@@ -137,32 +200,32 @@ class FailureAwareStage2Dataset(Dataset):
                     elif mode == "rotation":
                         for dir_bin_id in range(rot_dir_bins):
                             for mag_bin_id in range(rot_mag_bins):
-                                units.append(
+                                add_if_valid(
                                     {
                                         "phase_key": phase_key,
                                         "phase_instance_idx": phase_instance_idx,
                                         "phase_bin_id": phase_bin_id,
                                         "error_mode": mode,
-                                        "active_arm_pattern": None,
+                                        "active_arm_pattern": active_arm_pattern,
                                         "dir_bin_id": dir_bin_id,
                                         "mag_bin_id": mag_bin_id,
                                         "weight": 1.0,
                                     }
                                 )
                     else:
-                        units.append(
+                        add_if_valid(
                             {
                                 "phase_key": phase_key,
                                 "phase_instance_idx": phase_instance_idx,
                                 "phase_bin_id": phase_bin_id,
                                 "error_mode": mode,
-                                "active_arm_pattern": None,
+                                "active_arm_pattern": active_arm_pattern,
                                 "dir_bin_id": -1,
                                 "mag_bin_id": -1,
                                 "weight": 1.0,
                             }
                         )
-            self._explore_units = units
+            self._explore_units = sorted(units, key=_explore_unit_sort_key)
             return
 
         if not self.failure_table_path:
@@ -190,9 +253,12 @@ class FailureAwareStage2Dataset(Dataset):
             phase_bin_id = int(np.clip(int(item["phase_bin_id"]), 0, self.failure_phase_bins - 1))
             active_pattern = item.get("active_arm_pattern")
             if active_pattern is not None:
-                active_pattern = str(active_pattern).strip().lower()
-                if active_pattern not in ACTIVE_ARM_PATTERNS:
+                try:
+                    active_pattern = canonicalize_active_arm_pattern_key(active_pattern)
+                except ValueError:
                     continue
+                if active_pattern == "both":
+                    active_pattern = None
             weight = float(item.get("weight", item.get("fail_rate", 1.0)))
             if (not np.isfinite(weight)) or weight <= 0.0:
                 weight = 1.0
@@ -258,75 +324,57 @@ class FailureAwareStage2Dataset(Dataset):
         for episode_id in self.episode_ids:
             max_start = self._resolve_max_start(int(episode_id))
             scan = self._scan_phase_bins(int(episode_id), 0, max_start)
-            for meta in scan.values():
+            projection_visible = self._scan_start_projection_visibility(int(episode_id))
+            for ts, meta in scan.items():
                 phase_key = str(meta["phase_key"])
                 phase_instance_idx = int(meta["phase_instance_idx"])
                 phase_bin_id = int(meta["phase_bin_id"])
-                if phase_key == "approach" and phase_bin_id < int(self.failure_skip_approach_bins):
+                raw_active_arm_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
+                try:
+                    active_arm_pattern = canonicalize_active_arm_pattern_key(raw_active_arm_pattern)
+                except ValueError:
                     continue
-                unit_key = (phase_key, phase_instance_idx, phase_bin_id)
-                if unit_key in unit_keys:
+                if self._should_skip_explore_phase_bin(phase_key, phase_bin_id):
                     continue
-                unit_keys.add(unit_key)
-                units.append(
-                    {
-                        "phase_key": phase_key,
-                        "phase_instance_idx": phase_instance_idx,
-                        "phase_bin_id": phase_bin_id,
-                    }
+                if self._is_open_laptop_dataset() and phase_key == "transport":
+                    continue
+                expanded_patterns = (
+                    ["left_arm", "right_arm"] if active_arm_pattern == "both" else [active_arm_pattern]
                 )
-        return units
+                for expanded_pattern in expanded_patterns:
+                    if (
+                        projection_visible
+                        and not bool(projection_visible.get(int(ts), {}).get(str(expanded_pattern), False))
+                    ):
+                        continue
+                    unit_key = (phase_key, phase_instance_idx, phase_bin_id, expanded_pattern)
+                    if unit_key in unit_keys:
+                        continue
+                    unit_keys.add(unit_key)
+                    units.append(
+                        {
+                            "phase_key": phase_key,
+                            "phase_instance_idx": phase_instance_idx,
+                            "phase_bin_id": phase_bin_id,
+                            "active_arm_pattern": expanded_pattern,
+                        }
+                    )
+        return sorted(units, key=_phase_unit_sort_key)
 
     def _get_episode_len(self, episode_id: int) -> int:
+        episode_id = int(episode_id)
+        if episode_id in self._episode_len_cache:
+            return int(self._episode_len_cache[episode_id])
         path = os.path.join(self.dataset_dir, f"episode_{int(episode_id)}.hdf5")
         with h5py.File(path, "r") as root:
-            return int(root["/action"].shape[0])
+            episode_len = int(root["/action"].shape[0])
+        self._episode_len_cache[episode_id] = int(episode_len)
+        return int(episode_len)
 
     def _resolve_max_start(self, episode_id: int) -> int:
         episode_len = self._get_episode_len(episode_id)
         max_start_future = episode_len - self.future_offset - 1
-        max_start_margin = episode_len - 1 - self.start_margin
-        return int(max(0, min(max_start_future, max_start_margin)))
-
-    def _get_first_stage_len(self, episode_id: int, max_start: int) -> int:
-        key = (int(episode_id), int(max_start))
-        if key in self._first_stage_len_cache:
-            return self._first_stage_len_cache[key]
-
-        n_valid = int(max(1, max_start + 1))
-        first_stage_len = n_valid
-        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
-        try:
-            with h5py.File(dataset_path, "r") as root:
-                action = root["/action"][()]
-            if action.ndim == 2 and action.shape[1] >= 14 and action.shape[0] > 1:
-                left_gripper = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
-                right_gripper = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
-                n_scan = min(n_valid, left_gripper.shape[0], right_gripper.shape[0])
-                first_non_approach = n_scan
-                for ts in range(n_scan):
-                    phase_key = infer_phase_key_from_gt_window(
-                        left_gripper[ts:],
-                        right_gripper[ts:],
-                        self.sample_phase_window_len,
-                    )
-                    if phase_key != "approach":
-                        first_non_approach = ts
-                        break
-                first_stage_len = int(first_non_approach)
-        except Exception:
-            first_stage_len = n_valid
-
-        first_stage_len = int(np.clip(first_stage_len, 0, n_valid))
-        self._first_stage_len_cache[key] = first_stage_len
-        return first_stage_len
-
-    def _resolve_min_start(self, episode_id: int, max_start: int) -> int:
-        if self.sample_skip_head_ratio is None:
-            return 0
-        first_stage_len = self._get_first_stage_len(episode_id, max_start)
-        min_start_ratio = int(np.floor(float(first_stage_len) * float(self.sample_skip_head_ratio)))
-        return int(np.clip(min_start_ratio, 0, max_start))
+        return int(max(0, max_start_future))
 
     def _infer_active_arm_pattern_from_action_window(
         self,
@@ -337,7 +385,7 @@ class FailureAwareStage2Dataset(Dataset):
     ) -> str:
         action_array = np.asarray(action, dtype=np.float32)
         if action_array.ndim != 2 or action_array.shape[0] <= 1 or action_array.shape[1] < 14:
-            return "both"
+            return "none"
 
         def bounds(num_steps: int) -> tuple[int, int]:
             if num_steps <= 1:
@@ -372,7 +420,7 @@ class FailureAwareStage2Dataset(Dataset):
             return "left_only"
         if right_on:
             return "right_only"
-        return "both"
+        return "none"
 
     def _scan_phase_bins(self, episode_id: int, min_start: int, max_start: int) -> dict[int, dict]:
         key = (int(episode_id), int(min_start), int(max_start), int(self.failure_phase_bins))
@@ -423,6 +471,180 @@ class FailureAwareStage2Dataset(Dataset):
 
         self._phase_scan_cache[key] = info
         return info
+
+    @staticmethod
+    def _pose_wxyz_to_matrix(pose_wxyz: np.ndarray) -> np.ndarray:
+        from scipy.spatial.transform import Rotation as R
+
+        pose = np.asarray(pose_wxyz, dtype=np.float32).reshape(7,)
+        mat = np.eye(4, dtype=np.float32)
+        q_wxyz = pose[3:7]
+        q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float32)
+        mat[:3, :3] = R.from_quat(q_xyzw).as_matrix().astype(np.float32)
+        mat[:3, 3] = pose[:3]
+        return mat
+
+    @staticmethod
+    def _evac_gripper_keypoints_world(pose_wxyz: np.ndarray) -> np.ndarray:
+        # Match EVAC get_traj(): pose_mat @ Gripper2EEFCvt @ EndEffectorPts.
+        end_effector_pts = np.asarray(
+            [[0.0, 0.0, 0.0, 1.0], [0.1, 0.0, 0.0, 1.0], [0.0, 0.1, 0.0, 1.0], [0.0, 0.0, 0.1, 1.0]],
+            dtype=np.float32,
+        ).T
+        gripper_to_eef = np.asarray(
+            [[1.0, 0.0, 0.0, 0.085], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        pts = FailureAwareStage2Dataset._pose_wxyz_to_matrix(pose_wxyz) @ gripper_to_eef @ end_effector_pts
+        return pts[:3, :].T.astype(np.float32)
+
+    @staticmethod
+    def _project_point_in_image(point_3d: np.ndarray, intrinsic: np.ndarray, w2c: np.ndarray, width: int, height: int) -> bool:
+        point_homo = np.append(np.asarray(point_3d, dtype=np.float32).reshape(3,), 1.0).astype(np.float32)
+        w2c_arr = np.asarray(w2c, dtype=np.float32)
+        if w2c_arr.shape == (3, 4):
+            point_cam = w2c_arr @ point_homo
+        elif w2c_arr.shape == (4, 4):
+            point_cam = (w2c_arr @ point_homo)[:3]
+        else:
+            return False
+        if point_cam.shape[0] < 3 or (not np.all(np.isfinite(point_cam))) or float(point_cam[2]) <= 1e-6:
+            return False
+        point_img = np.asarray(intrinsic, dtype=np.float32).reshape(3, 3) @ point_cam[:3]
+        if (not np.all(np.isfinite(point_img))) or abs(float(point_img[2])) <= 1e-6:
+            return False
+        u = float(point_img[0] / point_img[2])
+        v = float(point_img[1] / point_img[2])
+        return bool(0.0 <= u < float(width) and 0.0 <= v < float(height))
+
+    @staticmethod
+    def _evac_gripper_projection_visible(pose_wxyz: np.ndarray, intrinsic: np.ndarray, w2c: np.ndarray, width: int, height: int) -> bool:
+        pts_world = FailureAwareStage2Dataset._evac_gripper_keypoints_world(pose_wxyz)
+        return all(
+            FailureAwareStage2Dataset._project_point_in_image(pt, intrinsic, w2c, width, height)
+            for pt in pts_world
+        )
+
+    def _scan_start_projection_visibility(self, episode_id: int) -> dict[int, dict[str, bool | np.ndarray]]:
+        episode_id = int(episode_id)
+        if episode_id in self._projection_visible_cache:
+            return self._projection_visible_cache[episode_id]
+        raw_path = None
+        if self.raw_data_dir:
+            raw_path = os.path.join(self.raw_data_dir, f"episode{episode_id}.hdf5")
+        if not raw_path or not os.path.isfile(raw_path):
+            self._projection_visible_cache[episode_id] = {}
+            return {}
+        try:
+            with h5py.File(raw_path, "r") as root:
+                left_endpose = root["endpose/left_endpose"][()].astype(np.float32)
+                right_endpose = root["endpose/right_endpose"][()].astype(np.float32)
+                intrinsic = root["observation/head_camera/intrinsic_cv"][0].astype(np.float32)
+                ext_cv = root["observation/head_camera/extrinsic_cv"][0].astype(np.float32)
+                w2c = np.eye(4, dtype=np.float32)
+                w2c[:3, :] = ext_cv
+                rgb0 = root["observation/head_camera/rgb"][0]
+                native_height, native_width = self._resolve_raw_rgb_hw(rgb0)
+                if self.evac_sample_size is None:
+                    height, width = int(native_height), int(native_width)
+                else:
+                    height, width = int(self.evac_sample_size[0]), int(self.evac_sample_size[1])
+                intrinsic_scaled = intrinsic.copy()
+                intrinsic_scaled[0, 0] *= float(width) / float(native_width)
+                intrinsic_scaled[0, 2] *= float(width) / float(native_width)
+                intrinsic_scaled[1, 1] *= float(height) / float(native_height)
+                intrinsic_scaled[1, 2] *= float(height) / float(native_height)
+        except Exception:
+            self._projection_visible_cache[episode_id] = {}
+            return {}
+        visible = {}
+        n = int(min(left_endpose.shape[0], right_endpose.shape[0]))
+        for ts in range(n):
+            visible[int(ts)] = {
+                "left_arm": self._evac_gripper_projection_visible(left_endpose[ts], intrinsic_scaled, w2c, width, height),
+                "right_arm": self._evac_gripper_projection_visible(right_endpose[ts], intrinsic_scaled, w2c, width, height),
+                "_left_pose": left_endpose[ts].copy(),
+                "_right_pose": right_endpose[ts].copy(),
+                "_intrinsic": intrinsic_scaled,
+                "_w2c": w2c,
+                "_width": int(width),
+                "_height": int(height),
+            }
+        self._projection_visible_cache[episode_id] = visible
+        return visible
+
+    @staticmethod
+    def _resolve_raw_rgb_hw(rgb_frame) -> tuple[int, int]:
+        if getattr(rgb_frame, "ndim", 0) >= 2:
+            return int(rgb_frame.shape[0]), int(rgb_frame.shape[1])
+        try:
+            import cv2
+
+            decoded = cv2.imdecode(np.frombuffer(bytes(rgb_frame), np.uint8), cv2.IMREAD_COLOR)
+            if decoded is not None and decoded.size > 0:
+                return int(decoded.shape[0]), int(decoded.shape[1])
+        except Exception:
+            pass
+        return 240, 320
+
+    def _unit_projection_visible(self, projection_visible: dict, ts: int, unit: dict) -> bool:
+        if not projection_visible:
+            return True
+        item = projection_visible.get(int(ts), {})
+        active_arm = str(unit.get("active_arm_pattern", "left_arm"))
+        if active_arm not in {"left_arm", "right_arm"}:
+            return False
+        if not bool(item.get(active_arm, False)):
+            return False
+
+        mode = str(unit.get("error_mode", "")).strip().lower()
+        if mode not in {"translation", "rotation"}:
+            return True
+
+        intrinsic = item.get("_intrinsic")
+        w2c = item.get("_w2c")
+        width = item.get("_width")
+        height = item.get("_height")
+        left_pose = item.get("_left_pose")
+        right_pose = item.get("_right_pose")
+        if left_pose is None or right_pose is None or intrinsic is None or w2c is None or width is None or height is None:
+            return True
+
+        target_left_pose = np.asarray(left_pose, dtype=np.float32).copy()
+        target_right_pose = np.asarray(right_pose, dtype=np.float32).copy()
+        active_pose = target_left_pose if active_arm == "left_arm" else target_right_pose
+        bin_cfg = get_failure_param_bins()
+        dir_bin_id = int(unit.get("dir_bin_id", -1))
+        mag_bin_id = int(unit.get("mag_bin_id", -1))
+        if mode == "translation":
+            n_dir = int(max(1, bin_cfg["translation_dir_bins"]))
+            n_mag = int(max(1, bin_cfg["translation_mag_bins"]))
+            dir_bin_id = int(np.clip(dir_bin_id, 0, n_dir - 1))
+            mag_bin_id = int(np.clip(mag_bin_id, 0, n_mag - 1))
+            fail_gain, _ = _mag_value_from_bin(self.perturb_eef_fail_gain, mag_bin_id, n_mag)
+            direction, _ = _translation_dir_from_bin(active_pose[3:7], dir_bin_id)
+            active_pose[:3] = active_pose[:3] + float(fail_gain) * np.asarray(direction, dtype=np.float32)
+        elif mode == "rotation":
+            from scipy.spatial.transform import Rotation as R
+
+            n_dir = int(max(1, bin_cfg["rotation_dir_bins"]))
+            n_mag = int(max(1, bin_cfg["rotation_mag_bins"]))
+            dir_bin_id = int(np.clip(dir_bin_id, 0, n_dir - 1))
+            mag_bin_id = int(np.clip(mag_bin_id, 0, n_mag - 1))
+            angle_max_deg, _ = _mag_value_from_bin(self.perturb_rot_max_deg, mag_bin_id, n_mag)
+            rot_sign, _ = _rotation_sign_from_bin(dir_bin_id, n_dir)
+            axis, _ = _rotation_axis_from_bin(active_pose[3:7], dir_bin_id)
+            q_xyzw = np.array([active_pose[4], active_pose[5], active_pose[6], active_pose[3]], dtype=np.float32)
+            q_new = (
+                R.from_rotvec(np.asarray(axis, dtype=np.float32) * np.deg2rad(float(angle_max_deg) * float(rot_sign)))
+                * R.from_quat(q_xyzw)
+            ).as_quat()
+            active_pose[3:7] = np.array([q_new[3], q_new[0], q_new[1], q_new[2]], dtype=np.float32)
+
+        intrinsic_arr = np.asarray(intrinsic, dtype=np.float32)
+        w2c_arr = np.asarray(w2c, dtype=np.float32)
+        active_target_pose = target_left_pose if active_arm == "left_arm" else target_right_pose
+        return bool(self._evac_gripper_projection_visible(active_target_pose, intrinsic_arr, w2c_arr, int(width), int(height)))
 
     def _select_failure_unit(self) -> tuple[dict, int] | None:
         if self.failure_mode == "explore":
@@ -477,8 +699,9 @@ class FailureAwareStage2Dataset(Dataset):
         for offset in range(num_episodes):
             episode_id = int(self.episode_ids[(int(base_index) + offset) % num_episodes])
             max_start = self._resolve_max_start(episode_id)
-            min_start = 0 if self.failure_mode == "explore" else self._resolve_min_start(episode_id, max_start)
+            min_start = 0
             scan = self._scan_phase_bins(episode_id, min_start, max_start)
+            projection_visible = self._scan_start_projection_visibility(episode_id)
             candidates = []
             for ts, meta in scan.items():
                 if str(meta["phase_key"]) != str(unit["phase_key"]):
@@ -489,8 +712,16 @@ class FailureAwareStage2Dataset(Dataset):
                 if int(meta["phase_bin_id"]) != int(unit["phase_bin_id"]):
                     continue
                 target_pattern = unit.get("active_arm_pattern")
-                if target_pattern is not None and str(meta["active_arm_pattern"]) != str(target_pattern):
-                    continue
+                if target_pattern is not None:
+                    meta_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
+                    try:
+                        meta_pattern = canonicalize_active_arm_pattern_key(meta_pattern)
+                    except ValueError:
+                        continue
+                    if meta_pattern != "both" and str(meta_pattern) != str(target_pattern):
+                        continue
+                    if not self._unit_projection_visible(projection_visible, int(ts), unit):
+                        continue
                 candidates.append(int(ts))
             if not candidates:
                 continue
@@ -504,7 +735,7 @@ class FailureAwareStage2Dataset(Dataset):
                 "phase_key": str(meta.get("phase_key", unit["phase_key"])),
                 "phase_instance_idx": int(meta.get("phase_instance_idx", -1)),
                 "phase_bin_id": int(meta.get("phase_bin_id", unit["phase_bin_id"])),
-                "active_arm_pattern": str(meta.get("active_arm_pattern", "both")),
+                "active_arm_pattern": str(unit.get("active_arm_pattern", "left_arm")),
                 "error_mode": str(unit["error_mode"]),
                 "dir_bin_id": int(unit.get("dir_bin_id", -1)),
                 "mag_bin_id": int(unit.get("mag_bin_id", -1)),
@@ -514,6 +745,37 @@ class FailureAwareStage2Dataset(Dataset):
                 "sampled_unit_prob": unit.get("sampled_unit_prob", None),
             }
         raise RuntimeError(f"Failure unit has no local candidate: {unit} (dataset={self.dataset_dir})")
+
+    def _iter_unit_candidate_ts(self, unit: dict, base_index: int = 0):
+        num_episodes = len(self.episode_ids)
+        for offset in range(num_episodes):
+            episode_id = int(self.episode_ids[(int(base_index) + offset) % num_episodes])
+            max_start = self._resolve_max_start(episode_id)
+            scan = self._scan_phase_bins(episode_id, 0, max_start)
+            projection_visible = self._scan_start_projection_visibility(episode_id)
+            for ts, meta in scan.items():
+                if str(meta["phase_key"]) != str(unit["phase_key"]):
+                    continue
+                target_phase_instance = unit.get("phase_instance_idx")
+                if target_phase_instance is not None and int(meta.get("phase_instance_idx", -1)) != int(target_phase_instance):
+                    continue
+                if int(meta["phase_bin_id"]) != int(unit["phase_bin_id"]):
+                    continue
+                target_pattern = unit.get("active_arm_pattern")
+                if target_pattern is not None:
+                    meta_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
+                    try:
+                        meta_pattern = canonicalize_active_arm_pattern_key(meta_pattern)
+                    except ValueError:
+                        continue
+                    if meta_pattern != "both" and str(meta_pattern) != str(target_pattern):
+                        continue
+                    if not self._unit_projection_visible(projection_visible, int(ts), unit):
+                        continue
+                yield episode_id, int(ts), meta
+
+    def _unit_has_local_candidate(self, unit: dict) -> bool:
+        return next(self._iter_unit_candidate_ts(unit, base_index=0), None) is not None
 
     def record_explore_trial(self, unit_idx: int, episode_id: int, start_ts: int) -> None:
         if self.failure_mode != "explore" or not self._explore_units:
@@ -556,19 +818,33 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_seen_samples = set()
         self._explore_completed_unit_count = 0
 
+    def set_episode_ids(self, episode_ids: list[int] | None) -> None:
+        self.episode_ids = [int(x) for x in list(episode_ids or [])]
+        self._phase_scan_cache = {}
+        self._projection_visible_cache = {}
+        self._first_stage_len_cache = {}
+        self._episode_len_cache = {}
+        self._failure_entries = []
+        self._failure_entries_by_mode = {}
+        self._failure_mode_probs = None
+        self._explore_units = []
+        self._explore_curr_unit_idx = 0
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+        self._explore_completed_unit_count = 0
+        self._init_failure_units()
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
         if self.failure_mode in {"train", "explore"}:
             sampled = self._sample_start_ts_from_failure_unit(index)
             assert sampled is not None
             episode_id = int(sampled["episode_id"])
             start_ts = int(sampled["start_ts"])
-            pregrasp_seg_start = int(sampled.get("seg_start", -1))
-            pregrasp_seg_end = int(sampled.get("seg_end", -1))
             sampled_phase_key = str(sampled.get("phase_key", "approach"))
             sampled_phase_instance_id = int(sampled.get("phase_instance_idx", -1))
             sampled_phase_bin_id = int(sampled.get("phase_bin_id", -1))
             forced_error_mode_id = error_mode_key_to_id(str(sampled.get("error_mode", "translation")))
-            sampled_active_arm_pattern_id = active_arm_pattern_key_to_id(str(sampled.get("active_arm_pattern", "both")))
+            sampled_active_arm_pattern_id = active_arm_pattern_key_to_id(str(sampled.get("active_arm_pattern", "left_arm")))
             forced_dir_bin_id = int(sampled.get("dir_bin_id", -1))
             forced_mag_bin_id = int(sampled.get("mag_bin_id", -1))
             sampled_explore_unit_idx = int(sampled.get("explore_unit_idx", -1))
@@ -578,10 +854,8 @@ class FailureAwareStage2Dataset(Dataset):
         else:
             episode_id = int(self.episode_ids[index])
             max_start = self._resolve_max_start(episode_id)
-            min_start = self._resolve_min_start(episode_id, max_start)
+            min_start = 0
             start_ts = int(np.random.randint(min_start, max_start + 1))
-            pregrasp_seg_start = -1
-            pregrasp_seg_end = -1
             sampled_phase_key = infer_phase_key_from_gt_window(np.zeros((1,), dtype=np.float32), np.zeros((1,), dtype=np.float32), 1)
             sampled_phase_instance_id = -1
             sampled_phase_bin_id = -1
@@ -621,8 +895,6 @@ class FailureAwareStage2Dataset(Dataset):
                 sampled_phase_bin_id = int(np.clip(sampled_phase_bin_id, 0, self.failure_phase_bins - 1))
 
         sample["sampled_phase_id"] = torch.tensor(phase_key_to_id(sampled_phase_key), dtype=torch.int64)
-        sample["pregrasp_seg_start"] = torch.tensor(pregrasp_seg_start, dtype=torch.int64)
-        sample["pregrasp_seg_end"] = torch.tensor(pregrasp_seg_end, dtype=torch.int64)
         sample["sampled_phase_bin_id"] = torch.tensor(sampled_phase_bin_id, dtype=torch.int64)
         sample["sampled_phase_instance_id"] = torch.tensor(sampled_phase_instance_id, dtype=torch.int64)
         sample["forced_error_mode_id"] = torch.tensor(forced_error_mode_id, dtype=torch.int64)
@@ -644,7 +916,6 @@ def build_failure_table_dataset(
     prefix_steps: int,
     future_offset: int,
     sample_phase_window_len: int,
-    sample_skip_head_ratio: float | None,
     start_margin: int,
     failure_mode: str,
     failure_table_path: str,
@@ -654,11 +925,16 @@ def build_failure_table_dataset(
     failure_rotation_dir_bins: int,
     failure_rotation_mag_bins: int,
     failure_explore_k: int,
+    raw_data_dir: str | None = None,
+    perturb_eef_fail_gain: float = 0.08,
+    perturb_rot_max_deg: float = 15.0,
+    evac_sample_size: tuple[int, int] | None = None,
 ) -> tuple[FailureAwareStage2Dataset, dict[str, np.ndarray]]:
     stats = get_norm_stats(dataset_dir, num_episodes)
     valid_ids = list_valid_episode_ids(dataset_dir, num_episodes, future_offset)
     dataset = FailureAwareStage2Dataset(
         dataset_dir=dataset_dir,
+        raw_data_dir=raw_data_dir,
         episode_ids=valid_ids,
         camera_names=camera_names,
         norm_stats=stats,
@@ -666,7 +942,6 @@ def build_failure_table_dataset(
         prefix_steps=prefix_steps,
         future_offset=future_offset,
         sample_phase_window_len=sample_phase_window_len,
-        sample_skip_head_ratio=sample_skip_head_ratio,
         start_margin=start_margin,
         failure_mode=failure_mode,
         failure_table_path=failure_table_path,
@@ -676,5 +951,8 @@ def build_failure_table_dataset(
         failure_rotation_dir_bins=failure_rotation_dir_bins,
         failure_rotation_mag_bins=failure_rotation_mag_bins,
         failure_explore_k=failure_explore_k,
+        perturb_eef_fail_gain=perturb_eef_fail_gain,
+        perturb_rot_max_deg=perturb_rot_max_deg,
+        evac_sample_size=evac_sample_size,
     )
     return dataset, stats

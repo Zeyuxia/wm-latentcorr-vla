@@ -32,6 +32,7 @@ class Stage1LossOutput:
     loss_bridge_future: torch.Tensor
     beta_dynamics: float
     alpha_latent: float
+    lambda_action_conditioned_eff: float
 
 
 @dataclass
@@ -332,9 +333,12 @@ class ACTLatentStage1(nn.Module):
         loss_bridge_future = self._masked_l1(bridge_future, action_future_prefix, is_pad_future_prefix)
 
         beta_dyn = alpha_latent * self.latent_loss_cfg.beta_dynamics_max
+        lambda_action_conditioned_eff = float(self.latent_loss_cfg.lambda_action_conditioned)
+        if self.latent_loss_cfg.schedule_action_conditioned:
+            lambda_action_conditioned_eff *= float(alpha_latent)
         loss = (
             (self.latent_loss_cfg.lambda_action * loss_action)
-            + (self.latent_loss_cfg.lambda_action_conditioned * loss_action_conditioned)
+            + (lambda_action_conditioned_eff * loss_action_conditioned)
             + (self.latent_loss_cfg.lambda_align * loss_align)
             + (self.latent_loss_cfg.lambda_wm_action_current * loss_wm_action_current)
             + (self.latent_loss_cfg.lambda_wm_action_future * loss_wm_action_future)
@@ -353,6 +357,7 @@ class ACTLatentStage1(nn.Module):
             loss_bridge_future=loss_bridge_future,
             beta_dynamics=beta_dyn,
             alpha_latent=alpha_latent,
+            lambda_action_conditioned_eff=lambda_action_conditioned_eff,
         )
 
     def prepare_stage2_context(

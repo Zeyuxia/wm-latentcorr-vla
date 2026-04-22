@@ -43,29 +43,68 @@ def _infer_meta(source_dir: str) -> dict[str, int]:
     return {key: int(value) for key, value in meta.items()}
 
 
-def _build_entries(trials: list[dict], fail_thresh: float) -> list[dict]:
-    stats: dict[tuple[str, int, int, str, int, int], dict[str, int]] = {}
+def _build_entries(trials: list[dict], fail_thresh: float) -> tuple[list[dict], dict]:
+    stats: dict[tuple[str, int, int, str, str, int, int], dict[str, int]] = {}
     for trial in trials:
+        active_arm_pattern = str(trial.get("active_arm_pattern", "both")).strip().lower()
+        if active_arm_pattern == "left_arm":
+            active_arm_pattern = "left_only"
+        elif active_arm_pattern == "right_arm":
+            active_arm_pattern = "right_only"
+        if active_arm_pattern not in {"left_only", "right_only", "both"}:
+            active_arm_pattern = "both"
         key = (
             str(trial["phase_key"]),
             int(trial["phase_instance_idx"]),
             int(trial["phase_bin_id"]),
             str(trial["error_mode"]),
+            active_arm_pattern,
             int(trial["dir_bin_id"]),
             int(trial["mag_bin_id"]),
         )
+        invalid_trial = bool(trial.get("invalid_trial", False))
+        invalid_reason = str(trial.get("invalid_reason", "")).strip()
         recoverable = bool(trial.get("recoverable", False))
         if key not in stats:
-            stats[key] = {"n": 0, "n_recover": 0}
+            stats[key] = {"n": 0, "n_valid": 0, "n_recover": 0, "n_invalid_blurry": 0}
         stats[key]["n"] += 1
+        if invalid_trial and invalid_reason == "evac_blurry_after_perturb":
+            stats[key]["n_invalid_blurry"] += 1
+            continue
+        if invalid_trial:
+            continue
+        stats[key]["n_valid"] += 1
         stats[key]["n_recover"] += int(recoverable)
 
     entries = []
+    excluded_blurry_units = []
     for key, count in sorted(stats.items()):
-        phase_key, phase_instance_idx, phase_bin_id, error_mode, dir_bin_id, mag_bin_id = key
+        phase_key, phase_instance_idx, phase_bin_id, error_mode, active_arm_pattern, dir_bin_id, mag_bin_id = key
         n_trials = int(count["n"])
+        n_valid = int(count["n_valid"])
         n_recover = int(count["n_recover"])
-        recover_rate = float(n_recover) / float(max(1, n_trials))
+        n_invalid_blurry = int(count["n_invalid_blurry"])
+        blurry_rate = float(n_invalid_blurry) / float(max(1, n_trials))
+        if n_invalid_blurry > (0.5 * float(n_trials)):
+            excluded_blurry_units.append(
+                {
+                    "phase_key": str(phase_key),
+                    "phase_instance_idx": int(phase_instance_idx),
+                    "phase_bin_id": int(phase_bin_id),
+                    "error_mode": str(error_mode),
+                    "active_arm_pattern": str(active_arm_pattern),
+                    "dir_bin_id": int(dir_bin_id),
+                    "mag_bin_id": int(mag_bin_id),
+                    "n_trials": int(n_trials),
+                    "n_valid": int(n_valid),
+                    "n_invalid_blurry": int(n_invalid_blurry),
+                    "blurry_rate": float(blurry_rate),
+                }
+            )
+            continue
+        if n_valid <= 0:
+            continue
+        recover_rate = float(n_recover) / float(max(1, n_valid))
         if recover_rate > float(fail_thresh):
             continue
         entries.append(
@@ -74,17 +113,25 @@ def _build_entries(trials: list[dict], fail_thresh: float) -> list[dict]:
                 "phase_instance_idx": int(phase_instance_idx),
                 "phase_bin_id": int(phase_bin_id),
                 "error_mode": str(error_mode),
-                "active_arm_pattern": None,
+                "active_arm_pattern": str(active_arm_pattern),
                 "dir_bin_id": int(dir_bin_id),
                 "mag_bin_id": int(mag_bin_id),
                 "n_trials": int(n_trials),
+                "n_valid": int(n_valid),
                 "n_recover": int(n_recover),
+                "n_invalid_blurry": int(n_invalid_blurry),
+                "blurry_rate": float(blurry_rate),
                 "recover_rate": float(recover_rate),
                 "fail_rate": float(1.0 - recover_rate),
                 "weight": float(max(1e-6, 1.0 - recover_rate)),
             }
         )
-    return entries
+    summary = {
+        "num_units_seen": int(len(stats)),
+        "num_units_excluded_blurry_majority": int(len(excluded_blurry_units)),
+        "excluded_blurry_units": excluded_blurry_units,
+    }
+    return entries, summary
 
 
 def merge_failure_dir(
@@ -109,7 +156,7 @@ def merge_failure_dir(
             trials.extend(payload)
 
     meta = _infer_meta(source_dir)
-    entries = _build_entries(trials, float(failure_fail_recover_rate_thresh))
+    entries, merge_summary = _build_entries(trials, float(failure_fail_recover_rate_thresh))
     mode = "explore_merged_live" if epoch is None else "explore_merged_epoch"
 
     merged_trials_path = os.path.join(output_dir, "failure_trials_merged.json")
@@ -127,6 +174,7 @@ def merge_failure_dir(
         "failure_rotation_mag_bins": int(meta["failure_rotation_mag_bins"]),
         "failure_explore_k": int(meta["failure_explore_k"]),
         "failure_fail_recover_rate_thresh": float(failure_fail_recover_rate_thresh),
+        "merge_summary": merge_summary,
         "entries": entries,
     }
 

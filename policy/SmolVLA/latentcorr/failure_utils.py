@@ -10,14 +10,14 @@ ERROR_MODE_KEYS = ("translation", "rotation", "gripper_close")
 ERROR_MODE_KEY_TO_ID = {key: idx for idx, key in enumerate(ERROR_MODE_KEYS)}
 ERROR_MODE_ID_TO_KEY = {idx: key for idx, key in enumerate(ERROR_MODE_KEYS)}
 
-ACTIVE_ARM_PATTERN_KEYS = ("left_only", "right_only", "both")
+ACTIVE_ARM_PATTERN_KEYS = ("left_arm", "right_arm")
 ACTIVE_ARM_PATTERN_KEY_TO_ID = {key: idx for idx, key in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
 ACTIVE_ARM_PATTERN_ID_TO_KEY = {idx: key for idx, key in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
 
 FAILURE_TRANSLATION_DIR_BINS = 5
-FAILURE_TRANSLATION_MAG_BINS = 3
+FAILURE_TRANSLATION_MAG_BINS = 1
 FAILURE_ROTATION_DIR_BINS = 6
-FAILURE_ROTATION_MAG_BINS = 3
+FAILURE_ROTATION_MAG_BINS = 1
 
 
 def set_failure_param_bins(
@@ -76,8 +76,22 @@ def error_mode_id_to_key(error_mode_id: int) -> str:
     return str(ERROR_MODE_ID_TO_KEY[idx])
 
 
-def active_arm_pattern_key_to_id(active_arm_pattern_key: str) -> int:
+def canonicalize_active_arm_pattern_key(active_arm_pattern_key: str) -> str:
     key = str(active_arm_pattern_key).strip().lower()
+    if key in {"left_arm", "left_only"}:
+        return "left_arm"
+    if key in {"right_arm", "right_only"}:
+        return "right_arm"
+    if key == "both":
+        return "both"
+    raise ValueError(
+        "Invalid active_arm_pattern_key="
+        f"{active_arm_pattern_key!r}. Expected one of left_arm/right_arm/both."
+    )
+
+
+def active_arm_pattern_key_to_id(active_arm_pattern_key: str) -> int:
+    key = canonicalize_active_arm_pattern_key(active_arm_pattern_key)
     if key not in ACTIVE_ARM_PATTERN_KEY_TO_ID:
         raise ValueError(
             "Invalid active_arm_pattern_key="
