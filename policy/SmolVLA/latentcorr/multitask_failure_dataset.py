@@ -44,6 +44,7 @@ class MultiTaskFailureDataset(Dataset):
         for task_idx, spec in enumerate(self.task_specs):
             dataset = FailureAwareStage2Dataset(
                 dataset_dir=spec.dataset_dir,
+                raw_data_dir=spec.raw_data_dir,
                 episode_ids=list(range(int(spec.num_episodes))),
                 camera_names=list(spec.camera_names),
                 norm_stats=self.norm_stats,
