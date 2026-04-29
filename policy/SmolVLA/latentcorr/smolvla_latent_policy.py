@@ -359,7 +359,7 @@ class SmolVLALatentPolicy(nn.Module):
         beta_condition = self.beta_condition_scheduler.weight(global_step)
         loss_action = self._action_loss(batch=batch, actions=batch[ACTION])
         cond_token, cond_mask, cond_att_mask = self.build_condition_token(
-            self.teacher_latent_to_map(future_teacher_latent).detach(),
+            predicted_latent.detach(),
             scale=1.0,
         )
         loss_action_conditioned = self._action_loss(
@@ -369,7 +369,7 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_mask=cond_mask,
             external_prefix_att_mask=cond_att_mask,
         )
-        loss_dynamics = F.mse_loss(predicted_latent, teacher_shared.detach())
+        loss_dynamics = F.mse_loss(predicted_latent, teacher_shared)
         loss = loss_action + (beta_condition * loss_action_conditioned) + (beta_dynamics * loss_dynamics)
         return SmolVLAStage1LossOutput(
             loss=loss,
@@ -414,7 +414,7 @@ class SmolVLALatentPolicy(nn.Module):
         predicted_latent = self.predict_next_latent(correction_batch, correction_action_prefix, target_hw=target_hw)
         beta_dynamics = self.beta_dynamics_scheduler.weight(global_step)
         corr_token, corr_mask, corr_att_mask = self.build_condition_token(
-            self.teacher_latent_to_map(correction_teacher_latent).detach(),
+            predicted_latent.detach(),
             scale=1.0,
         )
         loss_correct = self._action_loss(
@@ -425,7 +425,7 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_att_mask=corr_att_mask,
         )
         loss_retain = self._action_loss(batch=normal_batch, actions=normal_batch[ACTION])
-        loss_dynamics = F.mse_loss(predicted_latent, rollout_shared.detach())
+        loss_dynamics = F.mse_loss(predicted_latent, rollout_shared)
         loss = loss_correct + (float(retain_weight) * loss_retain) + (beta_dynamics * loss_dynamics)
         return SmolVLAStage2LossOutput(
             loss=loss,

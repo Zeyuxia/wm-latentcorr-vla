@@ -31,6 +31,7 @@ from policy.ACT.constants import SIM_TASK_CONFIGS
 from policy.SmolVLA.latentcorr.act_aligned_correction import ACTAlignedCorrectionBuilder, build_act_aligned_cfg_from_args
 from policy.SmolVLA.latentcorr.evac_interface import EvacLatentTeacher
 from policy.SmolVLA.latentcorr.correction_policy_adapter import SampleBoundSmolVLAAdapter
+from policy.SmolVLA.latentcorr.failure_utils import active_arm_pattern_id_to_key, error_mode_id_to_key, phase_id_to_key
 from policy.SmolVLA.latentcorr.latent_dataset_utils import load_raw_episode
 from policy.SmolVLA.latentcorr.multitask_latent_utils import resolve_multitask_specs
 from policy.SmolVLA.latentcorr.smolvla_data_utils import make_smolvla_processors
@@ -91,7 +92,16 @@ def get_explore_completed_unit_count(dataset) -> int:
 def get_explore_completed_sample_count(dataset, k_per_unit: int) -> int:
     completed_units = get_explore_completed_unit_count(dataset)
     current_trials = get_current_explore_trial_count(dataset)
+    if hasattr(dataset, "_explore_unit_target_trials"):
+        target_trials = list(getattr(dataset, "_explore_unit_target_trials", []))
+        return int(sum(int(x) for x in target_trials[:completed_units])) + int(current_trials)
     return int(completed_units) * int(k_per_unit) + int(current_trials)
+
+
+def get_explore_total_target_samples(dataset, k_per_unit: int) -> int:
+    if hasattr(dataset, "_explore_total_target_samples"):
+        return int(getattr(dataset, "_explore_total_target_samples"))
+    return int(get_explore_num_units(dataset)) * int(k_per_unit)
 
 
 def sync_rank_sample_totals(local_total_samples: int, device: torch.device) -> list[int]:
@@ -176,8 +186,10 @@ def format_rank_progress(progress: list[dict]) -> str:
 def write_failure_live_files(task_output_dir: Path, args, epoch: int, rank: int, failure_trials: list[dict]) -> None:
     task_output_dir.mkdir(parents=True, exist_ok=True)
     trials_path = task_output_dir / f"failure_trials_live_rank{int(rank):02d}.json"
-    with open(trials_path, "w", encoding="utf-8") as f:
+    trials_tmp = trials_path.with_name(trials_path.name + ".tmp")
+    with open(trials_tmp, "w", encoding="utf-8") as f:
         json.dump(failure_trials, f, indent=2, ensure_ascii=False)
+    os.replace(trials_tmp, trials_path)
     meta = {
         "version": 1,
         "mode": "explore_meta_live",
@@ -191,8 +203,11 @@ def write_failure_live_files(task_output_dir: Path, args, epoch: int, rank: int,
         "rank": int(rank),
         "world_size": int(args.world_size),
     }
-    with open(task_output_dir / f"failure_meta_rank{int(rank):02d}.json", "w", encoding="utf-8") as f:
+    meta_path = task_output_dir / f"failure_meta_rank{int(rank):02d}.json"
+    meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+    with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
+    os.replace(meta_tmp, meta_path)
 
 
 def sanitize_path_token(value: str) -> str:
@@ -201,18 +216,12 @@ def sanitize_path_token(value: str) -> str:
     return token or "unknown"
 
 
-def shard_episode_ids(episode_ids: list[int], rank: int, world_size: int) -> list[int]:
-    if world_size <= 1:
-        return [int(ep) for ep in episode_ids]
-    return [int(ep) for idx, ep in enumerate(episode_ids) if idx % int(world_size) == int(rank)]
-
-
 def shuffle_episode_ids_for_rank(episode_ids: list[int], seed: int, rank: int, task_name: str) -> list[int]:
     ids = [int(ep) for ep in episode_ids]
     if len(ids) <= 1:
         return ids
     task_hash = sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(task_name)))
-    rng = np.random.default_rng(int(seed) + 1009 * int(rank) + 9176 * int(task_hash))
+    rng = np.random.default_rng(int(seed) + 9176 * int(task_hash) + 1009 * int(rank))
     perm = rng.permutation(len(ids))
     return [ids[int(idx)] for idx in perm]
 
@@ -249,6 +258,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--failure_rotation_dir_bins", type=int, required=True)
     parser.add_argument("--failure_rotation_mag_bins", type=int, required=True)
     parser.add_argument("--failure_explore_k", type=int, required=True)
+    parser.add_argument("--explore_phase_keys", nargs="*", default=[])
+    parser.add_argument("--explore_error_modes", nargs="*", default=[])
+    parser.add_argument("--explore_disable_phase_bin_skip", type=str2bool, default=False)
+    parser.add_argument("--explore_skip_open_laptop_transport", type=str2bool, default=False)
     parser.add_argument("--act_aligned_rollout_exec_steps", type=int, required=True)
     parser.add_argument("--planner_orient_weight", type=float, required=True)
     parser.add_argument("--planner_gripper_penalty", type=float, required=True)
@@ -257,6 +270,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--planner_active_gripper_delta_thresh", type=float, required=True)
     parser.add_argument("--recover_eval_save_video", type=str2bool, required=True)
     parser.add_argument("--save_perturb_rollout_video", type=str2bool, required=True)
+    parser.add_argument("--save_correction_debug", type=str2bool, default=False)
     parser.add_argument("--recover_eval_gripper_open_thresh", type=float, required=True)
     parser.add_argument("--recover_eval_pos_thresh_m", type=float, required=True)
     parser.add_argument("--recover_eval_rot_thresh_deg", type=float, required=True)
@@ -269,7 +283,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--evac_blur_filter_enable", type=str2bool, default=False)
     parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.25)
     parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=24)
-    parser.add_argument("--fail_fast_on_error", type=str2bool, default=True)
+    parser.add_argument("--evac_use_dual_cache", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_bounds", nargs="*", type=int, default=[])
+    parser.add_argument("--evac_dc_budget", type=float, default=-1.0)
+    parser.add_argument("--evac_dc_enc_start", type=int, default=999)
+    parser.add_argument("--evac_dc_replay_step_noise", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_hf_metric", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_blur_on_reuse", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
+    parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
+    parser.add_argument("--fail_fast_on_error", type=str2bool, default=False)
     return parser
 
 
@@ -330,7 +353,7 @@ def main() -> None:
         future_offset=int(args.future_offset),
         sample_phase_window_len=int(args.sample_phase_window_len),
         start_margin=int(args.start_margin),
-        failure_mode="explore",
+        failure_mode="off",
         failure_table_path="",
         failure_phase_bins=int(args.failure_phase_bins),
         failure_translation_dir_bins=int(args.failure_translation_dir_bins),
@@ -342,6 +365,10 @@ def main() -> None:
         perturb_eef_fail_gain=float(args.act_aligned_perturb_eef_fail_gain),
         perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
         evac_sample_size=evac_sample_size,
+        explore_phase_keys=list(args.explore_phase_keys),
+        explore_error_modes=list(args.explore_error_modes),
+        explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
+        explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
     )
     init_sample = init_dataset[0]
     init_task_only, init_task_config = parse_task_parts(init_spec.task_name)
@@ -369,7 +396,7 @@ def main() -> None:
     )
     model.initialize_from_batch(init_batch, teacher_latent=init_teacher_latent)
     if str(args.stage1_ckpt).strip():
-        stage1_ckpt = torch.load(args.stage1_ckpt, map_location="cpu")
+        stage1_ckpt = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=True)
         model.load_state_dict(stage1_ckpt["model"], strict=True)
     model.to(device_obj)
     model.eval()
@@ -416,23 +443,34 @@ def main() -> None:
             perturb_eef_fail_gain=float(args.act_aligned_perturb_eef_fail_gain),
             perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
             evac_sample_size=evac_sample_size,
+            explore_phase_keys=list(args.explore_phase_keys),
+            explore_error_modes=list(args.explore_error_modes),
+            explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
+            explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
         )
         full_episode_ids = [int(ep) for ep in dataset.episode_ids]
+        global_units = int(get_explore_num_units(dataset))
+        global_target_samples = int(get_explore_total_target_samples(dataset, int(failure_explore_k_local)))
         local_episode_ids = shuffle_episode_ids_for_rank(
-            full_episode_ids, seed=int(args.seed), rank=int(args.rank), task_name=spec.task_name
+            full_episode_ids,
+            seed=int(args.seed),
+            rank=int(args.rank),
+            task_name=spec.task_name,
         )
         dataset.set_episode_ids(local_episode_ids)
+        dataset.set_explore_local_k(int(failure_explore_k_local))
         total_units = get_explore_num_units(dataset)
         task_only, _ = parse_task_parts(spec.task_name)
         task_order.append(task_only)
-        task_samples = int(total_units) * int(failure_explore_k_local)
+        task_samples = int(get_explore_total_target_samples(dataset, int(failure_explore_k_local)))
         total_rank_samples += task_samples
         task_run_stats[task_only] = {
             "num_explore_units_local": int(total_units),
-            "num_explore_units_global": int(len(dataset._collect_local_explore_phase_units())),
+            "num_explore_units_global": int(global_units),
             "num_episode_ids_local": int(len(local_episode_ids)),
             "num_episode_ids_global": int(len(full_episode_ids)),
             "total_samples_local": int(task_samples),
+            "total_samples_global": int(global_target_samples),
         }
 
     rank_totals = sync_rank_sample_totals(int(total_rank_samples), device_obj)
@@ -454,6 +492,9 @@ def main() -> None:
         "total_samples_local": int(total_rank_samples),
         "task_outputs": {},
     }
+
+    task_contexts: list[dict] = []
+    total_units_all = int(sum(int(task_run_stats[task_only]["num_explore_units_local"]) for task_only in task_order))
 
     for spec in task_specs:
         task_only, _ = parse_task_parts(spec.task_name)
@@ -481,6 +522,10 @@ def main() -> None:
             perturb_eef_fail_gain=float(args.act_aligned_perturb_eef_fail_gain),
             perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
             evac_sample_size=evac_sample_size,
+            explore_phase_keys=list(args.explore_phase_keys),
+            explore_error_modes=list(args.explore_error_modes),
+            explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
+            explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
         )
         dataloader = DataLoader(
             dataset,
@@ -492,13 +537,15 @@ def main() -> None:
         )
         full_episode_ids = [int(ep) for ep in dataset.episode_ids]
         local_episode_ids = shuffle_episode_ids_for_rank(
-            full_episode_ids, seed=int(args.seed), rank=int(args.rank), task_name=spec.task_name
+            full_episode_ids,
+            seed=int(args.seed),
+            rank=int(args.rank),
+            task_name=spec.task_name,
         )
         dataset.set_episode_ids(local_episode_ids)
         dataset.set_explore_local_k(int(failure_explore_k_local))
-        full_units_global = [dict(item) for item in dataset._collect_local_explore_phase_units()]
         total_units = int(task_run_stats[task_only]["num_explore_units_local"])
-        task_total_samples = int(total_units) * int(failure_explore_k_local)
+        task_total_samples = int(task_run_stats[task_only]["total_samples_local"])
         failure_trials: list[dict] = []
         epoch = 0
         processed_samples = 0
@@ -515,179 +562,237 @@ def main() -> None:
                 "num_episode_ids_local": int(task_run_stats[task_only]["num_episode_ids_local"]),
                 "num_episode_ids_global": int(task_run_stats[task_only]["num_episode_ids_global"]),
                 "total_samples_local": 0,
+                "total_samples_global": int(task_run_stats[task_only]["total_samples_global"]),
             }
             continue
 
-        all_task_done = False
-        while not all_task_done:
-            if local_task_done:
-                task_prefix_samples = 0
-                for prev_task in task_order:
-                    if prev_task == task_only:
-                        break
-                    task_prefix_samples += int(task_run_stats[prev_task]["total_samples_local"])
-                local_current_samples = int(task_prefix_samples) + int(task_total_samples)
-                explore_progress = sync_all_explore_status(
-                    local_current_samples=int(local_current_samples),
-                    local_total_samples=int(total_rank_samples),
-                    local_done=True,
-                    local_completed_units=int(total_units),
-                    local_total_units=int(total_units),
-                    local_unit_idx=int(max(0, total_units - 1)),
-                    local_trial_count=int(failure_explore_k_local),
-                    device=device_obj,
-                )
-                all_task_done = bool(len(explore_progress) > 0 and all(bool(item["done"]) for item in explore_progress))
-                if overall_progress is not None:
-                    target_done = int(sum(int(item["current_samples"]) for item in explore_progress))
-                    if target_done > int(overall_progress.n):
-                        overall_progress.update(target_done - int(overall_progress.n))
-                    overall_progress.set_postfix_str(
-                        f"task={task_only} {format_rank_progress(explore_progress)}"
-                    )
-                if all_task_done:
-                    break
-                accelerator.wait_for_everyone()
-                continue
-            for batch in dataloader:
-                if interrupted["flag"]:
-                    raise KeyboardInterrupt
-                processed_samples += 1
-                episode_id = int(batch["episode_id"][0].item())
-                start_ts = int(batch["start_ts"][0].item())
-                adapter = SampleBoundSmolVLAAdapter(
-                    latent_policy=model,
-                    preprocess=preprocess,
-                    postprocess=postprocess,
-                    task_name=task_only,
-                    task_config=task_config,
-                    episode_id=episode_id,
-                    instruction_type=args.instruction_type,
-                )
-                if episode_id not in raw_cache:
-                    raw_cache[episode_id] = load_raw_episode(spec.raw_data_dir, episode_id)
-                sample_debug_dir = None
-                if bool(args.save_perturb_rollout_video) or bool(args.recover_eval_save_video):
-                    phase_bin_id = int(batch["sampled_phase_bin_id"][0].item())
-                    sample_debug_dir = (
-                        task_output_dir
-                        / "debug_wm"
-                        / f"rank{int(args.rank):02d}"
-                        / f"step_{processed_samples - 1:06d}"
-                        / f"bi{phase_bin_id}"
-                    )
-                correction = correction_builder.build(
-                    latent_model=adapter,
-                    image_t=batch["image_t"][0].to(args.device),
-                    qpos_t=batch["qpos_t"][0].to(args.device),
-                    raw_data=raw_cache[episode_id],
-                    norm_stats=norm_stats,
-                    start_ts=start_ts,
-                    failure_mode_override="explore",
-                    sampled_phase_id=int(batch["sampled_phase_id"][0].item()),
-                    sampled_phase_bin_id=int(batch["sampled_phase_bin_id"][0].item()),
-                    sampled_phase_instance_id=int(batch["sampled_phase_instance_id"][0].item()),
-                    forced_error_mode_id=int(batch["forced_error_mode_id"][0].item()),
-                    sampled_active_arm_pattern_id=int(batch["sampled_active_arm_pattern_id"][0].item()),
-                    forced_dir_bin_id=int(batch["forced_dir_bin_id"][0].item()),
-                    forced_mag_bin_id=int(batch["forced_mag_bin_id"][0].item()),
-                    sampled_mode_prob=float(batch["sampled_mode_prob"][0].item()),
-                    sampled_entry_prob_within_mode=float(batch["sampled_entry_prob_within_mode"][0].item()),
-                    sampled_unit_prob=float(batch["sampled_unit_prob"][0].item()),
-                    debug_dir=(None if sample_debug_dir is None else str(sample_debug_dir)),
-                    precomputed_action_chunk_norm=batch["act_action_chunk"][0],
-                )
-                corr_meta = None
-                if isinstance(correction, dict):
-                    corr_meta = correction.get("corr_meta")
-                if corr_meta is None:
-                    corr_meta = correction_builder.pop_last_skip_meta()
-                if isinstance(corr_meta, dict):
-                    recover_eval_last = corr_meta.get("recover_eval_last", {}) or {}
-                    recoverable_raw = recover_eval_last.get("recoverable", None)
-                    error_mode_key = str(corr_meta.get("sampled_error_mode", "")).strip().lower()
-                    invalid_trial = bool(corr_meta.get("invalid_trial", False))
-                    invalid_reason = str(corr_meta.get("invalid_reason", "")).strip()
-                    if (
-                        (recoverable_raw is not None or invalid_trial)
-                        and error_mode_key in {"translation", "rotation", "gripper_close"}
-                    ):
-                        phase_key = str(corr_meta.get("sampled_phase_key", "")).strip().lower()
-                        active_arm_pattern = str(corr_meta.get("sampled_active_arm_pattern", "both")).strip().lower()
-                        if not phase_key:
-                            raise ValueError("corr_meta missing sampled_phase_key during explore")
-                        failure_trials.append(
-                            {
-                                "epoch": int(epoch),
-                                "global_step": int(len(failure_trials)),
-                                "episode_id": episode_id,
-                                "start_ts": start_ts,
-                                "phase_key": phase_key,
-                                "phase_instance_idx": int(batch["sampled_phase_instance_id"][0].item()),
-                                "phase_bin_id": int(batch["sampled_phase_bin_id"][0].item()),
-                                "error_mode": error_mode_key,
-                                "active_arm_pattern": active_arm_pattern,
-                                "dir_bin_id": int(batch["forced_dir_bin_id"][0].item()),
-                                "mag_bin_id": int(batch["forced_mag_bin_id"][0].item()),
-                                "recoverable": bool(recoverable_raw) if recoverable_raw is not None else False,
-                                "invalid_trial": bool(invalid_trial),
-                                "invalid_reason": invalid_reason if invalid_trial else None,
-                                "recover_eval_mode": recover_eval_last.get("mode"),
-                                "recover_eval_metric_name": recover_eval_last.get("metric_name"),
-                                "recover_eval_metric": recover_eval_last.get("metric"),
-                                "recover_eval_threshold": recover_eval_last.get("threshold"),
-                                "evac_blur_filter": corr_meta.get("evac_blur_filter"),
-                            }
-                        )
+        task_contexts.append(
+            {
+                "spec": spec,
+                "task_only": task_only,
+                "task_config": task_config,
+                "task_output_dir": task_output_dir,
+                "raw_cache": raw_cache,
+                "dataset": dataset,
+                "norm_stats": norm_stats,
+                "dataloader": dataloader,
+                "dataloader_iter": iter(dataloader),
+                "failure_trials": failure_trials,
+                "epoch": int(epoch),
+                "processed_samples": int(processed_samples),
+                "local_task_done": bool(local_task_done),
+                "total_units": int(total_units),
+                "task_total_samples": int(task_total_samples),
+            }
+        )
 
-                dataset.record_explore_trial(
-                    int(batch["sampled_explore_unit_idx"][0].item()),
-                    episode_id,
-                    start_ts,
+    def _compute_local_task_progress() -> tuple[int, int]:
+        current_samples = 0
+        completed_units = 0
+        for ctx in task_contexts:
+            if bool(ctx["local_task_done"]):
+                current_samples += int(ctx["task_total_samples"])
+                completed_units += int(ctx["total_units"])
+            else:
+                current_samples += int(
+                    get_explore_completed_sample_count(ctx["dataset"], int(failure_explore_k_local))
                 )
-                completed_units = get_explore_completed_unit_count(dataset)
-                task_sample_progress = get_explore_completed_sample_count(dataset, int(failure_explore_k_local))
-                task_prefix_samples = 0
-                for prev_task in task_order:
-                    if prev_task == task_only:
-                        break
-                    task_prefix_samples += int(task_run_stats[prev_task]["total_samples_local"])
-                overall_current_samples_local = int(task_prefix_samples) + int(task_sample_progress)
-                explore_progress = sync_all_explore_status(
-                    local_current_samples=int(overall_current_samples_local),
-                    local_total_samples=int(total_rank_samples),
-                    local_done=bool(completed_units >= total_units),
-                    local_completed_units=int(completed_units),
-                    local_total_units=int(total_units),
-                    local_unit_idx=int(get_current_explore_unit_idx(dataset)),
-                    local_trial_count=int(get_current_explore_trial_count(dataset)),
-                    device=device_obj,
+                completed_units += int(get_explore_completed_unit_count(ctx["dataset"]))
+        return int(current_samples), int(completed_units)
+
+    all_task_done = bool(len(task_contexts) == 0)
+    while not all_task_done:
+        all_task_done = True
+        for ctx in task_contexts:
+            if bool(ctx["local_task_done"]):
+                continue
+            all_task_done = False
+            if interrupted["flag"]:
+                raise KeyboardInterrupt
+            try:
+                batch = next(ctx["dataloader_iter"])
+            except StopIteration:
+                ctx["epoch"] = int(ctx["epoch"]) + 1
+                ctx["dataloader_iter"] = iter(ctx["dataloader"])
+                try:
+                    batch = next(ctx["dataloader_iter"])
+                except StopIteration:
+                    ctx["local_task_done"] = True
+                    continue
+            task_only = str(ctx["task_only"])
+            task_config = str(ctx["task_config"])
+            spec = ctx["spec"]
+            task_output_dir = ctx["task_output_dir"]
+            raw_cache = ctx["raw_cache"]
+            dataset = ctx["dataset"]
+            norm_stats = ctx["norm_stats"]
+            failure_trials = ctx["failure_trials"]
+            ctx["processed_samples"] = int(ctx["processed_samples"]) + 1
+            processed_samples = int(ctx["processed_samples"])
+            episode_id = int(batch["episode_id"][0].item())
+            start_ts = int(batch["start_ts"][0].item())
+            adapter = SampleBoundSmolVLAAdapter(
+                latent_policy=model,
+                preprocess=preprocess,
+                postprocess=postprocess,
+                task_name=task_only,
+                task_config=task_config,
+                episode_id=episode_id,
+                instruction_type=args.instruction_type,
+            )
+            if episode_id not in raw_cache:
+                raw_cache[episode_id] = load_raw_episode(spec.raw_data_dir, episode_id)
+            sample_debug_dir = None
+            if (
+                bool(args.save_correction_debug)
+                or bool(args.save_perturb_rollout_video)
+                or bool(args.recover_eval_save_video)
+            ):
+                phase_bin_id = int(batch["sampled_phase_bin_id"][0].item())
+                sample_debug_dir = (
+                    task_output_dir
+                    / "debug_wm"
+                    / f"rank{int(args.rank):02d}"
+                    / f"step_{processed_samples - 1:06d}"
+                    / f"bi{phase_bin_id}"
                 )
-                if overall_progress is not None:
-                    target_done = int(sum(int(item["current_samples"]) for item in explore_progress))
-                    if target_done > int(overall_progress.n):
-                        overall_progress.update(target_done - int(overall_progress.n))
-                    overall_progress.set_postfix_str(
-                        f"task={task_only} {format_rank_progress(explore_progress)}"
+            correction = correction_builder.build(
+                latent_model=adapter,
+                image_t=batch["image_t"][0].to(args.device),
+                qpos_t=batch["qpos_t"][0].to(args.device),
+                raw_data=raw_cache[episode_id],
+                norm_stats=norm_stats,
+                start_ts=start_ts,
+                failure_mode_override="explore",
+                sampled_phase_id=int(batch["sampled_phase_id"][0].item()),
+                sampled_phase_bin_id=int(batch["sampled_phase_bin_id"][0].item()),
+                sampled_phase_instance_id=int(batch["sampled_phase_instance_id"][0].item()),
+                forced_error_mode_id=int(batch["forced_error_mode_id"][0].item()),
+                sampled_active_arm_pattern_id=int(batch["sampled_active_arm_pattern_id"][0].item()),
+                original_active_arm_pattern_id=int(batch["original_active_arm_pattern_id"][0].item()),
+                forced_dir_bin_id=int(batch["forced_dir_bin_id"][0].item()),
+                forced_mag_bin_id=int(batch["forced_mag_bin_id"][0].item()),
+                sampled_mode_prob=float(batch["sampled_mode_prob"][0].item()),
+                sampled_entry_prob_within_mode=float(batch["sampled_entry_prob_within_mode"][0].item()),
+                sampled_unit_prob=float(batch["sampled_unit_prob"][0].item()),
+                debug_dir=(None if sample_debug_dir is None else str(sample_debug_dir)),
+                precomputed_action_chunk_norm=batch["act_action_chunk"][0],
+            )
+            corr_meta = None
+            if isinstance(correction, dict):
+                corr_meta = correction.get("corr_meta")
+            if corr_meta is None:
+                corr_meta = correction_builder.pop_last_skip_meta()
+            if isinstance(corr_meta, dict):
+                recover_eval_last = corr_meta.get("recover_eval_last", {}) or {}
+                recoverable_raw = recover_eval_last.get("recoverable", None)
+                error_mode_key = str(corr_meta.get("sampled_error_mode", "")).strip().lower()
+                if not error_mode_key:
+                    error_mode_key = error_mode_id_to_key(int(batch["forced_error_mode_id"][0].item()))
+                invalid_trial = bool(corr_meta.get("invalid_trial", False))
+                if corr_meta.get("skip_reason") and recoverable_raw is None:
+                    invalid_trial = True
+                recover_eval_error = str(recover_eval_last.get("error", "")).strip()
+                if recover_eval_error and recoverable_raw is None:
+                    invalid_trial = True
+                invalid_reason = str(corr_meta.get("invalid_reason", "")).strip()
+                if invalid_trial and not invalid_reason:
+                    invalid_reason = str(corr_meta.get("skip_reason", "")).strip()
+                    if not invalid_reason and recover_eval_error:
+                        invalid_reason = "recover_eval_error"
+                if (
+                    (recoverable_raw is not None or invalid_trial)
+                    and error_mode_key in {"translation", "rotation", "gripper_close"}
+                ):
+                    phase_key = str(corr_meta.get("sampled_phase_key", "")).strip().lower()
+                    if not phase_key:
+                        phase_key = phase_id_to_key(int(batch["sampled_phase_id"][0].item()))
+                    active_arm_pattern = str(corr_meta.get("sampled_active_arm_pattern", "")).strip().lower()
+                    if active_arm_pattern not in {"left_arm", "right_arm"}:
+                        active_arm_pattern = active_arm_pattern_id_to_key(
+                            int(batch["sampled_active_arm_pattern_id"][0].item())
+                        )
+                    original_active_arm_pattern = active_arm_pattern_id_to_key(
+                        int(batch["original_active_arm_pattern_id"][0].item())
                     )
-                write_failure_live_files(task_output_dir, args, epoch, int(args.rank), failure_trials)
-                if completed_units >= total_units:
-                    local_task_done = True
-                    break
-                all_task_done = bool(len(explore_progress) > 0 and all(bool(item["done"]) for item in explore_progress))
-                if all_task_done:
-                    local_task_done = True
-                    break
-            epoch += 1
+                    if not phase_key:
+                        raise ValueError("corr_meta missing sampled_phase_key during explore")
+                    failure_trials.append(
+                        {
+                            "epoch": int(ctx["epoch"]),
+                            "global_step": int(len(failure_trials)),
+                            "episode_id": episode_id,
+                            "start_ts": start_ts,
+                            "phase_key": phase_key,
+                            "phase_instance_idx": int(batch["sampled_phase_instance_id"][0].item()),
+                            "phase_bin_id": int(batch["sampled_phase_bin_id"][0].item()),
+                            "error_mode": error_mode_key,
+                            "active_arm_pattern": active_arm_pattern,
+                            "original_active_arm_pattern": original_active_arm_pattern,
+                            "dir_bin_id": int(batch["forced_dir_bin_id"][0].item()),
+                            "mag_bin_id": int(batch["forced_mag_bin_id"][0].item()),
+                            "recoverable": bool(recoverable_raw) if recoverable_raw is not None else False,
+                            "invalid_trial": bool(invalid_trial),
+                            "invalid_reason": invalid_reason if invalid_trial else None,
+                            "recover_eval_mode": recover_eval_last.get("mode"),
+                            "recover_eval_metric_name": recover_eval_last.get("metric_name"),
+                            "recover_eval_metric": recover_eval_last.get("metric"),
+                            "recover_eval_threshold": recover_eval_last.get("threshold"),
+                            "recover_eval_metrics": recover_eval_last.get("metrics"),
+                            "recover_eval_thresholds": recover_eval_last.get("thresholds"),
+                            "recover_eval_passes": recover_eval_last.get("passes"),
+                            "recover_eval_failed_thresholds": recover_eval_last.get("failed_thresholds"),
+                            "skip_reason": corr_meta.get("skip_reason"),
+                            "skip_error": corr_meta.get("skip_error"),
+                            "evac_blur_filter": corr_meta.get("evac_blur_filter"),
+                        }
+                    )
+
+            dataset.record_explore_trial(
+                int(batch["sampled_explore_unit_idx"][0].item()),
+                episode_id,
+                start_ts,
+            )
+            completed_units = int(get_explore_completed_unit_count(dataset))
+            if completed_units >= int(ctx["total_units"]):
+                ctx["local_task_done"] = True
+            overall_current_samples_local, overall_completed_units_local = _compute_local_task_progress()
+            local_all_done = bool(all(bool(item["local_task_done"]) for item in task_contexts))
+            explore_progress = sync_all_explore_status(
+                local_current_samples=int(overall_current_samples_local),
+                local_total_samples=int(total_rank_samples),
+                local_done=bool(local_all_done),
+                local_completed_units=int(overall_completed_units_local),
+                local_total_units=int(total_units_all),
+                local_unit_idx=int(get_current_explore_unit_idx(dataset)),
+                local_trial_count=int(get_current_explore_trial_count(dataset)),
+                device=device_obj,
+            )
+            if overall_progress is not None:
+                target_done = int(sum(int(item["current_samples"]) for item in explore_progress))
+                if target_done > int(overall_progress.n):
+                    overall_progress.update(target_done - int(overall_progress.n))
+                overall_progress.set_postfix_str(
+                    f"task={task_only} {format_rank_progress(explore_progress)}"
+                )
+            write_failure_live_files(task_output_dir, args, int(ctx["epoch"]), int(args.rank), failure_trials)
+
+        all_task_done = bool(all(bool(item["local_task_done"]) for item in task_contexts))
+
+    for ctx in task_contexts:
+        task_only = str(ctx["task_only"])
+        spec = ctx["spec"]
+        failure_trials = ctx["failure_trials"]
         explore_manifest["task_outputs"][task_only] = {
             "task_name": spec.task_name,
-            "task_output_dir": str(task_output_dir),
+            "task_output_dir": str(ctx["task_output_dir"]),
             "num_failure_trials": len(failure_trials),
-            "num_explore_units_local": int(total_units),
+            "num_explore_units_local": int(ctx["total_units"]),
             "num_explore_units_global": int(task_run_stats[task_only]["num_explore_units_global"]),
             "num_episode_ids_local": int(task_run_stats[task_only]["num_episode_ids_local"]),
             "num_episode_ids_global": int(task_run_stats[task_only]["num_episode_ids_global"]),
-            "total_samples_local": int(task_total_samples),
+            "total_samples_local": int(ctx["task_total_samples"]),
+            "total_samples_global": int(task_run_stats[task_only]["total_samples_global"]),
         }
 
     if overall_progress is not None:

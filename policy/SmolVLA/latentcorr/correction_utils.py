@@ -17,8 +17,33 @@ def str2bool(value):
 
 
 def build_evac_infer_kwargs(cfg):
-    del cfg
-    return {}
+    infer_kwargs = {}
+    if not bool(cfg.get("evac_use_dual_cache", False)):
+        return infer_kwargs
+
+    infer_kwargs["use_dual_cache"] = True
+    dc_v_bounds = cfg.get("evac_dc_v_bounds", None)
+    if dc_v_bounds is None:
+        dc_v_bounds = []
+    if isinstance(dc_v_bounds, str):
+        dc_v_bounds = [part for part in dc_v_bounds.replace(",", " ").split() if part]
+    dc_v_bounds = [int(bound) for bound in dc_v_bounds]
+    if dc_v_bounds:
+        infer_kwargs["dc_v_bounds"] = dc_v_bounds
+
+    dc_budget = cfg.get("evac_dc_budget", None)
+    if dc_budget is not None:
+        dc_budget = float(dc_budget)
+        if dc_budget >= 0.0:
+            infer_kwargs["dc_budget"] = dc_budget
+
+    infer_kwargs["dc_enc_start"] = int(cfg.get("evac_dc_enc_start", 999))
+    infer_kwargs["dc_replay_step_noise"] = bool(cfg.get("evac_dc_replay_step_noise", False))
+    infer_kwargs["dc_hf_metric"] = bool(cfg.get("evac_dc_hf_metric", False))
+    infer_kwargs["dc_v_blur_on_reuse"] = bool(cfg.get("evac_dc_v_blur_on_reuse", False))
+    infer_kwargs["dc_v_blur_kernel"] = int(cfg.get("evac_dc_v_blur_kernel", 3))
+    infer_kwargs["dc_v_blur_strength"] = float(cfg.get("evac_dc_v_blur_strength", 0.15))
+    return infer_kwargs
 
 
 def resample_trajectory(traj, target_len):

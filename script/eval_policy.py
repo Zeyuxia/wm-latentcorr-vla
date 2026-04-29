@@ -419,10 +419,19 @@ def parse_args_and_config():
         for i in range(0, len(pairs), 2):
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
-            try:
-                value = eval(value)
-            except:
-                pass
+            if isinstance(value, str):
+                lower = value.strip().lower()
+                if lower == "true":
+                    value = True
+                elif lower == "false":
+                    value = False
+                elif lower == "none":
+                    value = None
+                else:
+                    try:
+                        value = eval(value)
+                    except:
+                        pass
             override_dict[key] = value
         return override_dict
 

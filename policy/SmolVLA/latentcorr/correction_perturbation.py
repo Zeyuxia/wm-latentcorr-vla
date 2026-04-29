@@ -191,8 +191,7 @@ def _front_hemisphere_dir_from_bin(quat_wxyz, dir_bin_id, n_dir, theta_deg=60.0)
 
 def _translation_dir_from_bin(quat_wxyz, dir_bin_id):
     n = int(max(1, get_failure_param_bins()["translation_dir_bins"]))
-    del quat_wxyz
-    dirs = (
+    local_axes = (
         np.array([1.0, 0.0, 0.0], dtype=np.float32),
         np.array([-1.0, 0.0, 0.0], dtype=np.float32),
         np.array([0.0, 1.0, 0.0], dtype=np.float32),
@@ -200,8 +199,13 @@ def _translation_dir_from_bin(quat_wxyz, dir_bin_id):
         np.array([0.0, 0.0, 1.0], dtype=np.float32),
         np.array([0.0, 0.0, -1.0], dtype=np.float32),
     )
-    idx = int(np.clip(int(dir_bin_id), 0, min(n, len(dirs)) - 1))
-    return dirs[idx].copy(), idx
+    idx = int(np.clip(int(dir_bin_id), 0, min(n, len(local_axes)) - 1))
+    direction = _eef_local_axis_from_wxyz(
+        quat_wxyz,
+        local_axis=local_axes[idx],
+        fallback_axis=local_axes[idx],
+    )
+    return np.asarray(direction, dtype=np.float32), idx
 
 
 def _rotation_axis_from_bin(quat_wxyz, dir_bin_id):

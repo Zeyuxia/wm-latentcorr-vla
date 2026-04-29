@@ -10,11 +10,11 @@ ERROR_MODE_KEYS = ("translation", "rotation", "gripper_close")
 ERROR_MODE_KEY_TO_ID = {key: idx for idx, key in enumerate(ERROR_MODE_KEYS)}
 ERROR_MODE_ID_TO_KEY = {idx: key for idx, key in enumerate(ERROR_MODE_KEYS)}
 
-ACTIVE_ARM_PATTERN_KEYS = ("left_arm", "right_arm")
+ACTIVE_ARM_PATTERN_KEYS = ("left_arm", "right_arm", "both")
 ACTIVE_ARM_PATTERN_KEY_TO_ID = {key: idx for idx, key in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
 ACTIVE_ARM_PATTERN_ID_TO_KEY = {idx: key for idx, key in enumerate(ACTIVE_ARM_PATTERN_KEYS)}
 
-FAILURE_TRANSLATION_DIR_BINS = 5
+FAILURE_TRANSLATION_DIR_BINS = 6
 FAILURE_TRANSLATION_MAG_BINS = 1
 FAILURE_ROTATION_DIR_BINS = 6
 FAILURE_ROTATION_MAG_BINS = 1

@@ -17,6 +17,9 @@ class MultiTaskFailureDatasetConfig:
     future_offset: int
     sample_phase_window_len: int
     start_margin: int
+    perturb_eef_fail_gain: float
+    perturb_rot_max_deg: float
+    evac_sample_size: tuple[int, int] | None
     failure_table_paths: dict[str, str]
     failure_phase_bins: int
     failure_translation_dir_bins: int
@@ -61,6 +64,9 @@ class MultiTaskFailureDataset(Dataset):
                 failure_rotation_dir_bins=int(config.failure_rotation_dir_bins),
                 failure_rotation_mag_bins=int(config.failure_rotation_mag_bins),
                 failure_explore_k=int(config.failure_explore_k),
+                perturb_eef_fail_gain=float(config.perturb_eef_fail_gain),
+                perturb_rot_max_deg=float(config.perturb_rot_max_deg),
+                evac_sample_size=config.evac_sample_size,
             )
             self.datasets.append(dataset)
             for local_index in range(len(dataset)):

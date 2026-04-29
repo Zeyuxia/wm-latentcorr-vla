@@ -10,19 +10,16 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate smolvla
 cd "${SCRIPT_DIR}"
 
-# Edit the values in this block directly before launching the script.
-DATASET_REPO_ID="${DATASET_REPO_ID:-robotwin_multitask_5_cam_high}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/stage1/${DATASET_REPO_ID}}"
-TRAIN_TAG="${TRAIN_TAG:-stage1_no_object_contact_correction}"
-RUN_TAG="${RUN_TAG:-stage1_spatial_projector_no_aux_losses}"
+DATASET_REPO_ID="robotwin_multitask_5_cam_high"
+OUTPUT_ROOT="${SCRIPT_DIR}/outputs/correction_validation/${DATASET_REPO_ID}"
+RUN_TAG="correction_sample_validation"
 
 PRETRAINED_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
-RESUME_FROM="${RESUME_FROM:-}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
-POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
-FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
-TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
-LOAD_VLM_WEIGHTS="${LOAD_VLM_WEIGHTS:-true}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+POLICY_DEVICE="cuda"
+FREEZE_VISION_ENCODER="false"
+TRAIN_EXPERT_ONLY="false"
+LOAD_VLM_WEIGHTS="true"
 
 MULTI_TASK_NAMES=(
   sim-open_laptop-demo_clean-50
@@ -39,10 +36,12 @@ CUROBO_LEFT_YML="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curo
 CUROBO_RIGHT_YML="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml"
 
 SEED="${SEED:-0}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-MAX_STEPS="${MAX_STEPS:-1500}"
-SAVE_FREQ="${SAVE_FREQ:-250}"
+BATCH_SIZE=4
+NUM_WORKERS="${NUM_WORKERS:-0}"
+NUM_SAMPLES="${NUM_SAMPLES:-20}"
+VALIDATION_BATCH_SIZE="${VALIDATION_BATCH_SIZE:-1}"
+MAX_STEPS=1500
+SAVE_FREQ=250
 OPTIMIZER_LR="5e-5"
 WEIGHT_DECAY="1e-10"
 SCHEDULER_WARMUP_STEPS=200
@@ -57,15 +56,15 @@ ADAPTER_HIDDEN_DIM=512
 PREDICTOR_HIDDEN_DIM=512
 DYN_ZERO_STEPS=0
 DYN_RAMP_STEPS=1000
-DYN_MAX_WEIGHT="${DYN_MAX_WEIGHT:-0.0}"
+DYN_MAX_WEIGHT=0.5
 DYN_WARMUP_CURVE="cosine"
 COND_ZERO_STEPS=0
 COND_RAMP_STEPS=1000
-COND_MAX_WEIGHT="${COND_MAX_WEIGHT:-0.0}"
+COND_MAX_WEIGHT=0.5
 COND_WARMUP_CURVE="cosine"
-FAILURE_MODE="${FAILURE_MODE:-train}"
-FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json}"
-FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.25}"
+FAILURE_MODE="train"
+FAILURE_TABLE_PATHS_JSON="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json"
+FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.5}"
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
 FAILURE_PHASE_BINS=4
@@ -81,7 +80,7 @@ PLANNER_NEAREST_WINDOW_RADIUS=12
 PLANNER_ACTIVE_JOINT_DELTA_THRESH=0.01
 PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
 RECOVER_EVAL_SAVE_VIDEO=false
-SAVE_PERTURB_ROLLOUT_VIDEO=true
+SAVE_PERTURB_ROLLOUT_VIDEO=false
 SAVE_CORRECTION_DEBUG=false
 RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.3
 RECOVER_EVAL_POS_THRESH_M=0.04
@@ -104,137 +103,25 @@ EVAC_DC_HF_METRIC=false
 EVAC_DC_V_BLUR_ON_REUSE=false
 EVAC_DC_V_BLUR_KERNEL=3
 EVAC_DC_V_BLUR_STRENGTH=0.15
-DEBUG_WM_CORRECTION=true
-DEBUG_WM_ALL_RANKS=true
-DEBUG_LOSS_BATCH_PROJECTION=true
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 SMOLVLA_EVAC_PRINT_RUNTIME=false
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
 PYTHONPATH="/data/zhenyangfan/RoboTwin:${LOCAL_SRC_DIR}"
 
-if [ -z "${CUDA_VISIBLE_DEVICES}" ]; then
-  echo "CUDA_VISIBLE_DEVICES is empty." >&2
-  exit 1
-fi
-
-if [ -z "${PRETRAINED_PATH}" ]; then
-  echo "PRETRAINED_PATH is required." >&2
-  exit 1
-fi
-
-if [ -z "${EVAC_CKPT}" ]; then
-  echo "EVAC_CKPT is required for stage1." >&2
-  exit 1
-fi
-
-if [ -n "${RESUME_FROM}" ] && [ ! -f "${RESUME_FROM}" ]; then
-  echo "Resume checkpoint does not exist: ${RESUME_FROM}" >&2
-  exit 1
-fi
-
-if [ ! -f "${EVAC_CKPT}" ]; then
-  echo "EVAC checkpoint path is missing: ${EVAC_CKPT}" >&2
-  exit 1
-fi
-
-if [ ! -f "${EVAC_CONFIG}" ]; then
-  echo "EVAC config path is missing: ${EVAC_CONFIG}" >&2
-  exit 1
-fi
-
-build_run_dir() {
-  local root_dir="$1"
-  local timestamp
-  local base_name
-  local target_dir
-  timestamp=$(date +"%Y%m%d_%H%M%S")
-  base_name="${timestamp}"
-  if [ -n "${RUN_TAG}" ]; then
-    base_name="${base_name}-${RUN_TAG}"
-  fi
-  target_dir="${root_dir}/${base_name}"
-  if [ -e "${target_dir}" ]; then
-    local suffix=1
-    while [ -e "${root_dir}/${base_name}-${suffix}" ]; do
-      suffix=$((suffix + 1))
-    done
-    target_dir="${root_dir}/${base_name}-${suffix}"
-  fi
-  echo "${target_dir}"
-}
-
 mkdir -p "${OUTPUT_ROOT}"
-if [ -n "${RESUME_FROM}" ]; then
-  OUTPUT_DIR=$(dirname "$(readlink -f "${RESUME_FROM}")")
-  echo "Resuming existing stage1 run: ${OUTPUT_DIR}"
-  echo "Resume checkpoint: ${RESUME_FROM}"
-else
-  OUTPUT_DIR=$(build_run_dir "${OUTPUT_ROOT}")
-  mkdir -p "${OUTPUT_DIR}"
-fi
-
-cp "${SCRIPT_PATH}" "${OUTPUT_DIR}/launch_train_stage1.sh"
-
-cat > "${OUTPUT_DIR}/run_meta.txt" <<EOF
-script=${SCRIPT_PATH}
-script_dir=${SCRIPT_DIR}
-train_mode=stage1
-dataset_repo_id=${DATASET_REPO_ID}
-pretrained_path=${PRETRAINED_PATH}
-resume_from=${RESUME_FROM}
-policy_device=${POLICY_DEVICE}
-cuda_visible_devices=${CUDA_VISIBLE_DEVICES}
-freeze_vision_encoder=${FREEZE_VISION_ENCODER}
-train_expert_only=${TRAIN_EXPERT_ONLY}
-load_vlm_weights=${LOAD_VLM_WEIGHTS}
-batch_size=${BATCH_SIZE}
-num_workers=${NUM_WORKERS}
-max_steps=${MAX_STEPS}
-save_freq=${SAVE_FREQ}
-optimizer_lr=${OPTIMIZER_LR}
-weight_decay=${WEIGHT_DECAY}
-scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS}
-scheduler_decay_steps=${SCHEDULER_DECAY_STEPS}
-scheduler_decay_lr=${SCHEDULER_DECAY_LR}
-run_tag=${RUN_TAG}
-train_tag=${TRAIN_TAG}
-output_dir=${OUTPUT_DIR}
-pythonnousersite=${PYTHONNOUSERSITE}
-pythonpath=${PYTHONPATH}
-instruction_type=${INSTRUCTION_TYPE}
-evac_ckpt=${EVAC_CKPT}
-evac_config=${EVAC_CONFIG}
-evac_use_dual_cache=${EVAC_USE_DUAL_CACHE}
-evac_dc_v_bounds=${EVAC_DC_V_BOUNDS[*]}
-evac_dc_budget=${EVAC_DC_BUDGET}
-evac_dc_enc_start=${EVAC_DC_ENC_START}
-evac_dc_replay_step_noise=${EVAC_DC_REPLAY_STEP_NOISE}
-evac_dc_hf_metric=${EVAC_DC_HF_METRIC}
-evac_dc_v_blur_on_reuse=${EVAC_DC_V_BLUR_ON_REUSE}
-evac_dc_v_blur_kernel=${EVAC_DC_V_BLUR_KERNEL}
-evac_dc_v_blur_strength=${EVAC_DC_V_BLUR_STRENGTH}
-evac_blur_filter_enable=${EVAC_BLUR_FILTER_ENABLE}
-evac_blur_filter_min_ratio=${EVAC_BLUR_FILTER_MIN_RATIO}
-evac_blur_filter_patch_pad_px=${EVAC_BLUR_FILTER_PATCH_PAD_PX}
-save_perturb_rollout_video=${SAVE_PERTURB_ROLLOUT_VIDEO}
-save_correction_debug=${SAVE_CORRECTION_DEBUG}
-failure_mode=${FAILURE_MODE}
-failure_table_paths_json=${FAILURE_TABLE_PATHS_JSON}
-failure_corr_batch_ratio=${FAILURE_CORR_BATCH_RATIO}
-seed=${SEED}
-EOF
+timestamp=$(date +"%Y%m%d_%H%M%S")
+OUTPUT_DIR="${OUTPUT_ROOT}/${timestamp}-${RUN_TAG}"
+mkdir -p "${OUTPUT_DIR}"
+cp "${SCRIPT_PATH}" "${OUTPUT_DIR}/launch_validate_correction_samples.sh"
+VALIDATION_OUTPUT_JSON="${OUTPUT_DIR}/correction_validation.json"
 
 CMD=(
-  accelerate
-  launch
-  --multi_gpu
-  --num_processes=4
-  --main_process_port=29611
-  "${SCRIPT_DIR}/latentcorr/train_smolvla.py"
-  stage1
+  python "${SCRIPT_DIR}/latentcorr/validate_correction_samples.py"
   --output_dir "${OUTPUT_DIR}"
   --smolvla_pretrained_path "${PRETRAINED_PATH}"
-  --resume_ckpt "${RESUME_FROM}"
+  --resume_ckpt ""
   --freeze_vision_encoder "${FREEZE_VISION_ENCODER}"
   --train_expert_only "${TRAIN_EXPERT_ONLY}"
   --load_vlm_weights "${LOAD_VLM_WEIGHTS}"
@@ -312,29 +199,27 @@ CMD=(
   --evac_dc_v_blur_on_reuse "${EVAC_DC_V_BLUR_ON_REUSE}"
   --evac_dc_v_blur_kernel "${EVAC_DC_V_BLUR_KERNEL}"
   --evac_dc_v_blur_strength "${EVAC_DC_V_BLUR_STRENGTH}"
-  --debug_wm_correction "${DEBUG_WM_CORRECTION}"
-  --debug_wm_all_ranks "${DEBUG_WM_ALL_RANKS}"
-  --debug_loss_batch_projection "${DEBUG_LOSS_BATCH_PROJECTION}"
+  --num_samples "${NUM_SAMPLES}"
+  --validation_batch_size "${VALIDATION_BATCH_SIZE}"
+  --validation_output_json "${VALIDATION_OUTPUT_JSON}"
 )
 
 printf '%q ' "${CMD[@]}" > "${OUTPUT_DIR}/launch_command.sh"
 printf '\n' >> "${OUTPUT_DIR}/launch_command.sh"
 
-echo "Training mode: stage1"
-echo "Training output dir: ${OUTPUT_DIR}"
-echo "Train tag: ${TRAIN_TAG}"
-echo "Run tag: ${RUN_TAG}"
+echo "Validation output dir: ${OUTPUT_DIR}"
+echo "Validation json: ${VALIDATION_OUTPUT_JSON}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "NUM_SAMPLES=${NUM_SAMPLES}"
 
 export CUDA_VISIBLE_DEVICES
 export PYTHONNOUSERSITE
 export PYTHONPATH
 export TOKENIZERS_PARALLELISM
 export SMOLVLA_EVAC_PRINT_RUNTIME
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE
+export TRANSFORMERS_OFFLINE
 export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
 export MPLCONFIGDIR=/tmp/mplconfig
 
-"${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/log.log"
-
-echo "${OUTPUT_DIR}"
+"${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/validate.log"

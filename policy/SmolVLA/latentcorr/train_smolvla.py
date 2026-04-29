@@ -9,12 +9,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from lerobot.utils.constants import ACTION
+from omegaconf import OmegaConf
 
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parents[2]
@@ -31,6 +34,11 @@ from policy.SmolVLA.latentcorr.act_aligned_correction import ACTAlignedCorrectio
 from policy.SmolVLA.latentcorr.correction_policy_adapter import SampleBoundSmolVLAAdapter
 from policy.SmolVLA.latentcorr.evac_interface import EvacLatentTeacher
 from policy.SmolVLA.latentcorr.failure_manifest_utils import load_failure_table_paths
+from policy.SmolVLA.latentcorr.failure_utils import (
+    active_arm_pattern_id_to_key,
+    error_mode_id_to_key,
+    phase_id_to_key,
+)
 from policy.SmolVLA.latentcorr.latent_config import DynamicsWarmupConfig, Stage1WarmupConfig
 from policy.SmolVLA.latentcorr.latent_dataset_utils import load_raw_episode
 from policy.SmolVLA.latentcorr.multitask_failure_dataset import MultiTaskFailureDatasetConfig, build_multitask_failure_dataset
@@ -68,9 +76,157 @@ def str2bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
+def _save_loss_batch_projection(
+    save_dir: str,
+    image_cam: torch.Tensor,
+    action_norm: torch.Tensor,
+    is_pad: torch.Tensor,
+    raw_data: dict[str, Any],
+    fk,
+    norm_stats: dict[str, Any],
+    meta: dict[str, Any] | None = None,
+) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    import cv2
+
+    act = np.asarray(action_norm.detach().cpu().numpy(), dtype=np.float32)
+    pad = np.asarray(is_pad.detach().cpu().numpy(), dtype=bool).reshape(-1)
+    if act.ndim != 2 or act.shape[1] < 14:
+        return
+    valid = np.where(~pad)[0]
+    if valid.size == 0:
+        return
+    act = act[valid]
+    act_raw = np.asarray(act * norm_stats["action_std"] + norm_stats["action_mean"], dtype=np.float32)
+    if act_raw.shape[0] <= 0:
+        return
+
+    img_u8 = np.clip(
+        image_cam.detach().cpu().permute(1, 2, 0).numpy() * 255.0, 0.0, 255.0
+    ).astype(np.uint8)
+    overlay = img_u8.copy()
+
+    K = raw_data["intrinsic_cv"].astype(np.float32).copy()
+    E = np.eye(4, dtype=np.float32)
+    E[:3, :] = raw_data["extrinsic_cv"].astype(np.float32)
+    h_native, w_native = raw_data.get("native_resolution", (overlay.shape[0], overlay.shape[1]))
+    h_img, w_img = overlay.shape[:2]
+    if w_native > 0 and h_native > 0 and (w_native != w_img or h_native != h_img):
+        sx = float(w_img) / float(w_native)
+        sy = float(h_img) / float(h_native)
+        K[0, 0] *= sx
+        K[0, 2] *= sx
+        K[1, 1] *= sy
+        K[1, 2] *= sy
+
+    pose_list = []
+    for i in range(act_raw.shape[0]):
+        fr = fk.forward(act_raw[i, 0:6], act_raw[i, 7:13])
+        lp, lq_wxyz = fr["left"]
+        rp, rq_wxyz = fr["right"]
+        lq_xyzw = np.array([lq_wxyz[1], lq_wxyz[2], lq_wxyz[3], lq_wxyz[0]], dtype=np.float32)
+        rq_xyzw = np.array([rq_wxyz[1], rq_wxyz[2], rq_wxyz[3], rq_wxyz[0]], dtype=np.float32)
+        if lq_xyzw[3] < 0:
+            lq_xyzw = -lq_xyzw
+        if rq_xyzw[3] < 0:
+            rq_xyzw = -rq_xyzw
+        lg = float(np.clip(act_raw[i, 6], 0.0, 1.0)) * 120.0
+        rg = float(np.clip(act_raw[i, 13], 0.0, 1.0)) * 120.0
+        pose_list.append(np.concatenate([lp, lq_xyzw, [lg], rp, rq_xyzw, [rg]], axis=0).astype(np.float32))
+    pose_np = np.stack(pose_list, axis=0)
+
+    try:
+        import evac.lvdm.models.ddpm3d as ddpm3d_mod
+
+        w2c_t = torch.from_numpy(E).float().unsqueeze(0).unsqueeze(0)
+        intrinsic_t = torch.from_numpy(K).float().unsqueeze(0).unsqueeze(0)
+        cvt_matrix = torch.tensor(ddpm3d_mod.Gripper2EEFCvt, dtype=torch.float32).view(1, 1, 4, 4)
+        ee_key_pts = torch.tensor(ddpm3d_mod.EndEffectorPts, dtype=torch.float32).view(1, 1, 4, 4).permute(0, 1, 3, 2)
+
+        def _project_base_uv_from_pose_np(pose_arr):
+            pose_t = torch.from_numpy(pose_arr).float()
+            pose_l_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 0:7]).unsqueeze(0)
+            pose_r_mat = ddpm3d_mod.get_transformation_matrix_from_quat(pose_t[:, 8:15]).unsqueeze(0)
+            ee2cam_l = torch.matmul(torch.matmul(w2c_t, pose_l_mat), cvt_matrix)
+            ee2cam_r = torch.matmul(torch.matmul(w2c_t, pose_r_mat), cvt_matrix)
+            pts_l = torch.matmul(ee2cam_l, ee_key_pts)
+            pts_r = torch.matmul(ee2cam_r, ee_key_pts)
+            uvs_l = torch.matmul(intrinsic_t, pts_l[:, :, :3, :])
+            uvs_r = torch.matmul(intrinsic_t, pts_r[:, :, :3, :])
+            uvs_l = (uvs_l / pts_l[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+            uvs_r = (uvs_r / pts_r[:, :, 2:3, :])[:, :, :2, :].permute(0, 1, 3, 2).to(dtype=torch.int64)[0].cpu().numpy()
+            return uvs_l, uvs_r, pts_l, pts_r
+
+        def _extract_base_uv(uvs, pts):
+            seq = []
+            for i in range(uvs.shape[0]):
+                z = float(pts[0, i, 2, 0].item())
+                u = int(uvs[i, 0, 0])
+                v = int(uvs[i, 0, 1])
+                if z > 1e-6 and (0 <= u < w_img) and (0 <= v < h_img):
+                    seq.append((u, v))
+                else:
+                    seq.append(None)
+            return seq
+
+        def _draw_polyline(img, seq, color):
+            prev = None
+            for pt in seq:
+                if pt is None:
+                    prev = None
+                    continue
+                if prev is not None:
+                    cv2.line(img, (int(prev[0]), int(prev[1])), (int(pt[0]), int(pt[1])), color, 2, cv2.LINE_AA)
+                prev = pt
+
+        def _annotate_start_end(img, seq, prefix, color):
+            if len(seq) == 0:
+                return
+            s = seq[0]
+            e = seq[-1]
+            if s is not None:
+                cv2.circle(img, (int(s[0]), int(s[1])), 4, color, -1, cv2.LINE_AA)
+                cv2.putText(img, f"{prefix}-S", (int(s[0]) + 6, int(s[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            if e is not None:
+                cv2.circle(img, (int(e[0]), int(e[1])), 4, color, -1, cv2.LINE_AA)
+                cv2.putText(img, f"{prefix}-E", (int(e[0]) + 6, int(e[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        uvs_l, uvs_r, pts_l, pts_r = _project_base_uv_from_pose_np(pose_np)
+        luv = _extract_base_uv(uvs_l, pts_l.reshape(1, pts_l.shape[1], 4, 4))
+        ruv = _extract_base_uv(uvs_r, pts_r.reshape(1, pts_r.shape[1], 4, 4))
+        _draw_polyline(overlay, luv, (0, 255, 0))
+        _draw_polyline(overlay, ruv, (0, 0, 255))
+        _annotate_start_end(overlay, luv, "L", (0, 255, 0))
+        _annotate_start_end(overlay, ruv, "R", (0, 0, 255))
+        cv2.imwrite(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
+    except Exception:
+        import traceback
+
+        with open(os.path.join(save_dir, "loss_projection_error.txt"), "w") as f:
+            f.write(traceback.format_exc())
+        cv2.imwrite(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
+
+    meta_out = {"n_valid_actions": int(act_raw.shape[0]), "image_hw": [int(h_img), int(w_img)]}
+    if isinstance(meta, dict):
+        meta_out.update(meta)
+    with open(os.path.join(save_dir, "loss_projection_meta.json"), "w") as f:
+        json.dump(meta_out, f, indent=2)
+
+
 def build_accelerator() -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     return Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
+
+
+def load_evac_sample_size(evac_config_path: str) -> tuple[int, int] | None:
+    path = str(evac_config_path).strip()
+    if not path:
+        return None
+    cfg = OmegaConf.load(path)
+    value = cfg.data.params.train.params.sample_size
+    if value is None or len(value) != 2:
+        return None
+    return int(value[0]), int(value[1])
 
 
 def compute_retain_weight(
@@ -133,6 +289,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--act_chunk_size", type=int, required=True)
 
 
+def add_evac_dual_cache_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--evac_use_dual_cache", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_bounds", nargs="*", type=int, default=[])
+    parser.add_argument("--evac_dc_budget", type=float, default=-1.0)
+    parser.add_argument("--evac_dc_enc_start", type=int, default=999)
+    parser.add_argument("--evac_dc_replay_step_noise", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_hf_metric", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_blur_on_reuse", type=str2bool, default=False)
+    parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
+    parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
+
+
 def add_stage2_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage1_ckpt", type=str, required=True)
     parser.add_argument("--failure_table_paths_json", type=str, required=True)
@@ -169,6 +337,7 @@ def add_stage2_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, required=True)
+    add_evac_dual_cache_args(parser)
 
 
 def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
@@ -193,6 +362,8 @@ def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--planner_active_joint_delta_thresh", type=float, default=0.01)
     parser.add_argument("--planner_active_gripper_delta_thresh", type=float, default=0.05)
     parser.add_argument("--recover_eval_save_video", type=str2bool, default=False)
+    parser.add_argument("--save_perturb_rollout_video", type=str2bool, default=False)
+    parser.add_argument("--save_correction_debug", type=str2bool, default=False)
     parser.add_argument("--recover_eval_gripper_open_thresh", type=float, default=0.2)
     parser.add_argument("--recover_eval_pos_thresh_m", type=float, default=0.04)
     parser.add_argument("--recover_eval_rot_thresh_deg", type=float, default=8.0)
@@ -202,8 +373,13 @@ def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, default=0.08)
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, default=15.0)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, default=0.10)
+    parser.add_argument("--evac_blur_filter_enable", type=str2bool, default=False)
+    parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.25)
+    parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=24)
     parser.add_argument("--debug_wm_correction", type=str2bool, default=False)
     parser.add_argument("--debug_wm_all_ranks", type=str2bool, default=False)
+    parser.add_argument("--debug_loss_batch_projection", type=str2bool, default=False)
+    add_evac_dual_cache_args(parser)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -251,7 +427,7 @@ def build_stage1_warmup_config(args: argparse.Namespace) -> Stage1WarmupConfig:
     return Stage1WarmupConfig(dynamics=dynamics, condition=condition)
 
 
-def build_base_policy(args: argparse.Namespace) -> tuple[SmolVLAPolicy, Any]:
+def build_base_policy(args: argparse.Namespace) -> tuple[SmolVLAPolicy, Any, Any]:
     base_policy = SmolVLAPolicy.from_pretrained(args.smolvla_pretrained_path)
     base_policy.config.freeze_vision_encoder = parse_bool_flag(args.freeze_vision_encoder)
     base_policy.config.train_expert_only = parse_bool_flag(args.train_expert_only)
@@ -262,7 +438,7 @@ def build_base_policy(args: argparse.Namespace) -> tuple[SmolVLAPolicy, Any]:
     base_policy.model.set_requires_grad()
     base_policy.to(torch.device(args.device))
     preprocess, postprocess = make_smolvla_processors(base_policy, args.smolvla_pretrained_path)
-    return base_policy, preprocess
+    return base_policy, preprocess, postprocess
 
 
 def configure_optimizer(model: SmolVLALatentPolicy, args: argparse.Namespace, total_training_steps: int):
@@ -286,6 +462,180 @@ def log_stage1_tensorboard(writer: SummaryWriter, step: int, output: Any, lr: fl
     writer.add_scalar("train/beta_condition", float(output.beta_condition), step)
     writer.add_scalar("train/beta_dynamics", float(output.beta_dynamics), step)
     writer.add_scalar("train/lr", float(lr), step)
+
+
+def _mean_action_abs(raw_batch: dict[str, Any]) -> float:
+    action = raw_batch.get("act_action_chunk")
+    is_pad = raw_batch.get("act_is_pad")
+    if not isinstance(action, torch.Tensor):
+        return float("nan")
+    action_cpu = action.detach().float().cpu()
+    if isinstance(is_pad, torch.Tensor):
+        valid = (~is_pad.detach().cpu().bool()).unsqueeze(-1).expand_as(action_cpu)
+        values = action_cpu[valid]
+    else:
+        values = action_cpu.reshape(-1)
+    if values.numel() == 0:
+        return float("nan")
+    return float(values.abs().mean().item())
+
+
+def _slice_smolvla_batch(batch: dict[str, Any], start: int, end: int) -> dict[str, Any]:
+    sliced: dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            sliced[key] = value[int(start) : int(end)]
+        elif isinstance(value, list):
+            sliced[key] = value[int(start) : int(end)]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+@torch.no_grad()
+def compute_action_loss_split(
+    latent_model: SmolVLALatentPolicy,
+    batch: dict[str, Any],
+    *,
+    base_batch_size: int,
+    total_batch_size: int,
+) -> tuple[float, float]:
+    if ACTION not in batch:
+        return float("nan"), float("nan")
+    base_batch_size = int(base_batch_size)
+    total_batch_size = int(total_batch_size)
+    clean_loss = float("nan")
+    corr_loss = float("nan")
+    was_training = bool(latent_model.training)
+    latent_model.eval()
+    try:
+        if base_batch_size > 0:
+            clean_batch = _slice_smolvla_batch(batch, 0, base_batch_size)
+            clean_loss = float(
+                latent_model._action_loss(batch=clean_batch, actions=clean_batch[ACTION]).detach().float().item()
+            )
+        if total_batch_size > base_batch_size:
+            corr_batch = _slice_smolvla_batch(batch, base_batch_size, total_batch_size)
+            corr_loss = float(
+                latent_model._action_loss(batch=corr_batch, actions=corr_batch[ACTION]).detach().float().item()
+            )
+    finally:
+        if was_training:
+            latent_model.train()
+    return clean_loss, corr_loss
+
+
+def _tensor_item(value: Any, index: int, default: Any = None) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return value.item()
+        return value[index].item()
+    if isinstance(value, (list, tuple)):
+        return value[index]
+    return default
+
+
+def _safe_phase_id_to_key(phase_id: Any) -> str:
+    try:
+        return phase_id_to_key(int(phase_id))
+    except Exception:
+        return str(phase_id)
+
+
+def _safe_error_mode_id_to_key(error_mode_id: Any) -> str:
+    try:
+        return error_mode_id_to_key(int(error_mode_id))
+    except Exception:
+        return str(error_mode_id)
+
+
+def _safe_active_arm_id_to_key(active_arm_id: Any) -> str:
+    try:
+        return active_arm_pattern_id_to_key(int(active_arm_id))
+    except Exception:
+        return str(active_arm_id)
+
+
+def summarize_correction_raw_batch(correction_raw_batch: dict[str, Any]) -> list[dict[str, Any]]:
+    batch_size = int(correction_raw_batch["image_t"].shape[0])
+    records = []
+    for sample_index in range(batch_size):
+        records.append(
+            {
+                "task_name": str(_tensor_item(correction_raw_batch.get("task_name"), sample_index, "")),
+                "episode_id": int(_tensor_item(correction_raw_batch.get("episode_id"), sample_index, -1)),
+                "start_ts": int(_tensor_item(correction_raw_batch.get("start_ts"), sample_index, -1)),
+                "phase_key": _safe_phase_id_to_key(
+                    _tensor_item(correction_raw_batch.get("sampled_phase_id"), sample_index, -1)
+                ),
+                "phase_instance_idx": int(
+                    _tensor_item(correction_raw_batch.get("sampled_phase_instance_id"), sample_index, -1)
+                ),
+                "phase_bin_id": int(_tensor_item(correction_raw_batch.get("sampled_phase_bin_id"), sample_index, -1)),
+                "error_mode": _safe_error_mode_id_to_key(
+                    _tensor_item(correction_raw_batch.get("forced_error_mode_id"), sample_index, -1)
+                ),
+                "active_arm": _safe_active_arm_id_to_key(
+                    _tensor_item(correction_raw_batch.get("sampled_active_arm_pattern_id"), sample_index, -1)
+                ),
+                "original_active_arm": _safe_active_arm_id_to_key(
+                    _tensor_item(correction_raw_batch.get("original_active_arm_pattern_id"), sample_index, -1)
+                ),
+                "dir_bin_id": int(_tensor_item(correction_raw_batch.get("forced_dir_bin_id"), sample_index, -1)),
+                "mag_bin_id": int(_tensor_item(correction_raw_batch.get("forced_mag_bin_id"), sample_index, -1)),
+                "sampled_mode_prob": float(
+                    _tensor_item(correction_raw_batch.get("sampled_mode_prob"), sample_index, float("nan"))
+                ),
+                "sampled_entry_prob_within_mode": float(
+                    _tensor_item(
+                        correction_raw_batch.get("sampled_entry_prob_within_mode"),
+                        sample_index,
+                        float("nan"),
+                    )
+                ),
+                "sampled_unit_prob": float(
+                    _tensor_item(correction_raw_batch.get("sampled_unit_prob"), sample_index, float("nan"))
+                ),
+            }
+        )
+    return records
+
+
+def log_stage1_extra_tensorboard(
+    writer: SummaryWriter,
+    step: int,
+    *,
+    base_batch_size: int,
+    corr_requested: int,
+    corr_generated: int,
+    corr_skipped: int,
+    clean_action_abs_mean: float,
+    corr_source_action_abs_mean: float,
+    corr_generated_action_abs_mean: float,
+    clean_action_loss_eval: float,
+    corr_action_loss_eval: float,
+) -> None:
+    writer.add_scalar("train_extra/base_batch_size", float(base_batch_size), step)
+    writer.add_scalar("train_extra/corr_requested", float(corr_requested), step)
+    writer.add_scalar("train_extra/corr_generated", float(corr_generated), step)
+    writer.add_scalar("train_extra/corr_skipped", float(corr_skipped), step)
+    writer.add_scalar("train_extra/corr_generated_fraction", float(corr_generated) / max(1.0, float(corr_requested)), step)
+    if np.isfinite(clean_action_abs_mean):
+        writer.add_scalar("train_extra/clean_action_abs_mean_norm", float(clean_action_abs_mean), step)
+    if np.isfinite(corr_source_action_abs_mean):
+        writer.add_scalar("train_extra/corr_source_action_abs_mean_norm", float(corr_source_action_abs_mean), step)
+    if np.isfinite(corr_generated_action_abs_mean):
+        writer.add_scalar("train_extra/corr_generated_action_abs_mean_norm", float(corr_generated_action_abs_mean), step)
+    if np.isfinite(clean_action_loss_eval):
+        writer.add_scalar("train_extra/clean_action_loss_eval", float(clean_action_loss_eval), step)
+    if np.isfinite(corr_action_loss_eval):
+        writer.add_scalar("train_extra/corr_action_loss_eval", float(corr_action_loss_eval), step)
+    if np.isfinite(clean_action_loss_eval) and np.isfinite(corr_action_loss_eval):
+        writer.add_scalar(
+            "train_extra/corr_to_clean_action_loss_eval",
+            float(corr_action_loss_eval) / max(1e-8, float(clean_action_loss_eval)),
+            step,
+        )
 
 
 def log_stage2_tensorboard(
@@ -422,7 +772,7 @@ def build_stage1_samples_from_raw_batch(
             instruction_type=instruction_type,
         )
         samples.append(sample)
-        future_images.append(raw_batch["image_t_future"][batch_index, 0])
+        future_images.append(raw_batch["image_t_future"][batch_index, 0].detach().cpu())
         action_prefix.append(sample["action"][:, : int(prefix_steps), :])
     return samples, future_images, action_prefix
 
@@ -431,6 +781,7 @@ def build_stage1_correction_samples(
     correction_raw_batch: dict[str, Any],
     latent_model: SmolVLALatentPolicy,
     preprocess,
+    postprocess,
     instruction_type: str,
     args: argparse.Namespace,
     correction_builder: ACTAlignedCorrectionBuilder,
@@ -438,7 +789,7 @@ def build_stage1_correction_samples(
     norm_stats: dict[str, Any],
     raw_cache: dict[tuple[str, int], dict[str, Any]],
     step_debug_dir: str | None = None,
-) -> tuple[list[dict[str, Any]], list[torch.Tensor], list[torch.Tensor], Counter[str]]:
+) -> tuple[list[dict[str, Any]], list[torch.Tensor], list[torch.Tensor], Counter[str], list[dict[str, Any]]]:
     device = torch.device(args.device)
     qpos_mean = torch.as_tensor(norm_stats["qpos_mean"], dtype=torch.float32, device=device)
     qpos_std = torch.as_tensor(norm_stats["qpos_std"], dtype=torch.float32, device=device)
@@ -449,6 +800,7 @@ def build_stage1_correction_samples(
     future_images = []
     action_prefix = []
     skip_reasons: Counter[str] = Counter()
+    projection_debug_records: list[dict[str, Any]] = []
     for sample_index in range(correction_raw_batch["image_t"].shape[0]):
         task_name_full = correction_raw_batch["task_name"][sample_index]
         task_only, task_config = parse_task_parts(task_name_full)
@@ -481,6 +833,7 @@ def build_stage1_correction_samples(
             sampled_phase_instance_id=int(correction_raw_batch["sampled_phase_instance_id"][sample_index].item()),
             forced_error_mode_id=int(correction_raw_batch["forced_error_mode_id"][sample_index].item()),
             sampled_active_arm_pattern_id=int(correction_raw_batch["sampled_active_arm_pattern_id"][sample_index].item()),
+            original_active_arm_pattern_id=int(correction_raw_batch["original_active_arm_pattern_id"][sample_index].item()),
             forced_dir_bin_id=int(correction_raw_batch["forced_dir_bin_id"][sample_index].item()),
             forced_mag_bin_id=int(correction_raw_batch["forced_mag_bin_id"][sample_index].item()),
             sampled_mode_prob=float(correction_raw_batch["sampled_mode_prob"][sample_index].item()),
@@ -516,12 +869,29 @@ def build_stage1_correction_samples(
             episode_id=episode_id,
         )
         samples.append(smolvla_batch)
-        future_images.append(corr_image[0].detach().cpu())
+        # For correction samples, the first prefix_steps actions pull the
+        # perturbed state back to the original start_ts state, so the stage1
+        # dynamics/condition target should be the clean start_ts image.
+        future_images.append(correction_raw_batch["image_t"][sample_index, 0].detach().cpu())
         if correction["error_action_prefix_norm"] is not None:
             action_prefix.append(correction["error_action_prefix_norm"][None, ...])
         else:
             action_prefix.append(smolvla_batch["action"][:, : int(args.prefix_steps), :])
-    return samples, future_images, action_prefix, skip_reasons
+        projection_debug_records.append(
+            {
+                "sample_type": "correction",
+                "image_t": corr_image[0].detach().cpu(),
+                "action_norm": correction["corr_action_chunk_norm"].detach().cpu(),
+                "act_is_pad": torch.zeros(
+                    int(correction["corr_action_chunk_norm"].shape[0]),
+                    dtype=torch.bool,
+                ),
+                "raw_data_dir": str(correction_raw_batch["raw_data_dir"][sample_index]),
+                "episode_id": int(episode_id),
+                "start_ts": int(correction_raw_batch["start_ts"][sample_index].item()),
+            }
+        )
+    return samples, future_images, action_prefix, skip_reasons, projection_debug_records
 
 
 def run_stage1(args: argparse.Namespace) -> None:
@@ -568,12 +938,16 @@ def run_stage1(args: argparse.Namespace) -> None:
                 raise ValueError(f"stage1 failure_mode=train requires --{name}")
         failure_table_paths = load_failure_table_paths(args.failure_table_paths_json)
         corr_batch_size = int(max(1, round(float(args.batch_size) * float(args.failure_corr_batch_ratio))))
+        evac_sample_size = load_evac_sample_size(args.evac_config)
         failure_cfg = MultiTaskFailureDatasetConfig(
             act_chunk_size=int(args.act_chunk_size),
             prefix_steps=int(args.prefix_steps),
             future_offset=int(args.future_offset),
             sample_phase_window_len=int(args.sample_phase_window_len),
             start_margin=int(args.start_margin),
+            perturb_eef_fail_gain=float(args.act_aligned_perturb_eef_fail_gain),
+            perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
+            evac_sample_size=evac_sample_size,
             failure_table_paths={str(key): str(value) for key, value in failure_table_paths.items()},
             failure_phase_bins=int(args.failure_phase_bins),
             failure_translation_dir_bins=int(args.failure_translation_dir_bins),
@@ -601,7 +975,7 @@ def run_stage1(args: argparse.Namespace) -> None:
         correction_loader = None
         norm_stats = dataset.stats if hasattr(dataset, "stats") else None
 
-    base_policy, preprocess = build_base_policy(args)
+    base_policy, preprocess, postprocess = build_base_policy(args)
     model = SmolVLALatentPolicy(
         base_policy=base_policy,
         bridge_cfg=build_bridge_config(args),
@@ -654,6 +1028,7 @@ def run_stage1(args: argparse.Namespace) -> None:
     skip_reason_counter: Counter[str] = Counter()
     debug_wm = bool(getattr(args, "debug_wm_correction", False))
     debug_wm_all_ranks = bool(getattr(args, "debug_wm_all_ranks", False))
+    debug_loss_batch_projection = bool(getattr(args, "debug_loss_batch_projection", False))
     debug_wm_root = (output_dir / "debug_wm") if debug_wm else None
     debug_wm_dir = None
     if debug_wm_root is not None:
@@ -664,6 +1039,7 @@ def run_stage1(args: argparse.Namespace) -> None:
     debug_wm_should_save = bool(debug_wm_dir is not None and (debug_wm_all_ranks or accelerator.is_main_process))
     if debug_wm_should_save:
         debug_wm_dir.mkdir(parents=True, exist_ok=True)
+    correction_trace_path = output_dir / f"stage1_correction_trace_rank{int(accelerator.process_index):02d}.jsonl"
     global_step, epoch = resume_training_checkpoint(
         checkpoint_path=str(args.resume_ckpt),
         model=latent_model,
@@ -682,6 +1058,13 @@ def run_stage1(args: argparse.Namespace) -> None:
                     instruction_type=args.instruction_type,
                     prefix_steps=int(args.prefix_steps),
                 )
+                base_batch_size = int(raw_batch["image_t"].shape[0])
+                clean_action_abs_mean = _mean_action_abs(raw_batch)
+                corr_requested = 0
+                corr_source_action_abs_mean = float("nan")
+                corr_generated_action_abs_mean = float("nan")
+                corr_trace_records: list[dict[str, Any]] = []
+                corr_skip_reasons: Counter[str] = Counter()
                 if use_failure_corr_loader:
                     assert correction_iter is not None
                     assert correction_builder is not None
@@ -691,14 +1074,18 @@ def run_stage1(args: argparse.Namespace) -> None:
                     except StopIteration:
                         correction_iter = iter(correction_loader)
                         correction_raw_batch = next(correction_iter)
+                    corr_requested = int(correction_raw_batch["image_t"].shape[0])
+                    corr_source_action_abs_mean = _mean_action_abs(correction_raw_batch)
+                    corr_trace_records = summarize_correction_raw_batch(correction_raw_batch)
                     step_debug_dir = None
                     if debug_wm_should_save:
                         step_debug_dir = str(debug_wm_dir / f"step_{global_step:06d}")
                         Path(step_debug_dir).mkdir(parents=True, exist_ok=True)
-                    corr_samples, corr_future_images, corr_action_prefix, corr_skip_reasons = build_stage1_correction_samples(
+                    corr_samples, corr_future_images, corr_action_prefix, corr_skip_reasons, corr_projection_debug_records = build_stage1_correction_samples(
                         correction_raw_batch=correction_raw_batch,
                         latent_model=latent_model,
                         preprocess=preprocess,
+                        postprocess=postprocess,
                         instruction_type=args.instruction_type,
                         args=args,
                         correction_builder=correction_builder,
@@ -708,16 +1095,84 @@ def run_stage1(args: argparse.Namespace) -> None:
                         step_debug_dir=step_debug_dir,
                     )
                     skip_reason_counter.update(corr_skip_reasons)
+                    corr_skip_reasons = Counter(corr_skip_reasons)
                     samples.extend(corr_samples)
                     future_images.extend(corr_future_images)
                     action_prefix.extend(corr_action_prefix)
+                    if corr_projection_debug_records:
+                        corr_generated_action_abs_mean = float(
+                            np.mean(
+                                [
+                                    float(record["action_norm"].detach().float().abs().mean().item())
+                                    for record in corr_projection_debug_records
+                                ]
+                            )
+                        )
                     if not corr_samples:
+                        trace_payload = {
+                            "step": int(global_step),
+                            "rank": int(accelerator.process_index),
+                            "skipped_train_step": True,
+                            "base_batch_size": int(base_batch_size),
+                            "corr_requested": int(corr_requested),
+                            "corr_generated": 0,
+                            "corr_skipped": int(sum(corr_skip_reasons.values())),
+                            "skip_reasons": dict(corr_skip_reasons),
+                            "clean_action_abs_mean_norm": float(clean_action_abs_mean),
+                            "corr_source_action_abs_mean_norm": float(corr_source_action_abs_mean),
+                            "requested_units": corr_trace_records,
+                        }
+                        with open(correction_trace_path, "a", encoding="utf-8") as trace_f:
+                            trace_f.write(json.dumps(trace_payload, ensure_ascii=False) + "\n")
                         continue
+                else:
+                    step_debug_dir = None
+                    corr_projection_debug_records = []
 
                 batch = stack_smolvla_batches(samples)
                 future_image_tensor = torch.stack(future_images, dim=0).to(device=accelerator.device, dtype=torch.float32)
                 future_teacher_latent = teacher.encode_image(future_image_tensor)
                 action_prefix_tensor = torch.cat(action_prefix, dim=0).to(device=accelerator.device)
+
+                if debug_loss_batch_projection and step_debug_dir is not None and correction_builder is not None:
+                    loss_dbg_dir = Path(step_debug_dir) / "loss_batch_projection"
+                    loss_dbg_dir.mkdir(parents=True, exist_ok=True)
+                    fk = correction_builder.modules["fk"]
+
+                    def _get_raw(raw_data_dir_i: str, episode_id_i: int) -> dict[str, Any]:
+                        cache_key = (str(raw_data_dir_i), int(episode_id_i))
+                        if cache_key not in raw_cache:
+                            raw_cache[cache_key] = load_raw_episode(str(raw_data_dir_i), int(episode_id_i))
+                        return raw_cache[cache_key]
+
+                    for i in range(int(raw_batch["image_t"].shape[0])):
+                        ep_i = int(raw_batch["episode_id"][i].item())
+                        st_i = int(raw_batch["start_ts"][i].item())
+                        raw_dir_i = str(raw_batch["raw_data_dir"][i])
+                        _save_loss_batch_projection(
+                            str(loss_dbg_dir / f"base_{i:03d}_ep{ep_i}_ts{st_i:04d}"),
+                            raw_batch["image_t"][i, 0],
+                            raw_batch["act_action_chunk"][i],
+                            raw_batch["act_is_pad"][i],
+                            _get_raw(raw_dir_i, ep_i),
+                            fk,
+                            norm_stats,
+                            meta={"sample_type": "base", "episode_id": ep_i, "start_ts": st_i},
+                        )
+
+                    for j, record in enumerate(corr_projection_debug_records):
+                        ep_j = int(record["episode_id"])
+                        st_j = int(record["start_ts"])
+                        _save_loss_batch_projection(
+                            str(loss_dbg_dir / f"corr_{j:03d}_ep{ep_j}_ts{st_j:04d}"),
+                            record["image_t"],
+                            record["action_norm"],
+                            record["act_is_pad"],
+                            _get_raw(str(record["raw_data_dir"]), ep_j),
+                            fk,
+                            norm_stats,
+                            meta={"sample_type": str(record["sample_type"]), "episode_id": ep_j, "start_ts": st_j},
+                        )
 
                 output = model(
                     train_stage="stage1",
@@ -725,6 +1180,12 @@ def run_stage1(args: argparse.Namespace) -> None:
                     future_teacher_latent=future_teacher_latent,
                     action_prefix=action_prefix_tensor,
                     global_step=global_step,
+                )
+                clean_action_loss_eval, corr_action_loss_eval = compute_action_loss_split(
+                    latent_model,
+                    batch,
+                    base_batch_size=base_batch_size,
+                    total_batch_size=len(samples),
                 )
                 optimizer.zero_grad(set_to_none=True)
                 accelerator.backward(output.loss)
@@ -741,6 +1202,44 @@ def run_stage1(args: argparse.Namespace) -> None:
                         output=output,
                         lr=current_lr,
                     )
+                    log_stage1_extra_tensorboard(
+                        writer=tb_writer,
+                        step=global_step,
+                        base_batch_size=base_batch_size,
+                        corr_requested=corr_requested,
+                        corr_generated=(len(samples) - base_batch_size),
+                        corr_skipped=int(sum(corr_skip_reasons.values())),
+                        clean_action_abs_mean=clean_action_abs_mean,
+                        corr_source_action_abs_mean=corr_source_action_abs_mean,
+                        corr_generated_action_abs_mean=corr_generated_action_abs_mean,
+                        clean_action_loss_eval=clean_action_loss_eval,
+                        corr_action_loss_eval=corr_action_loss_eval,
+                    )
+                if use_failure_corr_loader:
+                    trace_payload = {
+                        "step": int(global_step),
+                        "rank": int(accelerator.process_index),
+                        "base_batch_size": int(base_batch_size),
+                        "corr_requested": int(corr_requested),
+                        "corr_generated": int(len(samples) - base_batch_size),
+                        "corr_skipped": int(sum(corr_skip_reasons.values())),
+                        "skip_reasons": dict(corr_skip_reasons),
+                        "clean_action_abs_mean_norm": float(clean_action_abs_mean),
+                        "corr_source_action_abs_mean_norm": float(corr_source_action_abs_mean),
+                        "corr_generated_action_abs_mean_norm": float(corr_generated_action_abs_mean),
+                        "clean_action_loss_eval": float(clean_action_loss_eval),
+                        "corr_action_loss_eval": float(corr_action_loss_eval),
+                        "loss": float(output.loss.item()),
+                        "loss_action": float(output.loss_action.item()),
+                        "loss_action_conditioned": float(output.loss_action_conditioned.item()),
+                        "loss_dynamics": float(output.loss_dynamics.item()),
+                        "beta_condition": float(output.beta_condition),
+                        "beta_dynamics": float(output.beta_dynamics),
+                        "lr": float(current_lr),
+                        "requested_units": corr_trace_records,
+                    }
+                    with open(correction_trace_path, "a", encoding="utf-8") as trace_f:
+                        trace_f.write(json.dumps(trace_payload, ensure_ascii=False) + "\n")
 
                 progress.set_postfix(
                     loss=f"{output.loss.item():.4f}",
@@ -831,12 +1330,16 @@ def run_stage2(args: argparse.Namespace) -> None:
         drop_last=True,
     )
 
+    evac_sample_size = load_evac_sample_size(args.evac_config)
     failure_cfg = MultiTaskFailureDatasetConfig(
         act_chunk_size=int(args.act_chunk_size),
         prefix_steps=int(args.prefix_steps),
         future_offset=int(args.future_offset),
         sample_phase_window_len=int(args.sample_phase_window_len),
         start_margin=int(args.start_margin),
+        perturb_eef_fail_gain=float(args.act_aligned_perturb_eef_fail_gain),
+        perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
+        evac_sample_size=evac_sample_size,
         failure_table_paths={str(key): str(value) for key, value in failure_table_paths.items()},
         failure_phase_bins=int(args.failure_phase_bins),
         failure_translation_dir_bins=int(args.failure_translation_dir_bins),
@@ -855,7 +1358,7 @@ def run_stage2(args: argparse.Namespace) -> None:
         drop_last=True,
     )
 
-    base_policy, preprocess = build_base_policy(args)
+    base_policy, preprocess, postprocess = build_base_policy(args)
     model = SmolVLALatentPolicy(
         base_policy=base_policy,
         bridge_cfg=build_bridge_config(args),
@@ -977,6 +1480,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                         sampled_phase_instance_id=int(correction_raw_batch["sampled_phase_instance_id"][sample_index].item()),
                         forced_error_mode_id=int(correction_raw_batch["forced_error_mode_id"][sample_index].item()),
                         sampled_active_arm_pattern_id=int(correction_raw_batch["sampled_active_arm_pattern_id"][sample_index].item()),
+                        original_active_arm_pattern_id=int(correction_raw_batch["original_active_arm_pattern_id"][sample_index].item()),
                         forced_dir_bin_id=int(correction_raw_batch["forced_dir_bin_id"][sample_index].item()),
                         forced_mag_bin_id=int(correction_raw_batch["forced_mag_bin_id"][sample_index].item()),
                         sampled_mode_prob=float(correction_raw_batch["sampled_mode_prob"][sample_index].item()),

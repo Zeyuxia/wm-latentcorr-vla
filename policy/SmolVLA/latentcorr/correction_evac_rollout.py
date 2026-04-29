@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import shutil
 import tempfile
@@ -78,6 +79,112 @@ def quat_geodesic_deg_wxyz(q1_wxyz, q2_wxyz):
     dot = float(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0))
     rad = 2.0 * float(np.arccos(dot))
     return float(np.rad2deg(rad))
+
+
+def _evac_denoise_runtime_meta(
+    *,
+    target_dir,
+    dataset_name,
+    ddim_steps,
+    n_valid,
+    num_chunk,
+    chunk,
+    n_previous,
+    saving_video,
+    infer_kwargs,
+):
+    kwargs = {} if infer_kwargs is None else dict(infer_kwargs)
+    meta = {
+        "target_dir": target_dir,
+        "dataset_name": str(dataset_name),
+        "ddim_steps": int(ddim_steps),
+        "denoise_step_indices": list(range(int(ddim_steps))),
+        "n_valid": int(n_valid),
+        "num_chunk": int(num_chunk),
+        "chunk": int(chunk),
+        "n_previous": int(n_previous),
+        "saving_video": bool(saving_video),
+        "infer_kwargs": kwargs,
+    }
+    if bool(kwargs.get("use_dual_cache", False)):
+        dc_budget = kwargs.get("dc_budget", None)
+        dc_v_bounds = kwargs.get("dc_v_bounds", []) or []
+        dc_v_bounds = [int(x) for x in dc_v_bounds]
+        dual_cache = {
+            "enabled": True,
+            "dc_v_bounds": dc_v_bounds,
+            "dc_budget": None if dc_budget is None else float(dc_budget),
+            "dc_enc_start": int(kwargs.get("dc_enc_start", 999)),
+            "dc_replay_step_noise": bool(kwargs.get("dc_replay_step_noise", False)),
+            "dc_hf_metric": bool(kwargs.get("dc_hf_metric", False)),
+            "dc_v_blur_on_reuse": bool(kwargs.get("dc_v_blur_on_reuse", False)),
+        }
+        if dc_budget is None and dc_v_bounds:
+            anchors = [0] + dc_v_bounds[:-1]
+            reuse_steps = []
+            for anchor, end in zip(anchors, dc_v_bounds):
+                reuse_steps.extend(range(int(anchor) + 1, min(int(end), int(ddim_steps))))
+            reuse_steps = sorted(set(step for step in reuse_steps if 0 <= int(step) < int(ddim_steps)))
+            full_steps = [step for step in range(int(ddim_steps)) if step not in set(reuse_steps)]
+            dual_cache.update({
+                "schedule_mode": "explicit_bounds",
+                "anchor_steps": [int(x) for x in anchors if 0 <= int(x) < int(ddim_steps)],
+                "reuse_steps": [int(x) for x in reuse_steps],
+                "full_unet_steps": [int(x) for x in full_steps],
+                "reuse_step_count": int(len(reuse_steps)),
+                "full_unet_step_count": int(len(full_steps)),
+            })
+        elif dc_budget is not None:
+            dual_cache.update({
+                "schedule_mode": "auto_budget",
+                "note": "Actual reuse schedule is derived inside DDIM sampler after calibration.",
+            })
+        else:
+            dual_cache.update({
+                "schedule_mode": "enabled_no_bounds",
+                "reuse_steps": [],
+                "full_unet_steps": list(range(int(ddim_steps))),
+                "reuse_step_count": 0,
+                "full_unet_step_count": int(ddim_steps),
+            })
+        meta["dual_cache"] = dual_cache
+    else:
+        meta["dual_cache"] = {
+            "enabled": False,
+            "reuse_steps": [],
+            "full_unet_steps": list(range(int(ddim_steps))),
+            "reuse_step_count": 0,
+            "full_unet_step_count": int(ddim_steps),
+        }
+    return meta
+
+
+def _print_evac_runtime_meta(meta):
+    env_value = os.environ.get("SMOLVLA_EVAC_PRINT_RUNTIME", None)
+    if env_value is None:
+        if not bool(meta.get("saving_video", False)):
+            return
+    elif str(env_value).strip().lower() in {"0", "false", "no", "off"}:
+        return
+    dc = meta.get("dual_cache", {}) if isinstance(meta, dict) else {}
+    if bool(dc.get("enabled", False)):
+        print(
+            "[EVAC runtime] "
+            f"dir={meta.get('target_dir')} "
+            f"ddim_steps={meta.get('ddim_steps')} chunks={meta.get('num_chunk')} n_valid={meta.get('n_valid')} "
+            f"dual_cache=True bounds={dc.get('dc_v_bounds')} mode={dc.get('schedule_mode')} "
+            f"full_unet={dc.get('full_unet_step_count')}/{meta.get('ddim_steps')} "
+            f"reuse={dc.get('reuse_step_count')}/{meta.get('ddim_steps')}",
+            flush=True,
+        )
+    else:
+        print(
+            "[EVAC runtime] "
+            f"dir={meta.get('target_dir')} "
+            f"ddim_steps={meta.get('ddim_steps')} chunks={meta.get('num_chunk')} n_valid={meta.get('n_valid')} "
+            "dual_cache=False",
+            flush=True,
+        )
 
 
 def evac_inference(
@@ -161,6 +268,25 @@ def evac_inference(
     if infer_kwargs is None:
         infer_kwargs = {}
 
+    runtime_meta = _evac_denoise_runtime_meta(
+        target_dir=target_dir,
+        dataset_name=dataset_name,
+        ddim_steps=ddim_steps,
+        n_valid=n_valid,
+        num_chunk=num_chunk,
+        chunk=chunk,
+        n_previous=n_prev,
+        saving_video=(save_dir is not None),
+        infer_kwargs=infer_kwargs,
+    )
+    if save_dir is not None:
+        try:
+            with open(os.path.join(target_dir, "evac_runtime_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(runtime_meta, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    _print_evac_runtime_meta(runtime_meta)
+
     with open(os.devnull, "w") as devnull:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -196,9 +322,10 @@ def evac_inference(
         except Exception:
             pass
 
+    last_rgb = cv2.resize(frames[-1], (640, 480))
+    last_bgr = last_rgb[:, :, ::-1].copy()
+
     if tmp_dir is not None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    last_rgb = cv2.resize(frames[-1], (640, 480))
-    last_bgr = last_rgb[:, :, ::-1].copy()
     return torch.from_numpy(last_bgr).float().permute(2, 0, 1) / 255.0

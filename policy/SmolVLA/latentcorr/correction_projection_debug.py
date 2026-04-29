@@ -353,6 +353,10 @@ def save_recover_eval_compare_image(
     metric_name=None,
     metric=None,
     threshold=None,
+    metrics=None,
+    thresholds=None,
+    passes=None,
+    failed_thresholds=None,
     nearest_dist=None,
 ):
     import cv2
@@ -386,8 +390,29 @@ def save_recover_eval_compare_image(
         ]
         if metric_name is not None and metric is not None:
             info_lines.append(f"{metric_name}={float(metric):.6f}")
+        elif metric_name is not None:
+            info_lines.append(f"criterion={metric_name}")
         if threshold is not None:
             info_lines.append(f"threshold={float(threshold):.6f}")
+        if isinstance(metrics, dict):
+            threshold_map = thresholds if isinstance(thresholds, dict) else {}
+            pass_map = passes if isinstance(passes, dict) else {}
+            for name in ("pos_err_m", "rot_err_deg", "gripper_err"):
+                value = metrics.get(name)
+                thresh = threshold_map.get(name)
+                passed = pass_map.get(name)
+                if value is None:
+                    continue
+                value_s = f"{float(value):.6f}"
+                thresh_s = "None" if thresh is None else f"{float(thresh):.6f}"
+                pass_s = "unknown" if passed is None else ("pass" if bool(passed) else "fail")
+                info_lines.append(f"{name}={value_s} thresh={thresh_s} {pass_s}")
+        if failed_thresholds is not None:
+            failed_list = [str(item) for item in list(failed_thresholds)]
+            info_lines.append(
+                "failed_thresholds="
+                + ("none" if len(failed_list) == 0 else ",".join(failed_list))
+            )
         if nearest_dist is not None:
             info_lines.append(f"nearest_dist={float(nearest_dist):.6f}")
 
@@ -413,6 +438,12 @@ def save_recover_eval_compare_image(
             "metric_name": metric_name,
             "metric": (None if metric is None else float(metric)),
             "threshold": (None if threshold is None else float(threshold)),
+            "metrics": metrics if isinstance(metrics, dict) else None,
+            "thresholds": thresholds if isinstance(thresholds, dict) else None,
+            "passes": passes if isinstance(passes, dict) else None,
+            "failed_thresholds": (
+                None if failed_thresholds is None else [str(item) for item in list(failed_thresholds)]
+            ),
             "nearest_dist": (None if nearest_dist is None else float(nearest_dist)),
         }
     except Exception:

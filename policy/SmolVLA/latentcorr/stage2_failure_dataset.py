@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -13,7 +14,6 @@ from policy.SmolVLA.latentcorr.failure_utils import (
     ERROR_MODE_KEYS,
     active_arm_pattern_key_to_id,
     canonicalize_active_arm_pattern_key,
-    error_mode_key_to_id,
     error_mode_key_to_id,
     get_failure_param_bins,
     normalize_error_mode_dir_mag_bins,
@@ -42,10 +42,20 @@ EXPLORE_PHASE_SORT_KEYS = {
     "place": 3,
 }
 EXPLORE_ERROR_MODE_SORT_KEYS = {
-    "gripper_close": 0,
-    "translation": 1,
-    "rotation": 2,
+    "translation": 0,
+    "rotation": 1,
+    "gripper_close": 2,
 }
+
+
+def _phase_allows_explore_error_mode(phase_key: str, error_mode: str) -> bool:
+    phase_key = str(phase_key).strip().lower()
+    error_mode = str(error_mode).strip().lower()
+    if phase_key in {"pregrasp", "approach"}:
+        return error_mode in {"translation", "rotation", "gripper_close"}
+    if phase_key in {"transport", "place"}:
+        return error_mode in {"translation", "rotation"}
+    return False
 
 
 def _safe_float_or_nan(value) -> float:
@@ -102,6 +112,10 @@ class FailureAwareStage2Dataset(Dataset):
         perturb_eef_fail_gain: float = 0.08,
         perturb_rot_max_deg: float = 15.0,
         evac_sample_size: tuple[int, int] | None = None,
+        explore_phase_keys: list[str] | None = None,
+        explore_error_modes: list[str] | None = None,
+        explore_disable_phase_bin_skip: bool = False,
+        explore_skip_open_laptop_transport: bool = False,
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -123,6 +137,10 @@ class FailureAwareStage2Dataset(Dataset):
         self.perturb_eef_fail_gain = float(perturb_eef_fail_gain)
         self.perturb_rot_max_deg = float(perturb_rot_max_deg)
         self.evac_sample_size = None if evac_sample_size is None else (int(evac_sample_size[0]), int(evac_sample_size[1]))
+        self.explore_phase_keys = None if not explore_phase_keys else {str(x).strip().lower() for x in explore_phase_keys if str(x).strip()}
+        self.explore_error_modes = None if not explore_error_modes else {str(x).strip().lower() for x in explore_error_modes if str(x).strip()}
+        self.explore_disable_phase_bin_skip = bool(explore_disable_phase_bin_skip)
+        self.explore_skip_open_laptop_transport = bool(explore_skip_open_laptop_transport)
         set_failure_param_bins(
             translation_dir_bins=failure_translation_dir_bins,
             translation_mag_bins=failure_translation_mag_bins,
@@ -143,13 +161,18 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_trial_count_local = 0
         self._explore_seen_samples: set[tuple[int, int]] = set()
         self._explore_completed_unit_count = 0
+        self._explore_unit_candidate_counts: list[int] = []
+        self._explore_unit_target_trials: list[int] = []
+        self._explore_total_target_samples = 0
         self._init_failure_units()
 
     def _is_open_laptop_dataset(self) -> bool:
-        dataset_key = os.path.basename(os.path.normpath(self.dataset_dir)).strip().lower()
+        dataset_key = os.path.normpath(self.dataset_dir).strip().lower()
         return "open_laptop" in dataset_key
 
     def _should_skip_explore_phase_bin(self, phase_key: str, phase_bin_id: int) -> bool:
+        if bool(self.explore_disable_phase_bin_skip):
+            return False
         phase_key = str(phase_key).strip().lower()
         phase_bin_id = int(phase_bin_id)
         if phase_key in {"approach", "transport"}:
@@ -158,13 +181,173 @@ class FailureAwareStage2Dataset(Dataset):
             return phase_bin_id == int(self.failure_phase_bins) - 1
         return False
 
+    def _resolve_start_bounds(self, episode_id: int) -> tuple[int, int] | None:
+        max_start = self._resolve_max_start(int(episode_id))
+        min_start = int(max(0, self.start_margin))
+        if max_start < min_start:
+            return None
+        return min_start, max_start
+
+    def _rebuild_explore_unit_targets(self) -> None:
+        if len(self._explore_unit_candidate_counts) == len(self._explore_units):
+            self._set_explore_unit_candidate_counts(self._explore_unit_candidate_counts)
+            return
+        counts: list[int] = []
+        for unit in self._explore_units:
+            count = int(self._count_unit_local_candidates(unit))
+            counts.append(count)
+        self._set_explore_unit_candidate_counts(counts)
+
+    def _set_explore_unit_candidate_counts(self, counts: list[int]) -> None:
+        counts = [int(max(0, int(x))) for x in list(counts)]
+        self._explore_unit_candidate_counts = counts
+        self._explore_unit_target_trials = [
+            int(min(self._explore_k_local, int(count))) for count in counts
+        ]
+        self._explore_total_target_samples = int(sum(self._explore_unit_target_trials))
+
+    def _advance_explore_unit(self) -> None:
+        if not self._explore_units:
+            self._explore_curr_unit_idx = 0
+            self._explore_trial_count_local = 0
+            self._explore_seen_samples = set()
+            return
+        self._explore_completed_unit_count += 1
+        self._explore_curr_unit_idx = (int(self._explore_curr_unit_idx) + 1) % int(len(self._explore_units))
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+
+    def _get_explore_unit_target_trials(self, unit_idx: int | None = None) -> int:
+        if unit_idx is None:
+            unit_idx = int(self._explore_curr_unit_idx)
+        if unit_idx < 0 or unit_idx >= len(self._explore_unit_target_trials):
+            return int(self._explore_k_local)
+        return int(max(0, self._explore_unit_target_trials[unit_idx]))
+
     def __len__(self) -> int:
         return len(self.episode_ids)
+
+    def _explore_cache_enabled(self) -> bool:
+        value = str(os.environ.get("SMOLVLA_DISABLE_FAILURE_SCAN_CACHE", "")).strip().lower()
+        return value not in {"1", "true", "yes", "y"}
+
+    def _explore_cache_dir(self) -> str:
+        override = str(os.environ.get("SMOLVLA_FAILURE_SCAN_CACHE_DIR", "")).strip()
+        if override:
+            return override
+        return os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "outputs", "cache", "failure_scan"))
+
+    @staticmethod
+    def _file_signature(path: str) -> dict:
+        path = os.path.realpath(path)
+        if not os.path.isfile(path):
+            return {"path": path, "exists": False}
+        stat = os.stat(path)
+        return {
+            "path": path,
+            "exists": True,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def _build_explore_cache_key(self) -> dict:
+        bin_cfg = get_failure_param_bins()
+        episode_sigs = []
+        for episode_id in self.episode_ids:
+            episode_id = int(episode_id)
+            processed_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
+            raw_path = (
+                None
+                if not self.raw_data_dir
+                else os.path.join(self.raw_data_dir, f"episode{episode_id}.hdf5")
+            )
+            episode_sigs.append(
+                {
+                    "episode_id": episode_id,
+                    "processed": self._file_signature(processed_path),
+                    "raw": None if raw_path is None else self._file_signature(raw_path),
+                }
+            )
+        return {
+            "version": 1,
+            "dataset_dir": os.path.realpath(self.dataset_dir),
+            "raw_data_dir": None if not self.raw_data_dir else os.path.realpath(self.raw_data_dir),
+            "episode_ids": [int(x) for x in self.episode_ids],
+            "episode_sigs": episode_sigs,
+            "failure_phase_bins": int(self.failure_phase_bins),
+            "failure_translation_dir_bins": int(bin_cfg["translation_dir_bins"]),
+            "failure_translation_mag_bins": int(bin_cfg["translation_mag_bins"]),
+            "failure_rotation_dir_bins": int(bin_cfg["rotation_dir_bins"]),
+            "failure_rotation_mag_bins": int(bin_cfg["rotation_mag_bins"]),
+            "future_offset": int(self.future_offset),
+            "sample_phase_window_len": int(self.sample_phase_window_len),
+            "start_margin": int(self.start_margin),
+            "perturb_eef_fail_gain": float(self.perturb_eef_fail_gain),
+            "perturb_rot_max_deg": float(self.perturb_rot_max_deg),
+            "evac_sample_size": None if self.evac_sample_size is None else list(self.evac_sample_size),
+            "explore_phase_keys": None if self.explore_phase_keys is None else sorted(self.explore_phase_keys),
+            "explore_error_modes": None if self.explore_error_modes is None else sorted(self.explore_error_modes),
+            "explore_disable_phase_bin_skip": bool(self.explore_disable_phase_bin_skip),
+            "explore_skip_open_laptop_transport": bool(self.explore_skip_open_laptop_transport),
+        }
+
+    def _explore_cache_path_and_key(self) -> tuple[str, dict]:
+        key = self._build_explore_cache_key()
+        encoded = json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        dataset_name = os.path.basename(os.path.normpath(self.dataset_dir)) or "dataset"
+        safe_dataset_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in dataset_name)
+        cache_path = os.path.join(self._explore_cache_dir(), f"{safe_dataset_name}_{digest}.json")
+        return cache_path, key
+
+    def _load_explore_unit_cache(self) -> bool:
+        if not self._explore_cache_enabled():
+            return False
+        try:
+            cache_path, key = self._explore_cache_path_and_key()
+            if not os.path.isfile(cache_path):
+                return False
+            with open(cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if payload.get("cache_key") != key:
+                return False
+            units = payload.get("explore_units")
+            counts = payload.get("candidate_counts")
+            if not isinstance(units, list) or not isinstance(counts, list) or len(units) != len(counts):
+                return False
+            self._explore_units = [dict(item) for item in units]
+            self._set_explore_unit_candidate_counts([int(x) for x in counts])
+            return True
+        except Exception:
+            return False
+
+    def _save_explore_unit_cache(self) -> None:
+        if not self._explore_cache_enabled():
+            return
+        if len(self._explore_unit_candidate_counts) != len(self._explore_units):
+            return
+        try:
+            cache_path, key = self._explore_cache_path_and_key()
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = {
+                "version": 1,
+                "cache_key": key,
+                "explore_units": [dict(item) for item in self._explore_units],
+                "candidate_counts": [int(x) for x in self._explore_unit_candidate_counts],
+            }
+            tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            return
 
     def _init_failure_units(self) -> None:
         if self.failure_mode == "off":
             return
         if self.failure_mode == "explore":
+            if self._load_explore_unit_cache():
+                return
             units = []
             phase_units = self._collect_local_explore_phase_units()
             bin_cfg = get_failure_param_bins()
@@ -182,6 +365,10 @@ class FailureAwareStage2Dataset(Dataset):
                 phase_bin_id = int(phase_unit["phase_bin_id"])
                 active_arm_pattern = str(phase_unit["active_arm_pattern"])
                 for mode in FAILURE_ERROR_MODES:
+                    if self.explore_error_modes is not None and str(mode).strip().lower() not in self.explore_error_modes:
+                        continue
+                    if not _phase_allows_explore_error_mode(phase_key, mode):
+                        continue
                     if mode == "translation":
                         for dir_bin_id in range(trans_dir_bins):
                             for mag_bin_id in range(trans_mag_bins):
@@ -226,6 +413,8 @@ class FailureAwareStage2Dataset(Dataset):
                             }
                         )
             self._explore_units = sorted(units, key=_explore_unit_sort_key)
+            self._rebuild_explore_unit_targets()
+            self._save_explore_unit_cache()
             return
 
         if not self.failure_table_path:
@@ -251,6 +440,7 @@ class FailureAwareStage2Dataset(Dataset):
             phase_key_to_id(phase_key)
             phase_instance_idx = int(item["phase_instance_idx"])
             phase_bin_id = int(np.clip(int(item["phase_bin_id"]), 0, self.failure_phase_bins - 1))
+            active_patterns = [None]
             active_pattern = item.get("active_arm_pattern")
             if active_pattern is not None:
                 try:
@@ -258,28 +448,32 @@ class FailureAwareStage2Dataset(Dataset):
                 except ValueError:
                     continue
                 if active_pattern == "both":
-                    active_pattern = None
+                    active_patterns = ["left_arm", "right_arm"]
+                else:
+                    active_patterns = [active_pattern]
             weight = float(item.get("weight", item.get("fail_rate", 1.0)))
             if (not np.isfinite(weight)) or weight <= 0.0:
                 weight = 1.0
             dir_bin_id, mag_bin_id = normalize_error_mode_dir_mag_bins(
                 mode, int(item.get("dir_bin_id", -1)), int(item.get("mag_bin_id", -1))
             )
-            parsed.append(
-                {
-                    "phase_key": phase_key,
-                    "phase_instance_idx": phase_instance_idx,
-                    "phase_bin_id": phase_bin_id,
-                    "error_mode": mode,
-                    "active_arm_pattern": active_pattern,
-                    "dir_bin_id": int(dir_bin_id),
-                    "mag_bin_id": int(mag_bin_id),
-                    "weight": float(weight),
-                    "n_trials": int(item.get("n_trials", 0)),
-                    "n_recover": int(item.get("n_recover", 0)),
-                    "fail_rate": float(item.get("fail_rate", max(1e-6, weight))),
-                }
-            )
+            per_pattern_weight = float(weight) / float(len(active_patterns))
+            for parsed_active_pattern in active_patterns:
+                parsed.append(
+                    {
+                        "phase_key": phase_key,
+                        "phase_instance_idx": phase_instance_idx,
+                        "phase_bin_id": phase_bin_id,
+                        "error_mode": mode,
+                        "active_arm_pattern": parsed_active_pattern,
+                        "dir_bin_id": int(dir_bin_id),
+                        "mag_bin_id": int(mag_bin_id),
+                        "weight": float(per_pattern_weight),
+                        "n_trials": int(item.get("n_trials", 0)),
+                        "n_recover": int(item.get("n_recover", 0)),
+                        "fail_rate": float(item.get("fail_rate", max(1e-6, weight))),
+                    }
+                )
         if not parsed:
             raise ValueError(f"No valid entries in failure_table: {path}")
 
@@ -322,11 +516,16 @@ class FailureAwareStage2Dataset(Dataset):
         unit_keys = set()
         units = []
         for episode_id in self.episode_ids:
-            max_start = self._resolve_max_start(int(episode_id))
-            scan = self._scan_phase_bins(int(episode_id), 0, max_start)
+            bounds = self._resolve_start_bounds(int(episode_id))
+            if bounds is None:
+                continue
+            min_start, max_start = bounds
+            scan = self._scan_phase_bins(int(episode_id), min_start, max_start)
             projection_visible = self._scan_start_projection_visibility(int(episode_id))
             for ts, meta in scan.items():
                 phase_key = str(meta["phase_key"])
+                if self.explore_phase_keys is not None and str(phase_key).strip().lower() not in self.explore_phase_keys:
+                    continue
                 phase_instance_idx = int(meta["phase_instance_idx"])
                 phase_bin_id = int(meta["phase_bin_id"])
                 raw_active_arm_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
@@ -336,7 +535,7 @@ class FailureAwareStage2Dataset(Dataset):
                     continue
                 if self._should_skip_explore_phase_bin(phase_key, phase_bin_id):
                     continue
-                if self._is_open_laptop_dataset() and phase_key == "transport":
+                if self.explore_skip_open_laptop_transport and self._is_open_laptop_dataset() and phase_key == "transport":
                     continue
                 expanded_patterns = (
                     ["left_arm", "right_arm"] if active_arm_pattern == "both" else [active_arm_pattern]
@@ -589,7 +788,7 @@ class FailureAwareStage2Dataset(Dataset):
 
     def _unit_projection_visible(self, projection_visible: dict, ts: int, unit: dict) -> bool:
         if not projection_visible:
-            return True
+            return not bool(self.raw_data_dir)
         item = projection_visible.get(int(ts), {})
         active_arm = str(unit.get("active_arm_pattern", "left_arm"))
         if active_arm not in {"left_arm", "right_arm"}:
@@ -651,6 +850,9 @@ class FailureAwareStage2Dataset(Dataset):
             if not self._explore_units:
                 raise RuntimeError("explore mode has no units")
             unit_idx = int(self._explore_curr_unit_idx) % int(len(self._explore_units))
+            if self._get_explore_unit_target_trials(unit_idx) <= 0:
+                self._advance_explore_unit()
+                unit_idx = int(self._explore_curr_unit_idx) % int(len(self._explore_units))
             unit = dict(self._explore_units[unit_idx])
             unit["sampled_mode_prob"] = None
             unit["sampled_entry_prob_within_mode"] = None
@@ -696,13 +898,17 @@ class FailureAwareStage2Dataset(Dataset):
             return None
         unit, unit_idx = output
         num_episodes = len(self.episode_ids)
+        seen_samples = self._explore_seen_samples if self.failure_mode == "explore" else set()
         for offset in range(num_episodes):
             episode_id = int(self.episode_ids[(int(base_index) + offset) % num_episodes])
-            max_start = self._resolve_max_start(episode_id)
-            min_start = 0
+            bounds = self._resolve_start_bounds(episode_id)
+            if bounds is None:
+                continue
+            min_start, max_start = bounds
             scan = self._scan_phase_bins(episode_id, min_start, max_start)
             projection_visible = self._scan_start_projection_visibility(episode_id)
             candidates = []
+            unseen_candidates = []
             for ts, meta in scan.items():
                 if str(meta["phase_key"]) != str(unit["phase_key"]):
                     continue
@@ -712,6 +918,7 @@ class FailureAwareStage2Dataset(Dataset):
                 if int(meta["phase_bin_id"]) != int(unit["phase_bin_id"]):
                     continue
                 target_pattern = unit.get("active_arm_pattern")
+                meta_pattern = None
                 if target_pattern is not None:
                     meta_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
                     try:
@@ -722,11 +929,28 @@ class FailureAwareStage2Dataset(Dataset):
                         continue
                     if not self._unit_projection_visible(projection_visible, int(ts), unit):
                         continue
-                candidates.append(int(ts))
+                candidate_ts = int(ts)
+                candidates.append(candidate_ts)
+                if (episode_id, candidate_ts) not in seen_samples:
+                    unseen_candidates.append(candidate_ts)
             if not candidates:
                 continue
-            ts = int(np.random.choice(candidates))
+            choose_from = unseen_candidates if unseen_candidates else candidates
+            ts = int(np.random.choice(choose_from))
             meta = scan.get(ts, {})
+            meta_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
+            try:
+                meta_pattern = canonicalize_active_arm_pattern_key(meta_pattern)
+            except ValueError:
+                meta_pattern = "both"
+            target_pattern = unit.get("active_arm_pattern")
+            if target_pattern is None:
+                if meta_pattern == "both":
+                    actual_pattern = str(np.random.choice(["left_arm", "right_arm"]))
+                else:
+                    actual_pattern = str(meta_pattern)
+            else:
+                actual_pattern = str(target_pattern)
             return {
                 "episode_id": episode_id,
                 "start_ts": ts,
@@ -735,7 +959,8 @@ class FailureAwareStage2Dataset(Dataset):
                 "phase_key": str(meta.get("phase_key", unit["phase_key"])),
                 "phase_instance_idx": int(meta.get("phase_instance_idx", -1)),
                 "phase_bin_id": int(meta.get("phase_bin_id", unit["phase_bin_id"])),
-                "active_arm_pattern": str(unit.get("active_arm_pattern", "left_arm")),
+                "active_arm_pattern": str(actual_pattern),
+                "original_active_arm_pattern": str(meta_pattern),
                 "error_mode": str(unit["error_mode"]),
                 "dir_bin_id": int(unit.get("dir_bin_id", -1)),
                 "mag_bin_id": int(unit.get("mag_bin_id", -1)),
@@ -750,8 +975,11 @@ class FailureAwareStage2Dataset(Dataset):
         num_episodes = len(self.episode_ids)
         for offset in range(num_episodes):
             episode_id = int(self.episode_ids[(int(base_index) + offset) % num_episodes])
-            max_start = self._resolve_max_start(episode_id)
-            scan = self._scan_phase_bins(episode_id, 0, max_start)
+            bounds = self._resolve_start_bounds(episode_id)
+            if bounds is None:
+                continue
+            min_start, max_start = bounds
+            scan = self._scan_phase_bins(episode_id, min_start, max_start)
             projection_visible = self._scan_start_projection_visibility(episode_id)
             for ts, meta in scan.items():
                 if str(meta["phase_key"]) != str(unit["phase_key"]):
@@ -777,21 +1005,25 @@ class FailureAwareStage2Dataset(Dataset):
     def _unit_has_local_candidate(self, unit: dict) -> bool:
         return next(self._iter_unit_candidate_ts(unit, base_index=0), None) is not None
 
+    def _count_unit_local_candidates(self, unit: dict) -> int:
+        return int(sum(1 for _ in self._iter_unit_candidate_ts(unit, base_index=0)))
+
     def record_explore_trial(self, unit_idx: int, episode_id: int, start_ts: int) -> None:
         if self.failure_mode != "explore" or not self._explore_units:
             return
         if int(unit_idx) != int(self._explore_curr_unit_idx):
+            return
+        target_trials = int(self._get_explore_unit_target_trials(unit_idx))
+        if target_trials <= 0:
+            self._advance_explore_unit()
             return
         sample_uid = (int(episode_id), int(start_ts))
         if sample_uid in self._explore_seen_samples:
             return
         self._explore_seen_samples.add(sample_uid)
         self._explore_trial_count_local += 1
-        if int(self._explore_trial_count_local) >= int(self._explore_k_local):
-            self._explore_completed_unit_count += 1
-            self._explore_curr_unit_idx = (int(self._explore_curr_unit_idx) + 1) % int(len(self._explore_units))
-            self._explore_trial_count_local = 0
-            self._explore_seen_samples = set()
+        if int(self._explore_trial_count_local) >= target_trials:
+            self._advance_explore_unit()
 
     def set_explore_unit_idx(self, unit_idx: int) -> None:
         if not self._explore_units:
@@ -804,6 +1036,8 @@ class FailureAwareStage2Dataset(Dataset):
 
     def set_explore_units(self, units: list[dict] | None) -> None:
         self._explore_units = [dict(item) for item in list(units or [])]
+        self._explore_unit_candidate_counts = []
+        self._rebuild_explore_unit_targets()
         if not self._explore_units:
             self._explore_curr_unit_idx = 0
         else:
@@ -814,6 +1048,7 @@ class FailureAwareStage2Dataset(Dataset):
 
     def set_explore_local_k(self, k_local: int) -> None:
         self._explore_k_local = int(max(1, int(k_local)))
+        self._rebuild_explore_unit_targets()
         self._explore_trial_count_local = 0
         self._explore_seen_samples = set()
         self._explore_completed_unit_count = 0
@@ -832,6 +1067,9 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_trial_count_local = 0
         self._explore_seen_samples = set()
         self._explore_completed_unit_count = 0
+        self._explore_unit_candidate_counts = []
+        self._explore_unit_target_trials = []
+        self._explore_total_target_samples = 0
         self._init_failure_units()
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
@@ -845,6 +1083,9 @@ class FailureAwareStage2Dataset(Dataset):
             sampled_phase_bin_id = int(sampled.get("phase_bin_id", -1))
             forced_error_mode_id = error_mode_key_to_id(str(sampled.get("error_mode", "translation")))
             sampled_active_arm_pattern_id = active_arm_pattern_key_to_id(str(sampled.get("active_arm_pattern", "left_arm")))
+            original_active_arm_pattern_id = active_arm_pattern_key_to_id(
+                str(sampled.get("original_active_arm_pattern", sampled.get("active_arm_pattern", "left_arm")))
+            )
             forced_dir_bin_id = int(sampled.get("dir_bin_id", -1))
             forced_mag_bin_id = int(sampled.get("mag_bin_id", -1))
             sampled_explore_unit_idx = int(sampled.get("explore_unit_idx", -1))
@@ -853,14 +1094,17 @@ class FailureAwareStage2Dataset(Dataset):
             sampled_unit_prob = _safe_float_or_nan(sampled.get("sampled_unit_prob", np.nan))
         else:
             episode_id = int(self.episode_ids[index])
-            max_start = self._resolve_max_start(episode_id)
-            min_start = 0
+            bounds = self._resolve_start_bounds(episode_id)
+            if bounds is None:
+                raise RuntimeError(f"No valid start bounds for episode_id={episode_id} in dataset={self.dataset_dir}")
+            min_start, max_start = bounds
             start_ts = int(np.random.randint(min_start, max_start + 1))
             sampled_phase_key = infer_phase_key_from_gt_window(np.zeros((1,), dtype=np.float32), np.zeros((1,), dtype=np.float32), 1)
             sampled_phase_instance_id = -1
             sampled_phase_bin_id = -1
             forced_error_mode_id = -1
             sampled_active_arm_pattern_id = -1
+            original_active_arm_pattern_id = -1
             forced_dir_bin_id = -1
             forced_mag_bin_id = -1
             sampled_explore_unit_idx = -1
@@ -899,6 +1143,7 @@ class FailureAwareStage2Dataset(Dataset):
         sample["sampled_phase_instance_id"] = torch.tensor(sampled_phase_instance_id, dtype=torch.int64)
         sample["forced_error_mode_id"] = torch.tensor(forced_error_mode_id, dtype=torch.int64)
         sample["sampled_active_arm_pattern_id"] = torch.tensor(sampled_active_arm_pattern_id, dtype=torch.int64)
+        sample["original_active_arm_pattern_id"] = torch.tensor(original_active_arm_pattern_id, dtype=torch.int64)
         sample["forced_dir_bin_id"] = torch.tensor(forced_dir_bin_id, dtype=torch.int64)
         sample["forced_mag_bin_id"] = torch.tensor(forced_mag_bin_id, dtype=torch.int64)
         sample["sampled_explore_unit_idx"] = torch.tensor(sampled_explore_unit_idx, dtype=torch.int64)
@@ -929,6 +1174,10 @@ def build_failure_table_dataset(
     perturb_eef_fail_gain: float = 0.08,
     perturb_rot_max_deg: float = 15.0,
     evac_sample_size: tuple[int, int] | None = None,
+    explore_phase_keys: list[str] | None = None,
+    explore_error_modes: list[str] | None = None,
+    explore_disable_phase_bin_skip: bool = False,
+    explore_skip_open_laptop_transport: bool = False,
 ) -> tuple[FailureAwareStage2Dataset, dict[str, np.ndarray]]:
     stats = get_norm_stats(dataset_dir, num_episodes)
     valid_ids = list_valid_episode_ids(dataset_dir, num_episodes, future_offset)
@@ -954,5 +1203,9 @@ def build_failure_table_dataset(
         perturb_eef_fail_gain=perturb_eef_fail_gain,
         perturb_rot_max_deg=perturb_rot_max_deg,
         evac_sample_size=evac_sample_size,
+        explore_phase_keys=explore_phase_keys,
+        explore_error_modes=explore_error_modes,
+        explore_disable_phase_bin_skip=explore_disable_phase_bin_skip,
+        explore_skip_open_laptop_transport=explore_skip_open_laptop_transport,
     )
     return dataset, stats

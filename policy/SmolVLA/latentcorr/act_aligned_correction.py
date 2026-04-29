@@ -127,6 +127,8 @@ class ACTAlignedCorrectionConfig:
     correction_force_generate: bool = False
     recover_eval_enable: bool = True
     recover_eval_save_video: bool = False
+    save_perturb_rollout_video: bool = False
+    save_correction_debug: bool = False
     recover_eval_gripper_open_thresh: float = 0.2
     recover_eval_pos_thresh_m: float = 0.03
     recover_eval_rot_thresh_deg: float = 10.0
@@ -155,6 +157,15 @@ class ACTAlignedCorrectionConfig:
     failure_rotation_dir_bins: int = 6
     failure_rotation_mag_bins: int = 1
     fail_fast_on_error: bool = False
+    evac_use_dual_cache: bool = False
+    evac_dc_v_bounds: tuple[int, ...] = ()
+    evac_dc_budget: float | None = None
+    evac_dc_enc_start: int = 999
+    evac_dc_replay_step_noise: bool = False
+    evac_dc_hf_metric: bool = False
+    evac_dc_v_blur_on_reuse: bool = False
+    evac_dc_v_blur_kernel: int = 3
+    evac_dc_v_blur_strength: float = 0.15
 
     def to_runtime_dict(self) -> dict[str, Any]:
         runtime = self.__dict__.copy()
@@ -163,11 +174,18 @@ class ACTAlignedCorrectionConfig:
 
 
 def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorrectionConfig:
+    evac_dc_budget = getattr(args, "evac_dc_budget", None)
+    if evac_dc_budget is not None:
+        evac_dc_budget = float(evac_dc_budget)
+        if evac_dc_budget < 0.0:
+            evac_dc_budget = None
     return ACTAlignedCorrectionConfig(
         max_rollout_steps=1,
         correction_force_generate=bool(getattr(args, "correction_force_generate", False)),
         recover_eval_enable=True,
         recover_eval_save_video=bool(getattr(args, "recover_eval_save_video", False)),
+        save_perturb_rollout_video=bool(getattr(args, "save_perturb_rollout_video", False)),
+        save_correction_debug=bool(getattr(args, "save_correction_debug", False)),
         recover_eval_gripper_open_thresh=float(getattr(args, "recover_eval_gripper_open_thresh", 0.2)),
         recover_eval_pos_thresh_m=float(getattr(args, "recover_eval_pos_thresh_m", 0.03)),
         recover_eval_rot_thresh_deg=float(getattr(args, "recover_eval_rot_thresh_deg", 10.0)),
@@ -196,6 +214,15 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         failure_rotation_dir_bins=int(getattr(args, "failure_rotation_dir_bins", 6)),
         failure_rotation_mag_bins=int(getattr(args, "failure_rotation_mag_bins", 1)),
         fail_fast_on_error=bool(getattr(args, "fail_fast_on_error", False)),
+        evac_use_dual_cache=bool(getattr(args, "evac_use_dual_cache", False)),
+        evac_dc_v_bounds=tuple(int(x) for x in (getattr(args, "evac_dc_v_bounds", None) or ())),
+        evac_dc_budget=evac_dc_budget,
+        evac_dc_enc_start=int(getattr(args, "evac_dc_enc_start", 999)),
+        evac_dc_replay_step_noise=bool(getattr(args, "evac_dc_replay_step_noise", False)),
+        evac_dc_hf_metric=bool(getattr(args, "evac_dc_hf_metric", False)),
+        evac_dc_v_blur_on_reuse=bool(getattr(args, "evac_dc_v_blur_on_reuse", False)),
+        evac_dc_v_blur_kernel=int(getattr(args, "evac_dc_v_blur_kernel", 3)),
+        evac_dc_v_blur_strength=float(getattr(args, "evac_dc_v_blur_strength", 0.15)),
     )
 
 
@@ -296,6 +323,7 @@ class ACTAlignedCorrectionBuilder:
         sampled_phase_instance_id: int | None = None,
         forced_error_mode_id: int | None = None,
         sampled_active_arm_pattern_id: int | None = None,
+        original_active_arm_pattern_id: int | None = None,
         forced_dir_bin_id: int | None = None,
         forced_mag_bin_id: int | None = None,
         sampled_mode_prob: float | None = None,
@@ -351,6 +379,7 @@ class ACTAlignedCorrectionBuilder:
                 sampled_phase_instance_id=sampled_phase_instance_id,
                 forced_error_mode_id=forced_error_mode_id,
                 sampled_active_arm_pattern_id=sampled_active_arm_pattern_id,
+                original_active_arm_pattern_id=original_active_arm_pattern_id,
                 forced_dir_bin_id=forced_dir_bin_id,
                 forced_mag_bin_id=forced_mag_bin_id,
                 sampled_mode_prob=sampled_mode_prob,
