@@ -31,6 +31,10 @@ MULTI_TASK_NAMES=(
   sim-place_burger_fries-demo_clean-50
   sim-handover_block-demo_clean-50
 )
+FAILURE_TASK_NAMES=(
+  sim-place_burger_fries-demo_clean-50
+  sim-handover_block-demo_clean-50
+)
 INSTRUCTION_TYPE="seen"
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
@@ -83,6 +87,7 @@ PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
 RECOVER_EVAL_SAVE_VIDEO=false
 SAVE_PERTURB_ROLLOUT_VIDEO=true
 SAVE_CORRECTION_DEBUG=false
+SAVE_CORRECTION_DATA="${SAVE_CORRECTION_DATA:-true}"
 RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.3
 RECOVER_EVAL_POS_THRESH_M=0.04
 RECOVER_EVAL_ROT_THRESH_DEG=8.0
@@ -218,7 +223,9 @@ evac_blur_filter_min_ratio=${EVAC_BLUR_FILTER_MIN_RATIO}
 evac_blur_filter_patch_pad_px=${EVAC_BLUR_FILTER_PATCH_PAD_PX}
 save_perturb_rollout_video=${SAVE_PERTURB_ROLLOUT_VIDEO}
 save_correction_debug=${SAVE_CORRECTION_DEBUG}
+save_correction_data=${SAVE_CORRECTION_DATA}
 failure_mode=${FAILURE_MODE}
+failure_task_names=${FAILURE_TASK_NAMES[*]}
 failure_table_paths_json=${FAILURE_TABLE_PATHS_JSON}
 failure_corr_batch_ratio=${FAILURE_CORR_BATCH_RATIO}
 seed=${SEED}
@@ -270,6 +277,7 @@ CMD=(
   --cond_warmup_curve "${COND_WARMUP_CURVE}"
   --failure_mode "${FAILURE_MODE}"
   --failure_table_paths_json "${FAILURE_TABLE_PATHS_JSON}"
+  --failure_task_names "${FAILURE_TASK_NAMES[@]}"
   --failure_corr_batch_ratio "${FAILURE_CORR_BATCH_RATIO}"
   --failure_phase_bins "${FAILURE_PHASE_BINS}"
   --failure_translation_dir_bins "${FAILURE_TRANSLATION_DIR_BINS}"
@@ -291,6 +299,7 @@ CMD=(
   --recover_eval_save_video "${RECOVER_EVAL_SAVE_VIDEO}"
   --save_perturb_rollout_video "${SAVE_PERTURB_ROLLOUT_VIDEO}"
   --save_correction_debug "${SAVE_CORRECTION_DEBUG}"
+  --save_correction_data "${SAVE_CORRECTION_DATA}"
   --recover_eval_gripper_open_thresh "${RECOVER_EVAL_GRIPPER_OPEN_THRESH}"
   --recover_eval_pos_thresh_m "${RECOVER_EVAL_POS_THRESH_M}"
   --recover_eval_rot_thresh_deg "${RECOVER_EVAL_ROT_THRESH_DEG}"
