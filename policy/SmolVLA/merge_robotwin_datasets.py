@@ -8,11 +8,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-
 FILE_DIR = Path(__file__).resolve().parent
 DATA_ROOT = FILE_DIR / "data"
+os.environ["HF_HOME"] = str((FILE_DIR / ".hf_home").resolve())
+os.environ["HF_DATASETS_CACHE"] = str((FILE_DIR / ".hf_home" / "datasets").resolve())
+
+from src.lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 DEFAULT_TASKS = [
     "open_laptop",
@@ -31,6 +32,11 @@ def parse_args():
     )
     parser.add_argument("--task-config", default="demo_clean")
     parser.add_argument("--expert-data-num", type=int, default=50)
+    parser.add_argument(
+        "--source-repo-suffix",
+        default="",
+        help="Suffix appended to source single-task repo ids, e.g. '_rgbfix'.",
+    )
     parser.add_argument("--output-repo-id", default="robotwin_multitask_5_cam_high")
     parser.add_argument("--batch-encoding-size", type=int, default=1)
     parser.add_argument("--image-writer-threads", type=int, default=4)
@@ -52,14 +58,18 @@ def normalize_image(image):
     return np.ascontiguousarray(image)
 
 
-def build_source_datasets(task_config: str, expert_data_num: int) -> list[tuple[str, LeRobotDataset]]:
+def build_source_datasets(
+    task_config: str,
+    expert_data_num: int,
+    source_repo_suffix: str,
+) -> list[tuple[str, LeRobotDataset]]:
     datasets = []
     for task_name in DEFAULT_TASKS:
-        repo_id = f"robotwin_{task_name}_{task_config}_{expert_data_num}_cam_high"
+        repo_id = f"robotwin_{task_name}_{task_config}_{expert_data_num}_cam_high{source_repo_suffix}"
         root = DATA_ROOT / repo_id
         if not root.is_dir():
             raise FileNotFoundError(f"Missing processed dataset: {root}")
-        datasets.append((task_name, LeRobotDataset(repo_id=repo_id, root=root)))
+        datasets.append((task_name, LeRobotDataset(repo_id=repo_id, root=root, video_backend="pyav")))
     return datasets
 
 
@@ -120,11 +130,7 @@ def rebuild_episode(target_dataset: LeRobotDataset, source_dataset: LeRobotDatas
 def main():
     args = parse_args()
 
-    # Keep HF datasets cache inside the workspace to avoid readonly cache locations.
-    os.environ.setdefault("HF_HOME", str((FILE_DIR / ".hf_home").resolve()))
-    os.environ.setdefault("HF_DATASETS_CACHE", str((FILE_DIR / ".hf_home" / "datasets").resolve()))
-
-    datasets = build_source_datasets(args.task_config, args.expert_data_num)
+    datasets = build_source_datasets(args.task_config, args.expert_data_num, args.source_repo_suffix)
     features, fps, robot_type = validate_compatible_sources(datasets)
     merged_episode_instructions = []
 

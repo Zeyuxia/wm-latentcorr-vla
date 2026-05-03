@@ -101,10 +101,10 @@ def _save_loss_batch_projection(
     if act_raw.shape[0] <= 0:
         return
 
-    img_u8 = np.clip(
+    img_rgb = np.clip(
         image_cam.detach().cpu().permute(1, 2, 0).numpy() * 255.0, 0.0, 255.0
     ).astype(np.uint8)
-    overlay = img_u8.copy()
+    overlay = img_rgb[:, :, ::-1].copy()
 
     K = raw_data["intrinsic_cv"].astype(np.float32).copy()
     E = np.eye(4, dtype=np.float32)
@@ -270,6 +270,21 @@ def save_stage1_correction_data(
         "error_action_prefix_norm": _tensor_to_numpy(correction.get("error_action_prefix_norm")),
         "error_action_prefix_raw": _tensor_to_numpy(correction.get("error_action_prefix_raw")),
         "error_is_pad_prefix": _tensor_to_numpy(correction.get("error_is_pad_prefix")),
+        "perturb_action_prefix_raw": (
+            None
+            if corr_meta.get("perturb_action_prefix_raw") is None
+            else np.asarray(corr_meta.get("perturb_action_prefix_raw"), dtype=np.float32)
+        ),
+        "perturb_start_qpos_raw": (
+            None
+            if corr_meta.get("perturb_start_qpos_raw") is None
+            else np.asarray(corr_meta.get("perturb_start_qpos_raw"), dtype=np.float32)
+        ),
+        "perturb_final_qpos_raw": (
+            None
+            if corr_meta.get("perturb_final_qpos_raw") is None
+            else np.asarray(corr_meta.get("perturb_final_qpos_raw"), dtype=np.float32)
+        ),
     }
     np.savez_compressed(sample_path, **{k: v for k, v in arrays.items() if v is not None})
     manifest_record = {
@@ -289,6 +304,9 @@ def save_stage1_correction_data(
         "sampled_active_arm_pattern": corr_meta.get("sampled_active_arm_pattern"),
         "forced_dir_bin_id": corr_meta.get("forced_dir_bin_id"),
         "forced_mag_bin_id": corr_meta.get("forced_mag_bin_id"),
+        "perturb_action_prefix_len": corr_meta.get("perturb_action_prefix_len"),
+        "perturb_delta_linf": corr_meta.get("perturb_delta_linf"),
+        "perturb_delta_l2": corr_meta.get("perturb_delta_l2"),
         "recover_eval_recoverable": recover_eval_last.get("recoverable"),
         "recover_eval_failed_thresholds": recover_eval_last.get("failed_thresholds"),
         "recover_eval_metrics": recover_eval_last.get("metrics"),
@@ -406,6 +424,7 @@ def add_stage2_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sample_phase_window_len", type=int, required=True)
     parser.add_argument("--start_margin", type=int, required=True)
     parser.add_argument("--act_aligned_rollout_exec_steps", type=int, required=True)
+    parser.add_argument("--act_aligned_full_chunk_recovery", type=str2bool, default=False)
     parser.add_argument("--planner_orient_weight", type=float, required=True)
     parser.add_argument("--planner_gripper_penalty", type=float, required=True)
     parser.add_argument("--planner_nearest_window_radius", type=int, required=True)
@@ -441,6 +460,7 @@ def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--curobo_left_yml", type=str, default="")
     parser.add_argument("--curobo_right_yml", type=str, default="")
     parser.add_argument("--act_aligned_rollout_exec_steps", type=int, default=16)
+    parser.add_argument("--act_aligned_full_chunk_recovery", type=str2bool, default=False)
     parser.add_argument("--planner_orient_weight", type=float, default=0.0573)
     parser.add_argument("--planner_gripper_penalty", type=float, default=1.0)
     parser.add_argument("--planner_nearest_window_radius", type=int, default=12)
@@ -456,7 +476,7 @@ def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--recover_eval_nearest_window_radius", type=int, default=16)
     parser.add_argument("--recover_eval_video_bridge_steps", type=int, default=16)
     parser.add_argument("--act_aligned_enable_perturb", type=str2bool, default=True)
-    parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, default=0.08)
+    parser.add_argument("--act_aligned_perturb_eef_fail_gain", type=float, default=0.05)
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, default=15.0)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, default=0.10)
     parser.add_argument("--evac_blur_filter_enable", type=str2bool, default=False)

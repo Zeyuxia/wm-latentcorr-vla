@@ -6,7 +6,8 @@ SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
 LOCAL_SRC_DIR="${SCRIPT_DIR}/src"
 
 source /data/miniconda3/etc/profile.d/conda.sh
-conda activate smolvla
+SMOLVLA_CONDA_ENV=${SMOLVLA_CONDA_ENV:-smolvla}
+conda activate "${SMOLVLA_CONDA_ENV}"
 cd /data/zhenyangfan/RoboTwin
 
 RUN_TAG="explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14"
@@ -20,15 +21,53 @@ MULTI_TASK_NAMES=(
   sim-place_burger_fries-demo_clean-50
   sim-handover_block-demo_clean-50
 )
+SMOLVLA_LATENT_DATA_SOURCE=${SMOLVLA_LATENT_DATA_SOURCE:-smolvla_rgbfix}
+SMOLVLA_LATENT_DATA_ROOT=${SMOLVLA_LATENT_DATA_ROOT:-${SCRIPT_DIR}/data}
+SMOLVLA_LATENT_DATA_SUFFIX=${SMOLVLA_LATENT_DATA_SUFFIX:-_rgbfix}
 INSTRUCTION_TYPE=seen
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
+WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-evac}
+COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE:-worker}
+COSMOS_ROOT=${COSMOS_ROOT:-${SCRIPT_DIR}/cosmos-predict2.5}
+COSMOS_TARGET_ROOT=${COSMOS_TARGET_ROOT:-/data/zhenyangfan/cosmos-predict2.5}
+COSMOS_PYTHON_BIN=${COSMOS_PYTHON_BIN:-${COSMOS_TARGET_ROOT}/.venv/bin/python}
+COSMOS_CHECKPOINT_PATH=${COSMOS_CHECKPOINT_PATH:-${COSMOS_TARGET_ROOT}/outputs/cosmos_predict2_action_conditioned/cosmos_predict_v2p5/2b_robotwin_dualarm_action_conditioned_fullft_lr1e4_actioncond_fullft_gripperfix_4gpu_bsz8/checkpoints/iter_000010000_pt/model_ema_bf16.pt}
+COSMOS_EXPERIMENT=${COSMOS_EXPERIMENT:-robotwin_dualarm_actioncond_2b_256_320}
+COSMOS_CONFIG_FILE=${COSMOS_CONFIG_FILE:-cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py}
+COSMOS_CUDA_VISIBLE_DEVICES=${COSMOS_CUDA_VISIBLE_DEVICES:-}
+COSMOS_CONTEXT_PARALLEL_SIZE=${COSMOS_CONTEXT_PARALLEL_SIZE:-1}
+COSMOS_CHUNK_SIZE=${COSMOS_CHUNK_SIZE:-12}
+COSMOS_GUIDANCE=${COSMOS_GUIDANCE:-7}
+COSMOS_RESOLUTION=${COSMOS_RESOLUTION:-256,320}
+COSMOS_FPS_DOWNSAMPLE_RATIO=${COSMOS_FPS_DOWNSAMPLE_RATIO:-1}
+COSMOS_GRIPPER_SCALE=${COSMOS_GRIPPER_SCALE:-1.0}
+COSMOS_INVERT_GRIPPER=${COSMOS_INVERT_GRIPPER:-true}
+COSMOS_NUM_STEPS=${COSMOS_NUM_STEPS:-35}
+COSMOS_SAVE_FPS=${COSMOS_SAVE_FPS:-30}
+COSMOS_NUM_LATENT_CONDITIONAL_FRAMES=${COSMOS_NUM_LATENT_CONDITIONAL_FRAMES:-1}
+COSMOS_ACTION_SCALER=${COSMOS_ACTION_SCALER:-20.0}
+COSMOS_ACTION_STATS_PATH=${COSMOS_ACTION_STATS_PATH:-}
+COSMOS_ACTION_NORMALIZATION_CLIP=${COSMOS_ACTION_NORMALIZATION_CLIP:-}
+COSMOS_USE_QUAT=${COSMOS_USE_QUAT:-false}
+COSMOS_PROMPT=${COSMOS_PROMPT:-}
+COSMOS_NEGATIVE_PROMPT=${COSMOS_NEGATIVE_PROMPT:-}
+COSMOS_SEED=${COSMOS_SEED:-0}
+COSMOS_WORK_DIR=${COSMOS_WORK_DIR:-}
+COSMOS_STARTUP_TIMEOUT_S=${COSMOS_STARTUP_TIMEOUT_S:-600}
+COSMOS_REQUEST_TIMEOUT_S=${COSMOS_REQUEST_TIMEOUT_S:-900}
+WORLD_MODEL_COMPARE_MODE=${WORLD_MODEL_COMPARE_MODE:-false}
+WORLD_MODEL_COMPARE_BACKENDS=(${WORLD_MODEL_COMPARE_BACKENDS:-evac cosmos})
+WORLD_MODEL_COMPARE_SIM=${WORLD_MODEL_COMPARE_SIM:-true}
+WORLD_MODEL_COMPARE_SIM_AUTORUN=${WORLD_MODEL_COMPARE_SIM_AUTORUN:-false}
+WORLD_MODEL_COMPARE_SIM_TIMEOUT_S=${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S:-600}
+WORLD_MODEL_COMPARE_COSMOS_AUTORUN=${WORLD_MODEL_COMPARE_COSMOS_AUTORUN:-false}
 URDF_PATH=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 CUROBO_LEFT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 CUROBO_RIGHT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
-DEVICE=cuda
-GPU_IDS=4,5,6,7
-MAIN_PROCESS_PORT=29501
+DEVICE=${DEVICE:-cuda}
+GPU_IDS=${GPU_IDS:-4,5,6,7}
+MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-29501}
 SEED=0
 NUM_WORKERS=0
 FUTURE_OFFSET=16
@@ -45,7 +84,7 @@ FAILURE_TRANSLATION_DIR_BINS=6
 FAILURE_TRANSLATION_MAG_BINS=1
 FAILURE_ROTATION_DIR_BINS=6
 FAILURE_ROTATION_MAG_BINS=1
-FAILURE_EXPLORE_K=4
+FAILURE_EXPLORE_K=${FAILURE_EXPLORE_K:-4}
 EXPLORE_PHASE_KEYS=(
   pregrasp
   approach
@@ -94,6 +133,17 @@ PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 SMOLVLA_EVAC_PRINT_RUNTIME=false
 PYTHONPATH="/data/zhenyangfan/RoboTwin:${LOCAL_SRC_DIR}"
+HF_HOME=${HF_HOME:-${SCRIPT_DIR}/.hf_home}
+HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/datasets}
+
+if [ -L "${SCRIPT_DIR}/cosmos-predict2.5" ]; then
+  :
+elif [ ! -e "${SCRIPT_DIR}/cosmos-predict2.5" ]; then
+  ln -s "${COSMOS_TARGET_ROOT}" "${SCRIPT_DIR}/cosmos-predict2.5"
+else
+  echo "Cosmos link path exists but is not a symlink: ${SCRIPT_DIR}/cosmos-predict2.5" >&2
+  exit 1
+fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BASE_NAME="${TIMESTAMP}"
@@ -138,6 +188,31 @@ if [ ! -f "${EVAC_CONFIG}" ]; then
   echo "EVAC config path is missing: ${EVAC_CONFIG}" >&2
   exit 1
 fi
+if [ "${WORLD_MODEL_BACKEND}" = "cosmos" ] || [ "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}" = "true" ]; then
+  if [ ! -d "${COSMOS_TARGET_ROOT}" ]; then
+    echo "Cosmos root is missing: ${COSMOS_TARGET_ROOT}" >&2
+    exit 1
+  fi
+  if [ ! -d "${COSMOS_ROOT}" ]; then
+    echo "Cosmos root/link is missing: ${COSMOS_ROOT}" >&2
+    exit 1
+  fi
+  if [ "${COSMOS_EXECUTION_MODE}" = "worker" ] && [ ! -x "${COSMOS_PYTHON_BIN}" ]; then
+    echo "Cosmos python is missing or not executable: ${COSMOS_PYTHON_BIN}" >&2
+    exit 1
+  fi
+  if [ "${COSMOS_EXECUTION_MODE}" != "worker" ] && [ "${COSMOS_EXECUTION_MODE}" != "direct" ]; then
+    echo "Unsupported COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE}; expected worker or direct" >&2
+    exit 1
+  fi
+  if [ ! -e "${COSMOS_CHECKPOINT_PATH}" ]; then
+    echo "Cosmos checkpoint path is missing: ${COSMOS_CHECKPOINT_PATH}" >&2
+    exit 1
+  fi
+elif [ "${WORLD_MODEL_BACKEND}" != "evac" ]; then
+  echo "Unsupported WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND}; expected evac or cosmos" >&2
+  exit 1
+fi
 mkdir -p "${OUTPUT_DIR}"
 cp "${SCRIPT_PATH}" "${OUTPUT_DIR}/explore_smolvla.sh"
 
@@ -145,6 +220,11 @@ export PYTHONNOUSERSITE
 export PYTHONPATH
 export TOKENIZERS_PARALLELISM
 export SMOLVLA_EVAC_PRINT_RUNTIME
+export SMOLVLA_LATENT_DATA_SOURCE
+export SMOLVLA_LATENT_DATA_ROOT
+export SMOLVLA_LATENT_DATA_SUFFIX
+export HF_HOME
+export HF_DATASETS_CACHE
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
@@ -163,6 +243,9 @@ CMD=(
     --output_dir "${OUTPUT_DIR}" \
     --smolvla_pretrained_path "${SMOLVLA_PRETRAINED_PATH}" \
     --multi_task_names "${MULTI_TASK_NAMES[@]}" \
+    --latent_dataset_source "${SMOLVLA_LATENT_DATA_SOURCE}" \
+    --latent_dataset_root "${SMOLVLA_LATENT_DATA_ROOT}" \
+    --latent_dataset_suffix "${SMOLVLA_LATENT_DATA_SUFFIX}" \
     --instruction_type "${INSTRUCTION_TYPE}" \
     --evac_ckpt "${EVAC_CKPT}" \
     --evac_config "${EVAC_CONFIG}" \
@@ -220,7 +303,41 @@ CMD=(
     --evac_dc_hf_metric "${EVAC_DC_HF_METRIC}" \
     --evac_dc_v_blur_on_reuse "${EVAC_DC_V_BLUR_ON_REUSE}" \
     --evac_dc_v_blur_kernel "${EVAC_DC_V_BLUR_KERNEL}" \
-    --evac_dc_v_blur_strength "${EVAC_DC_V_BLUR_STRENGTH}"
+    --evac_dc_v_blur_strength "${EVAC_DC_V_BLUR_STRENGTH}" \
+    --world_model_backend "${WORLD_MODEL_BACKEND}" \
+    --cosmos_execution_mode "${COSMOS_EXECUTION_MODE}" \
+    --cosmos_root "${COSMOS_ROOT}" \
+    --cosmos_python_bin "${COSMOS_PYTHON_BIN}" \
+    --cosmos_checkpoint_path "${COSMOS_CHECKPOINT_PATH}" \
+    --cosmos_experiment "${COSMOS_EXPERIMENT}" \
+    --cosmos_config_file "${COSMOS_CONFIG_FILE}" \
+    --cosmos_cuda_visible_devices "${COSMOS_CUDA_VISIBLE_DEVICES}" \
+    --cosmos_context_parallel_size "${COSMOS_CONTEXT_PARALLEL_SIZE}" \
+    --cosmos_chunk_size "${COSMOS_CHUNK_SIZE}" \
+    --cosmos_guidance "${COSMOS_GUIDANCE}" \
+    --cosmos_resolution "${COSMOS_RESOLUTION}" \
+    --cosmos_fps_downsample_ratio "${COSMOS_FPS_DOWNSAMPLE_RATIO}" \
+    --cosmos_gripper_scale "${COSMOS_GRIPPER_SCALE}" \
+    --cosmos_invert_gripper "${COSMOS_INVERT_GRIPPER}" \
+    --cosmos_num_steps "${COSMOS_NUM_STEPS}" \
+    --cosmos_save_fps "${COSMOS_SAVE_FPS}" \
+    --cosmos_num_latent_conditional_frames "${COSMOS_NUM_LATENT_CONDITIONAL_FRAMES}" \
+    --cosmos_action_scaler "${COSMOS_ACTION_SCALER}" \
+    --cosmos_action_stats_path "${COSMOS_ACTION_STATS_PATH}" \
+    --cosmos_action_normalization_clip "${COSMOS_ACTION_NORMALIZATION_CLIP}" \
+    --cosmos_use_quat "${COSMOS_USE_QUAT}" \
+    --cosmos_prompt "${COSMOS_PROMPT}" \
+    --cosmos_negative_prompt "${COSMOS_NEGATIVE_PROMPT}" \
+    --cosmos_seed "${COSMOS_SEED}" \
+    --cosmos_work_dir "${COSMOS_WORK_DIR}" \
+    --cosmos_startup_timeout_s "${COSMOS_STARTUP_TIMEOUT_S}" \
+    --cosmos_request_timeout_s "${COSMOS_REQUEST_TIMEOUT_S}" \
+    --world_model_compare_mode "${WORLD_MODEL_COMPARE_MODE}" \
+    --world_model_compare_backends "${WORLD_MODEL_COMPARE_BACKENDS[@]}" \
+    --world_model_compare_sim "${WORLD_MODEL_COMPARE_SIM}" \
+    --world_model_compare_sim_autorun "${WORLD_MODEL_COMPARE_SIM_AUTORUN}" \
+    --world_model_compare_sim_timeout_s "${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S}" \
+    --world_model_compare_cosmos_autorun "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}"
 )
 
 if [ -n "${STAGE1_CKPT}" ]; then
@@ -230,5 +347,20 @@ fi
 echo "Output dir: ${OUTPUT_DIR}"
 echo "GPU ids: ${GPU_IDS}"
 echo "Run tag: ${RUN_TAG}"
+echo "Conda env: ${SMOLVLA_CONDA_ENV}"
+echo "Latent dataset source: ${SMOLVLA_LATENT_DATA_SOURCE}"
+echo "Latent dataset root: ${SMOLVLA_LATENT_DATA_ROOT}"
+echo "Latent dataset suffix: ${SMOLVLA_LATENT_DATA_SUFFIX}"
+echo "World model backend: ${WORLD_MODEL_BACKEND}"
+echo "World model compare mode: ${WORLD_MODEL_COMPARE_MODE}"
+if [ "${WORLD_MODEL_COMPARE_MODE}" = "true" ]; then
+  echo "World model compare backends: ${WORLD_MODEL_COMPARE_BACKENDS[*]}"
+  echo "World model compare sim: ${WORLD_MODEL_COMPARE_SIM} autorun=${WORLD_MODEL_COMPARE_SIM_AUTORUN}"
+  echo "World model compare cosmos autorun: ${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}"
+fi
+if [ "${WORLD_MODEL_BACKEND}" = "cosmos" ] || [ "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}" = "true" ]; then
+  echo "Cosmos execution mode: ${COSMOS_EXECUTION_MODE}"
+  echo "Cosmos checkpoint: ${COSMOS_CHECKPOINT_PATH}"
+fi
 echo "Running: CUDA_VISIBLE_DEVICES=${GPU_IDS} ${CMD[*]}"
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${CMD[@]}"

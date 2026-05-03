@@ -333,7 +333,7 @@ def _perturb_action_chunk_target_pose(
     elif mode == "translation":
         # Translate from the same sampled-start target pose.
         fail_gain, _ = _mag_value_from_bin(
-            float(cfg.get("perturb_eef_fail_gain", 0.08)),
+            float(cfg.get("perturb_eef_fail_gain", 0.05)),
             mag_bin_id,
             n_mag,
         )

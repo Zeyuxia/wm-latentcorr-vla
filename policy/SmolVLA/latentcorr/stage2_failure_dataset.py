@@ -20,7 +20,15 @@ from policy.SmolVLA.latentcorr.failure_utils import (
     phase_key_to_id,
     set_failure_param_bins,
 )
-from policy.SmolVLA.latentcorr.latent_dataset_utils import get_norm_stats, list_valid_episode_ids, load_processed_episode_window
+from policy.SmolVLA.latentcorr.latent_dataset_utils import (
+    get_episode_length,
+    get_norm_stats,
+    is_lerobot_dataset_dir,
+    lerobot_dataset_signature_files,
+    list_valid_episode_ids,
+    load_episode_action_array,
+    load_processed_episode_window,
+)
 from policy.SmolVLA.latentcorr.phase_utils import infer_phase_key_from_gt_window
 from policy.SmolVLA.latentcorr.correction_perturbation import (
     _mag_value_from_bin,
@@ -109,7 +117,7 @@ class FailureAwareStage2Dataset(Dataset):
         failure_rotation_dir_bins: int,
         failure_rotation_mag_bins: int,
         failure_explore_k: int,
-        perturb_eef_fail_gain: float = 0.08,
+        perturb_eef_fail_gain: float = 0.05,
         perturb_rot_max_deg: float = 15.0,
         evac_sample_size: tuple[int, int] | None = None,
         explore_phase_keys: list[str] | None = None,
@@ -253,24 +261,44 @@ class FailureAwareStage2Dataset(Dataset):
     def _build_explore_cache_key(self) -> dict:
         bin_cfg = get_failure_param_bins()
         episode_sigs = []
-        for episode_id in self.episode_ids:
-            episode_id = int(episode_id)
-            processed_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
-            raw_path = (
-                None
-                if not self.raw_data_dir
-                else os.path.join(self.raw_data_dir, f"episode{episode_id}.hdf5")
-            )
-            episode_sigs.append(
-                {
-                    "episode_id": episode_id,
-                    "processed": self._file_signature(processed_path),
-                    "raw": None if raw_path is None else self._file_signature(raw_path),
-                }
-            )
+        dataset_format = "lerobot" if is_lerobot_dataset_dir(self.dataset_dir) else "act_hdf5"
+        dataset_sigs = []
+        if dataset_format == "lerobot":
+            dataset_sigs = [self._file_signature(path) for path in lerobot_dataset_signature_files(self.dataset_dir)]
+            for episode_id in self.episode_ids:
+                episode_id = int(episode_id)
+                raw_path = (
+                    None
+                    if not self.raw_data_dir
+                    else os.path.join(self.raw_data_dir, f"episode{episode_id}.hdf5")
+                )
+                episode_sigs.append(
+                    {
+                        "episode_id": episode_id,
+                        "raw": None if raw_path is None else self._file_signature(raw_path),
+                    }
+                )
+        else:
+            for episode_id in self.episode_ids:
+                episode_id = int(episode_id)
+                processed_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
+                raw_path = (
+                    None
+                    if not self.raw_data_dir
+                    else os.path.join(self.raw_data_dir, f"episode{episode_id}.hdf5")
+                )
+                episode_sigs.append(
+                    {
+                        "episode_id": episode_id,
+                        "processed": self._file_signature(processed_path),
+                        "raw": None if raw_path is None else self._file_signature(raw_path),
+                    }
+                )
         return {
-            "version": 1,
+            "version": 2,
+            "dataset_format": dataset_format,
             "dataset_dir": os.path.realpath(self.dataset_dir),
+            "dataset_sigs": dataset_sigs,
             "raw_data_dir": None if not self.raw_data_dir else os.path.realpath(self.raw_data_dir),
             "episode_ids": [int(x) for x in self.episode_ids],
             "episode_sigs": episode_sigs,
@@ -564,9 +592,7 @@ class FailureAwareStage2Dataset(Dataset):
         episode_id = int(episode_id)
         if episode_id in self._episode_len_cache:
             return int(self._episode_len_cache[episode_id])
-        path = os.path.join(self.dataset_dir, f"episode_{int(episode_id)}.hdf5")
-        with h5py.File(path, "r") as root:
-            episode_len = int(root["/action"].shape[0])
+        episode_len = int(get_episode_length(self.dataset_dir, int(episode_id)))
         self._episode_len_cache[episode_id] = int(episode_len)
         return int(episode_len)
 
@@ -627,9 +653,7 @@ class FailureAwareStage2Dataset(Dataset):
             return self._phase_scan_cache[key]
 
         info: dict[int, dict] = {}
-        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
-        with h5py.File(dataset_path, "r") as root:
-            action = root["/action"][()]
+        action = load_episode_action_array(self.dataset_dir, int(episode_id))
         left_gripper = np.asarray(action[:, 6], dtype=np.float32).reshape(-1)
         right_gripper = np.asarray(action[:, 13], dtype=np.float32).reshape(-1)
         ts_list = list(range(int(min_start), int(max_start) + 1))
@@ -1171,7 +1195,7 @@ def build_failure_table_dataset(
     failure_rotation_mag_bins: int,
     failure_explore_k: int,
     raw_data_dir: str | None = None,
-    perturb_eef_fail_gain: float = 0.08,
+    perturb_eef_fail_gain: float = 0.05,
     perturb_rot_max_deg: float = 15.0,
     evac_sample_size: tuple[int, int] | None = None,
     explore_phase_keys: list[str] | None = None,

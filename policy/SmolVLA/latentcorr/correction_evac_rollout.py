@@ -211,8 +211,8 @@ def evac_inference(
     n_states = len(fk_poses)
 
     h_native, w_native = raw_data["native_resolution"]
-    img_rgb = curr_image[[2, 1, 0]]
-    img_rgb = tvt.Resize((h_native, w_native))(img_rgb)
+    # Stage1 tensors are aligned to SmolVLA's RGB convention before reaching EVAC.
+    img_rgb = tvt.Resize((h_native, w_native))(curr_image)
     memories = img_rgb.unsqueeze(1).repeat(1, n_prev, 1, 1)
 
     all_ends_p = np.zeros((n_states, 2, 3), dtype=np.float32)
@@ -323,9 +323,8 @@ def evac_inference(
             pass
 
     last_rgb = cv2.resize(frames[-1], (640, 480))
-    last_bgr = last_rgb[:, :, ::-1].copy()
 
     if tmp_dir is not None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return torch.from_numpy(last_bgr).float().permute(2, 0, 1) / 255.0
+    return torch.from_numpy(last_rgb).float().permute(2, 0, 1) / 255.0

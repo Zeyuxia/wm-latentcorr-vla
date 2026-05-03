@@ -20,6 +20,18 @@ def _debug_relpath(path):
         return path
 
 
+def _write_bgr_image(path, image_bgr):
+    import cv2
+
+    cv2.imwrite(path, np.asarray(image_bgr))
+
+
+def _tensor_chw_to_bgr_u8(image):
+    arr = image.detach().cpu().permute(1, 2, 0).numpy()
+    rgb = np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+    return rgb[:, :, ::-1].copy()
+
+
 def _import_ddpm3d_module():
     evac_repo_root = os.path.realpath(
         os.path.join(os.path.dirname(__file__), "..", "evac")
@@ -292,20 +304,8 @@ def save_gt_projection_on_original(
     import cv2
 
     try:
-        overlay_src = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        overlay_src = _tensor_chw_to_bgr_u8(image_data_s[0])
         gt_ref_idx = int(np.clip(start_ts, 0, raw_data["left_endpose"].shape[0] - 1))
-        try:
-            episode_path = raw_data.get("episode_path")
-            if episode_path is not None and os.path.isfile(episode_path):
-                import h5py
-
-                with h5py.File(episode_path, "r") as gt_file:
-                    encoded = bytes(gt_file["observation/head_camera/rgb"][gt_ref_idx])
-                gt_img = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
-                if gt_img is not None and gt_img.size > 0:
-                    overlay_src = gt_img
-        except Exception:
-            pass
 
         intrinsic = raw_data["intrinsic_cv"].astype(np.float32).copy()
         extrinsic = np.eye(4, dtype=np.float32)
@@ -329,7 +329,7 @@ def save_gt_projection_on_original(
             _draw_phase_legend(overlay)
 
         out_path = os.path.join(debug_corr_dir, "gt_projection_on_original.png")
-        cv2.imwrite(out_path, overlay)
+        _write_bgr_image(out_path, overlay)
         return {"path": _debug_relpath(out_path), "exists": bool(os.path.exists(out_path)), "gt_ref_idx": int(gt_ref_idx)}
     except Exception:
         try:
@@ -375,10 +375,12 @@ def save_recover_eval_compare_image(
             with h5py.File(episode_path, "r") as gt_file:
                 encoded = bytes(gt_file["observation/head_camera/rgb"][gt_idx])
             gt_img = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
+            if gt_img is not None and gt_img.size > 0:
+                gt_img = gt_img[:, :, ::-1].copy()
         if gt_img is None or gt_img.size == 0:
             return None
 
-        pred_img = (recover_pred_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        pred_img = _tensor_chw_to_bgr_u8(recover_pred_img)
         if pred_img.shape[:2] != gt_img.shape[:2]:
             pred_img = cv2.resize(pred_img, (gt_img.shape[1], gt_img.shape[0]), interpolation=cv2.INTER_LINEAR)
         compare = np.concatenate([gt_img, pred_img], axis=1)
@@ -427,7 +429,7 @@ def save_recover_eval_compare_image(
             _put_text_hc(canvas, text, (x0, y0 + idx * 16), scale=0.46)
 
         out_path = os.path.join(debug_corr_dir, f"recover_eval_gtref_vs_rollout_last_step_{int(step_idx):03d}.png")
-        cv2.imwrite(out_path, canvas)
+        _write_bgr_image(out_path, canvas)
         return {
             "path": _debug_relpath(out_path),
             "exists": bool(os.path.exists(out_path)),
@@ -471,8 +473,8 @@ def save_perturb_compare_image(
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 255), 1, cv2.LINE_AA)
 
     try:
-        first = (first_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-        last = (last_img.detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        first = _tensor_chw_to_bgr_u8(first_img)
+        last = _tensor_chw_to_bgr_u8(last_img)
         if last.shape[:2] != first.shape[:2]:
             last = cv2.resize(last, (first.shape[1], first.shape[0]), interpolation=cv2.INTER_LINEAR)
         compare = np.concatenate([first, last], axis=1)
@@ -522,7 +524,7 @@ def save_perturb_compare_image(
             _put_text_hc(canvas, str(text), (10, y0 + 16 * idx), scale=0.44)
 
         out_path = os.path.join(debug_corr_dir, "perturb_input_vs_last.png")
-        cv2.imwrite(out_path, canvas)
+        _write_bgr_image(out_path, canvas)
         return {"path": _debug_relpath(out_path), "exists": bool(os.path.exists(out_path)), "sampled_unit": sample_unit}
     except Exception:
         try:
@@ -553,8 +555,7 @@ def save_loss_batch_projection(save_dir, image_cam, action_norm, is_pad, raw_dat
     if act_raw.shape[0] <= 0:
         return
 
-    img_u8 = np.clip(image_cam.detach().cpu().permute(1, 2, 0).numpy() * 255.0, 0.0, 255.0).astype(np.uint8)
-    overlay = img_u8.copy()
+    overlay = _tensor_chw_to_bgr_u8(image_cam)
 
     intrinsic = raw_data["intrinsic_cv"].astype(np.float32).copy()
     extrinsic = np.eye(4, dtype=np.float32)
@@ -646,13 +647,13 @@ def save_loss_batch_projection(save_dir, image_cam, action_norm, is_pad, raw_dat
         _draw_polyline(overlay, right_uv, (0, 0, 255))
         _annotate_start_end(overlay, left_uv, "L", (0, 255, 0))
         _annotate_start_end(overlay, right_uv, "R", (0, 0, 255))
-        cv2.imwrite(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
+        _write_bgr_image(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
     except Exception:
         import traceback
 
         with open(os.path.join(save_dir, "loss_projection_error.txt"), "w") as file:
             file.write(traceback.format_exc())
-        cv2.imwrite(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
+        _write_bgr_image(os.path.join(save_dir, "loss_projection_on_input.png"), overlay)
 
     meta_out = {"n_valid_actions": int(act_raw.shape[0]), "image_hw": [int(h_img), int(w_img)]}
     if isinstance(meta, dict):

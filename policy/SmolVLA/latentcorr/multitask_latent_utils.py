@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from policy.SmolVLA.latentcorr.latent_dataset_utils import resolve_raw_data_dir
+from policy.SmolVLA.latentcorr.latent_dataset_utils import act_processed_images_to_rgb, resolve_raw_data_dir
 
 
 @dataclass(frozen=True)
@@ -123,8 +123,10 @@ class MultiTaskLatentWarmupDataset(Dataset):
                 image_t.append(root[f"/observations/images/{camera_name}"][start_ts])
                 image_t_future.append(root[f"/observations/images/{camera_name}"][start_ts + self.future_offset])
 
-        image_t_tensor = torch.from_numpy(np.stack(image_t, axis=0)).permute(0, 3, 1, 2).float() / 255.0
-        image_t_future_tensor = torch.from_numpy(np.stack(image_t_future, axis=0)).permute(0, 3, 1, 2).float() / 255.0
+        image_t_np = act_processed_images_to_rgb(np.stack(image_t, axis=0))
+        image_t_future_np = act_processed_images_to_rgb(np.stack(image_t_future, axis=0))
+        image_t_tensor = torch.from_numpy(image_t_np).permute(0, 3, 1, 2).float() / 255.0
+        image_t_future_tensor = torch.from_numpy(image_t_future_np).permute(0, 3, 1, 2).float() / 255.0
         qpos_raw = qpos_seq[start_ts].astype(np.float32)
         qpos_t = (qpos_raw - self.stats["qpos_mean"]) / self.stats["qpos_std"]
 
@@ -177,6 +179,48 @@ def build_multitask_stage1_dataset(
     return dataset, stats
 
 
+def _split_sim_task_name(task_name: str, default_num_episodes: int) -> tuple[str, str, int]:
+    task = str(task_name)
+    if task.startswith("sim-"):
+        task = task[4:]
+    parts = task.split("-")
+    if len(parts) < 2:
+        raise ValueError(f"Cannot parse task_name={task_name!r}")
+    task_only = parts[0]
+    expert_num = int(default_num_episodes)
+    config_parts = parts[1:]
+    if config_parts and str(config_parts[-1]).isdigit():
+        expert_num = int(config_parts[-1])
+        config_parts = config_parts[:-1]
+    task_config = "-".join(config_parts)
+    if not task_config:
+        raise ValueError(f"Cannot parse task_config from task_name={task_name!r}")
+    return task_only, task_config, expert_num
+
+
+def _resolve_smolvla_lerobot_dataset_dir(task_name: str, info: dict) -> str | None:
+    source = str(os.environ.get("SMOLVLA_LATENT_DATA_SOURCE", "")).strip().lower()
+    if source not in {"smolvla", "smolvla_rgbfix", "lerobot", "lerobot_rgbfix"}:
+        return None
+    suffix = str(os.environ.get("SMOLVLA_LATENT_DATA_SUFFIX", "")).strip()
+    if source in {"smolvla_rgbfix", "lerobot_rgbfix"} and not suffix:
+        suffix = "_rgbfix"
+    data_root = os.path.realpath(
+        os.environ.get("SMOLVLA_LATENT_DATA_ROOT", "/data/zhenyangfan/RoboTwin/policy/SmolVLA/data")
+    )
+    task_only, task_config, expert_num = _split_sim_task_name(
+        task_name,
+        default_num_episodes=int(info.get("num_episodes", 50)),
+    )
+    dataset_name = f"robotwin_{task_only}_{task_config}_{expert_num}_cam_high{suffix}"
+    dataset_dir = os.path.realpath(os.path.join(data_root, dataset_name))
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(
+            f"SMOLVLA_LATENT_DATA_SOURCE={source!r} requested {dataset_dir}, but it does not exist."
+        )
+    return dataset_dir
+
+
 def resolve_multitask_specs(
     task_names: list[str],
     sim_task_configs: dict,
@@ -188,11 +232,13 @@ def resolve_multitask_specs(
         if task_name not in sim_task_configs:
             raise KeyError(f"task_name={task_name} not found in SIM_TASK_CONFIGS")
         info = sim_task_configs[task_name]
-        dataset_dir = info["dataset_dir"]
-        if dataset_dir.startswith("./"):
-            dataset_dir = os.path.realpath(os.path.join("/data/zhenyangfan/RoboTwin/policy/ACT", dataset_dir[2:]))
-        else:
-            dataset_dir = os.path.realpath(dataset_dir)
+        dataset_dir = _resolve_smolvla_lerobot_dataset_dir(task_name, info)
+        if dataset_dir is None:
+            dataset_dir = info["dataset_dir"]
+            if dataset_dir.startswith("./"):
+                dataset_dir = os.path.realpath(os.path.join("/data/zhenyangfan/RoboTwin/policy/ACT", dataset_dir[2:]))
+            else:
+                dataset_dir = os.path.realpath(dataset_dir)
         specs.append(
             MultiTaskSpec(
                 task_name=task_name,
@@ -203,4 +249,3 @@ def resolve_multitask_specs(
             )
         )
     return specs
-

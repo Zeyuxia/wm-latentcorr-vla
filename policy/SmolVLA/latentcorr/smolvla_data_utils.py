@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -24,9 +25,13 @@ from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
+def _smolvla_data_root() -> Path:
+    return Path(os.environ.get("SMOLVLA_LATENT_DATA_ROOT", str(SMOLVLA_ROOT / "data"))).resolve()
+
+
 @lru_cache(maxsize=None)
-def _load_episode_instruction_table(dataset_name: str) -> list[dict[str, Any]]:
-    instruction_path = SMOLVLA_ROOT / "data" / dataset_name / "meta" / "episode_instructions.json"
+def _load_episode_instruction_table(dataset_root: str, dataset_name: str) -> list[dict[str, Any]]:
+    instruction_path = Path(dataset_root) / dataset_name / "meta" / "episode_instructions.json"
     if not instruction_path.is_file():
         raise FileNotFoundError(f"Instruction file not found: {instruction_path}")
     with open(instruction_path, "r", encoding="utf-8") as f:
@@ -37,8 +42,12 @@ def _load_episode_instruction_table(dataset_name: str) -> list[dict[str, Any]]:
 
 
 def _resolve_smolvla_dataset_name(task_name: str, task_config: str) -> str:
-    dataset_name = f"robotwin_{task_name}_{task_config}_50_cam_high"
-    dataset_root = SMOLVLA_ROOT / "data" / dataset_name
+    source = str(os.environ.get("SMOLVLA_LATENT_DATA_SOURCE", "")).strip().lower()
+    suffix = str(os.environ.get("SMOLVLA_LATENT_DATA_SUFFIX", "")).strip()
+    if source in {"smolvla_rgbfix", "lerobot_rgbfix"} and not suffix:
+        suffix = "_rgbfix"
+    dataset_name = f"robotwin_{task_name}_{task_config}_50_cam_high{suffix}"
+    dataset_root = _smolvla_data_root() / dataset_name
     if not dataset_root.is_dir():
         raise FileNotFoundError(f"SmolVLA dataset directory not found: {dataset_root}")
     return dataset_name
@@ -49,7 +58,7 @@ def load_episode_instruction(task_name: str, task_config: str, episode_id: int, 
         raise ValueError(f"Unsupported instruction_type for SmolVLA dataset: {instruction_type}")
 
     dataset_name = _resolve_smolvla_dataset_name(task_name=task_name, task_config=task_config)
-    instruction_table = _load_episode_instruction_table(dataset_name)
+    instruction_table = _load_episode_instruction_table(str(_smolvla_data_root()), dataset_name)
     episode_id = int(episode_id)
     if episode_id < 0 or episode_id >= len(instruction_table):
         raise IndexError(

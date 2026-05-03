@@ -168,7 +168,7 @@ def main() -> None:
     parser.add_argument("--failure_translation_mag_bins", type=int, default=1)
     parser.add_argument("--failure_rotation_dir_bins", type=int, default=6)
     parser.add_argument("--failure_rotation_mag_bins", type=int, default=1)
-    parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.03)
+    parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.05)
     parser.add_argument("--perturb_rot_max_deg", type=float, default=10.0)
     args = parser.parse_args()
 

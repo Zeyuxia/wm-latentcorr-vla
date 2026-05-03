@@ -210,8 +210,8 @@ class EvacLatentTeacher:
         delta_action[:, 7:13] = (delta_action[:, 7:13] - sep * stat_mean[:, 6:]) / (sep * stat_std[:, 6:])
 
         h_native, w_native = raw_data["native_resolution"]
-        img_rgb = curr_image[[2, 1, 0]]
-        img_rgb = tvt.Resize((h_native, w_native))(img_rgb)
+        # Stage1 image tensors follow SmolVLA/base-policy RGB convention.
+        img_rgb = tvt.Resize((h_native, w_native))(curr_image)
         memories = img_rgb.unsqueeze(1).repeat(1, n_previous, 1, 1)
 
         ext_cv = raw_data["extrinsic_cv"]

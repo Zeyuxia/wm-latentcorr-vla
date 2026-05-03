@@ -19,6 +19,7 @@ RUN_TAG="${RUN_TAG:-stage1_spatial_projector_no_aux_losses}"
 PRETRAINED_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
 RESUME_FROM="${RESUME_FROM:-}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29611}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
@@ -35,6 +36,9 @@ FAILURE_TASK_NAMES=(
   sim-place_burger_fries-demo_clean-50
   sim-handover_block-demo_clean-50
 )
+if [ -n "${FAILURE_TASK_NAMES_OVERRIDE:-}" ]; then
+  read -r -a FAILURE_TASK_NAMES <<< "${FAILURE_TASK_NAMES_OVERRIDE}"
+fi
 INSTRUCTION_TYPE="seen"
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
@@ -49,8 +53,19 @@ MAX_STEPS="${MAX_STEPS:-1500}"
 SAVE_FREQ="${SAVE_FREQ:-250}"
 OPTIMIZER_LR="5e-5"
 WEIGHT_DECAY="1e-10"
-SCHEDULER_WARMUP_STEPS=200
-SCHEDULER_DECAY_STEPS=50000
+SCHEDULER_DECAY_STEPS="${SCHEDULER_DECAY_STEPS:-50000}"
+TRAIN_SH_REFERENCE_STEPS="${TRAIN_SH_REFERENCE_STEPS:-80000}"
+TRAIN_SH_REFERENCE_WARMUP_STEPS="${TRAIN_SH_REFERENCE_WARMUP_STEPS:-2000}"
+EFFECTIVE_SCHEDULER_WARMUP_STEPS="${EFFECTIVE_SCHEDULER_WARMUP_STEPS:-$(( (MAX_STEPS * TRAIN_SH_REFERENCE_WARMUP_STEPS + TRAIN_SH_REFERENCE_STEPS - 1) / TRAIN_SH_REFERENCE_STEPS ))}"
+if [ -z "${SCHEDULER_WARMUP_STEPS:-}" ]; then
+  if [ "${MAX_STEPS}" -lt "${SCHEDULER_DECAY_STEPS}" ]; then
+    # The SmolVLA scheduler auto-scales warmup by MAX_STEPS / SCHEDULER_DECAY_STEPS on short runs.
+    # Configure the pre-scaled value so the effective warmup matches train.sh's 2000/80000 ratio.
+    SCHEDULER_WARMUP_STEPS=$(( (EFFECTIVE_SCHEDULER_WARMUP_STEPS * SCHEDULER_DECAY_STEPS + MAX_STEPS - 1) / MAX_STEPS ))
+  else
+    SCHEDULER_WARMUP_STEPS="${EFFECTIVE_SCHEDULER_WARMUP_STEPS}"
+  fi
+fi
 SCHEDULER_DECAY_LR="1e-5"
 FUTURE_OFFSET=16
 ACT_CHUNK_SIZE=50
@@ -79,6 +94,7 @@ FAILURE_ROTATION_DIR_BINS=6
 FAILURE_ROTATION_MAG_BINS=1
 FAILURE_EXPLORE_K=4
 ACT_ALIGNED_ROLLOUT_EXEC_STEPS=16
+ACT_ALIGNED_FULL_CHUNK_RECOVERY="${ACT_ALIGNED_FULL_CHUNK_RECOVERY:-false}"
 PLANNER_ORIENT_WEIGHT=0.0573
 PLANNER_GRIPPER_PENALTY=1.0
 PLANNER_NEAREST_WINDOW_RADIUS=12
@@ -189,6 +205,7 @@ pretrained_path=${PRETRAINED_PATH}
 resume_from=${RESUME_FROM}
 policy_device=${POLICY_DEVICE}
 cuda_visible_devices=${CUDA_VISIBLE_DEVICES}
+main_process_port=${MAIN_PROCESS_PORT}
 freeze_vision_encoder=${FREEZE_VISION_ENCODER}
 train_expert_only=${TRAIN_EXPERT_ONLY}
 load_vlm_weights=${LOAD_VLM_WEIGHTS}
@@ -199,6 +216,9 @@ save_freq=${SAVE_FREQ}
 optimizer_lr=${OPTIMIZER_LR}
 weight_decay=${WEIGHT_DECAY}
 scheduler_warmup_steps=${SCHEDULER_WARMUP_STEPS}
+scheduler_effective_warmup_steps=${EFFECTIVE_SCHEDULER_WARMUP_STEPS}
+train_sh_reference_warmup_steps=${TRAIN_SH_REFERENCE_WARMUP_STEPS}
+train_sh_reference_steps=${TRAIN_SH_REFERENCE_STEPS}
 scheduler_decay_steps=${SCHEDULER_DECAY_STEPS}
 scheduler_decay_lr=${SCHEDULER_DECAY_LR}
 run_tag=${RUN_TAG}
@@ -228,6 +248,7 @@ failure_mode=${FAILURE_MODE}
 failure_task_names=${FAILURE_TASK_NAMES[*]}
 failure_table_paths_json=${FAILURE_TABLE_PATHS_JSON}
 failure_corr_batch_ratio=${FAILURE_CORR_BATCH_RATIO}
+act_aligned_full_chunk_recovery=${ACT_ALIGNED_FULL_CHUNK_RECOVERY}
 seed=${SEED}
 EOF
 
@@ -236,7 +257,7 @@ CMD=(
   launch
   --multi_gpu
   --num_processes=4
-  --main_process_port=29611
+  --main_process_port="${MAIN_PROCESS_PORT}"
   "${SCRIPT_DIR}/latentcorr/train_smolvla.py"
   stage1
   --output_dir "${OUTPUT_DIR}"
@@ -291,6 +312,7 @@ CMD=(
   --curobo_left_yml "${CUROBO_LEFT_YML}"
   --curobo_right_yml "${CUROBO_RIGHT_YML}"
   --act_aligned_rollout_exec_steps "${ACT_ALIGNED_ROLLOUT_EXEC_STEPS}"
+  --act_aligned_full_chunk_recovery "${ACT_ALIGNED_FULL_CHUNK_RECOVERY}"
   --planner_orient_weight "${PLANNER_ORIENT_WEIGHT}"
   --planner_gripper_penalty "${PLANNER_GRIPPER_PENALTY}"
   --planner_nearest_window_radius "${PLANNER_NEAREST_WINDOW_RADIUS}"

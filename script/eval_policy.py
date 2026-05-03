@@ -110,6 +110,9 @@ def main(usr_args):
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
+    # Let CLI overrides win over task yaml for eval-time switches such as video logging.
+    if "eval_video_log" in usr_args and usr_args["eval_video_log"] is not None:
+        args["eval_video_log"] = bool(usr_args["eval_video_log"])
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")

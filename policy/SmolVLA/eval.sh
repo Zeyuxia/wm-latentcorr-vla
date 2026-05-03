@@ -13,20 +13,20 @@ conda activate smolvla
 cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
-POLICY_NAME="SmolVLA"
-TASK_NAME="put_bottles_dustbin"
-TASK_CONFIG="demo_clean"
+POLICY_NAME="${POLICY_NAME:-SmolVLA}"
+TASK_NAME="${TASK_NAME:-put_bottles_dustbin}"
+TASK_CONFIG="${TASK_CONFIG:-demo_clean}"
 # CKPT_SETTING="stage1_spatial_projector_step_001250_base"
-CKPT_SETTING="evac_only_correction_ratio025_1500"
-SEED=0
-GPU_ID=7
-INSTRUCTION_TYPE="seen"
+CKPT_SETTING="${CKPT_SETTING:-evac_only_correction_ratio025_1500}"
+SEED="${SEED:-0}"
+GPU_ID="${GPU_ID:-7}"
+INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-seen}"
 # MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260420_130740-stage1_spatial_projector_0567/stage1_step_001250.pt"
-MODEL_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260428_235223-stage1_spatial_projector_no_aux_losses/stage1_step_001500.pt"
+MODEL_PATH="${MODEL_PATH:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260428_235223-stage1_spatial_projector_no_aux_losses/stage1_step_001500.pt}"
 # EVAL_TAG="stage1_spatial_projector_step_001250_base"
-EVAL_TAG="evac_only_correction_ratio025_1500"
-SEED_FILE=""
-POLICY_CONDA_ENV=""
+EVAL_TAG="${EVAL_TAG:-evac_only_correction_ratio025_1500}"
+SEED_FILE="${SEED_FILE:-}"
+POLICY_CONDA_ENV="${POLICY_CONDA_ENV:-}"
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
+import sys
 
 import numpy as np
 import torch
@@ -21,8 +25,11 @@ from policy.SmolVLA.latentcorr.correction_evac_rollout import (
     find_nearest_traj_point,
     quat_geodesic_deg_wxyz,
 )
+from policy.SmolVLA.latentcorr.correction_cosmos_rollout import cosmos_inference
 from policy.SmolVLA.latentcorr.correction_utils import resample_trajectory
 from policy.SmolVLA.latentcorr.correction_projection_debug import (
+    _tensor_chw_to_bgr_u8,
+    _write_bgr_image,
     compute_phase_projection,
     draw_phase_bin_starts,
     draw_phase_legend,
@@ -45,6 +52,453 @@ def _debug_relpath(path):
         return f"./{os.path.relpath(path, start=os.getcwd())}"
     except Exception:
         return path
+
+
+def _world_model_backend(cfg: dict) -> str:
+    backend = str(cfg.get("world_model_backend", "evac")).strip().lower()
+    if backend not in {"evac", "cosmos"}:
+        raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac' or 'cosmos'.")
+    return backend
+
+
+def _world_model_runtime_meta_filename(backend: str) -> str:
+    return "cosmos_runtime_meta.json" if str(backend).strip().lower() == "cosmos" else "evac_runtime_meta.json"
+
+
+def _world_model_inference(
+    modules: dict,
+    cfg: dict,
+    curr_image: torch.Tensor,
+    fk_poses: list,
+    grippers: list,
+    raw_data: dict,
+    device,
+    save_dir: str | None = None,
+    backend_override: str | None = None,
+) -> torch.Tensor:
+    backend = _world_model_backend(cfg) if backend_override is None else str(backend_override).strip().lower()
+    if backend not in {"evac", "cosmos"}:
+        raise ValueError(f"Unsupported world-model backend override={backend!r}.")
+    if backend == "cosmos":
+        client = modules.get("cosmos_client")
+        if client is None:
+            raise RuntimeError("world_model_backend='cosmos' but modules['cosmos_client'] is missing.")
+        return cosmos_inference(
+            client,
+            curr_image,
+            fk_poses,
+            grippers,
+            raw_data,
+            device,
+            save_dir=save_dir,
+        )
+    if modules.get("evac_model") is None or modules.get("evac_config") is None:
+        raise RuntimeError("world_model_backend='evac' but EVAC model/config is missing.")
+    return evac_inference(
+        modules["evac_model"],
+        modules["evac_config"],
+        curr_image,
+        fk_poses,
+        grippers,
+        raw_data,
+        device,
+        save_dir=save_dir,
+        infer_kwargs=cfg.get("evac_infer_kwargs"),
+    )
+
+
+def _world_model_compare_backends(cfg: dict) -> list[str]:
+    if not bool(cfg.get("world_model_compare_mode", False)):
+        return []
+    raw = cfg.get("world_model_compare_backends", ("evac", "cosmos"))
+    if raw is None or raw == "":
+        raw_items = ("evac", "cosmos")
+    elif isinstance(raw, str):
+        raw_items = raw.replace(";", ",").split(",")
+    else:
+        raw_items = list(raw)
+    backends: list[str] = []
+    for item in raw_items:
+        backend = str(item).strip().lower()
+        if not backend:
+            continue
+        if backend not in {"evac", "cosmos"}:
+            raise ValueError(f"Unsupported world-model compare backend={backend!r}.")
+        if backend not in backends:
+            backends.append(backend)
+    return backends or ["evac", "cosmos"]
+
+
+def _copy_world_model_artifacts(src_dir: str | None, dst_dir: str, backend: str) -> None:
+    if not src_dir:
+        return
+    src_dir = os.path.abspath(src_dir)
+    dst_dir = os.path.abspath(dst_dir)
+    if src_dir == dst_dir:
+        return
+    os.makedirs(dst_dir, exist_ok=True)
+    for filename in ("outputs.mp4", _world_model_runtime_meta_filename(backend)):
+        src = os.path.join(src_dir, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dst_dir, filename))
+
+
+def _serialize_world_model_request(
+    save_dir: str,
+    curr_image: torch.Tensor,
+    fk_poses: list,
+    grippers: list,
+) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    pose_arr = np.zeros((len(fk_poses), 14), dtype=np.float32)
+    grip_arr = np.zeros((len(grippers), 2), dtype=np.float32)
+    for idx, ((lp, lq, rp, rq), (lg, rg)) in enumerate(zip(fk_poses, grippers)):
+        pose_arr[idx, 0:3] = np.asarray(lp, dtype=np.float32).reshape(3,)
+        pose_arr[idx, 3:7] = np.asarray(lq, dtype=np.float32).reshape(4,)
+        pose_arr[idx, 7:10] = np.asarray(rp, dtype=np.float32).reshape(3,)
+        pose_arr[idx, 10:14] = np.asarray(rq, dtype=np.float32).reshape(4,)
+        grip_arr[idx, :] = [float(lg), float(rg)]
+    img = torch.clamp(curr_image.detach().float().cpu(), 0.0, 1.0).numpy().astype(np.float32)
+    request_path = os.path.join(save_dir, "world_model_request.npz")
+    np.savez_compressed(
+        request_path,
+        curr_image=img,
+        fk_poses=pose_arr,
+        grippers=grip_arr,
+    )
+    return request_path
+
+
+def _write_cosmos_offline_command(cfg: dict, save_dir: str, request_path: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    repo_root = str(cfg.get("compare_repo_root", "") or "/data/zhenyangfan/RoboTwin")
+    command_path = os.path.join(save_dir, "run_cosmos_offline.sh")
+    cmd = [
+        sys.executable,
+        "policy/SmolVLA/latentcorr/run_cosmos_compare_request.py",
+        "--request_npz",
+        request_path,
+        "--save_dir",
+        save_dir,
+        "--cosmos_root",
+        str(cfg.get("cosmos_root", "/data/zhenyangfan/cosmos-predict2.5")),
+        "--checkpoint_path",
+        str(cfg.get("cosmos_checkpoint_path", "")),
+        "--experiment",
+        str(cfg.get("cosmos_experiment", "robotwin_dualarm_actioncond_2b_256_320")),
+        "--config_file",
+        str(cfg.get("cosmos_config_file", "cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py")),
+        "--chunk_size",
+        str(int(cfg.get("cosmos_chunk_size", 12))),
+        "--guidance",
+        str(int(cfg.get("cosmos_guidance", 7))),
+        "--resolution",
+        str(cfg.get("cosmos_resolution", "256,320")),
+        "--fps_downsample_ratio",
+        str(int(cfg.get("cosmos_fps_downsample_ratio", 1))),
+        "--gripper_scale",
+        str(float(cfg.get("cosmos_gripper_scale", 1.0))),
+        "--num_steps",
+        str(int(cfg.get("cosmos_num_steps", 35))),
+        "--save_fps",
+        str(int(cfg.get("cosmos_save_fps", 30))),
+        "--num_latent_conditional_frames",
+        str(int(cfg.get("cosmos_num_latent_conditional_frames", 1))),
+        "--action_scaler",
+        str(float(cfg.get("cosmos_action_scaler", 20.0))),
+        "--action_stats_path",
+        str(cfg.get("cosmos_action_stats_path", "")),
+        "--action_normalization_clip",
+        "" if cfg.get("cosmos_action_normalization_clip", None) in {None, "", "none", "None"} else str(cfg.get("cosmos_action_normalization_clip")),
+        "--prompt",
+        str(cfg.get("cosmos_prompt", "")),
+        "--negative_prompt",
+        str(cfg.get("cosmos_negative_prompt", "")),
+        "--seed",
+        str(int(cfg.get("cosmos_seed", 0))),
+    ]
+    cmd.append("--invert_gripper" if bool(cfg.get("cosmos_invert_gripper", True)) else "--no-invert_gripper")
+    cmd.append("--use_quat" if bool(cfg.get("cosmos_use_quat", False)) else "--no-use_quat")
+    with open(command_path, "w", encoding="utf-8") as f:
+        f.write("#!/bin/bash\n")
+        f.write("set -euo pipefail\n")
+        f.write(f"cd {repo_root}\n")
+        f.write(" ".join(cmd) + "\n")
+    try:
+        os.chmod(command_path, 0o755)
+    except OSError:
+        pass
+    return command_path
+
+
+def _world_model_video_record(
+    *,
+    backend: str,
+    step: int,
+    save_dir: str,
+    source: str,
+    error: str | None = None,
+) -> dict:
+    meta_name = _world_model_runtime_meta_filename(backend)
+    video_path = os.path.join(save_dir, "outputs.mp4")
+    meta_path = os.path.join(save_dir, meta_name)
+    record = {
+        "step": int(step),
+        "backend": str(backend),
+        "source": str(source),
+        "path": _debug_relpath(video_path),
+        "exists": bool(os.path.exists(video_path)),
+        "runtime_meta_path": _debug_relpath(meta_path),
+        "runtime_meta_exists": bool(os.path.exists(meta_path)),
+    }
+    if error:
+        record["error"] = str(error)
+    return record
+
+
+def _run_world_model_compare(
+    modules: dict,
+    cfg: dict,
+    curr_image: torch.Tensor,
+    fk_poses: list,
+    grip_list: list,
+    raw_data: dict,
+    device,
+    *,
+    debug_dir: str | None,
+    step: int,
+    main_backend: str,
+    main_save_dir: str | None,
+) -> list[dict]:
+    if debug_dir is None:
+        return []
+    records: list[dict] = []
+    for backend in _world_model_compare_backends(cfg):
+        compare_dir = os.path.join(debug_dir, "compare", backend, f"rollout_step_{int(step):03d}")
+        try:
+            if backend == main_backend:
+                _copy_world_model_artifacts(main_save_dir, compare_dir, backend)
+                source = "main_backend_copy"
+            elif backend == "cosmos" and not bool(cfg.get("world_model_compare_cosmos_autorun", False)):
+                request_path = _serialize_world_model_request(compare_dir, curr_image, fk_poses, grip_list)
+                command_path = _write_cosmos_offline_command(cfg, compare_dir, request_path)
+                with open(os.path.join(compare_dir, "cosmos_offline_request.json"), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "backend": "cosmos",
+                            "step": int(step),
+                            "request_npz": _debug_relpath(request_path),
+                            "command_path": _debug_relpath(command_path),
+                            "note": "Run command_path on an idle GPU to generate outputs.mp4.",
+                        },
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                source = "compare_backend_offline_request"
+            else:
+                _world_model_inference(
+                    modules,
+                    cfg,
+                    curr_image,
+                    fk_poses,
+                    grip_list,
+                    raw_data,
+                    device,
+                    save_dir=compare_dir,
+                    backend_override=backend,
+                )
+                source = "compare_backend_inference"
+            records.append(
+                _world_model_video_record(
+                    backend=backend,
+                    step=int(step),
+                    save_dir=compare_dir,
+                    source=source,
+                )
+            )
+        except Exception as exc:
+            os.makedirs(compare_dir, exist_ok=True)
+            error_payload = {
+                "backend": backend,
+                "step": int(step),
+                "error": repr(exc),
+            }
+            try:
+                with open(os.path.join(compare_dir, "compare_error.json"), "w", encoding="utf-8") as f:
+                    json.dump(error_payload, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+            records.append(
+                _world_model_video_record(
+                    backend=backend,
+                    step=int(step),
+                    save_dir=compare_dir,
+                    source="compare_backend_error",
+                    error=repr(exc),
+                )
+            )
+            if bool(cfg.get("fail_fast_on_error", False)):
+                raise
+    return records
+
+
+def _infer_compare_task_name_from_episode_path(episode_path: str | None) -> str:
+    if not episode_path:
+        return ""
+    parts = os.path.normpath(str(episode_path)).split(os.sep)
+    try:
+        data_idx = len(parts) - 1 - parts[::-1].index("data")
+    except ValueError:
+        return ""
+    if data_idx >= 2:
+        task = parts[data_idx - 2]
+        task_config = parts[data_idx - 1]
+        if task and task_config:
+            return f"sim-{task}-{task_config}-50"
+    return ""
+
+
+def _write_compare_sim_artifact(
+    cfg: dict,
+    debug_dir: str | None,
+    raw_data: dict,
+    start_ts: int,
+    *,
+    sampled_unit: dict,
+    perturb_action_prefix_raw: np.ndarray | None,
+    perturb_start_qpos_raw: np.ndarray | None,
+    perturb_final_qpos_raw: np.ndarray | None,
+    corr_action_chunk_raw: np.ndarray | None = None,
+    corr_qpos_raw: np.ndarray | None = None,
+    error_action_prefix_raw: np.ndarray | None = None,
+) -> dict | None:
+    if (
+        debug_dir is None
+        or not bool(cfg.get("world_model_compare_mode", False))
+        or not bool(cfg.get("world_model_compare_sim", True))
+    ):
+        return None
+    sim_dir = os.path.join(debug_dir, "compare", "sim")
+    os.makedirs(sim_dir, exist_ok=True)
+    episode_path = str(raw_data.get("episode_path", "") or "")
+    raw_data_dir = str(cfg.get("compare_raw_data_dir", "") or "")
+    if not raw_data_dir and episode_path:
+        raw_data_dir = os.path.dirname(episode_path)
+    task_name_full = str(cfg.get("compare_task_name_full", "") or "")
+    if not task_name_full:
+        task_name_full = _infer_compare_task_name_from_episode_path(episode_path)
+    episode_id_value = cfg.get("compare_episode_id", None)
+    if episode_id_value is None:
+        match = re.search(r"episode(\d+)\.hdf5$", os.path.basename(episode_path))
+        episode_id_value = int(match.group(1)) if match else -1
+    rank = int(cfg.get("compare_rank", -1))
+    global_step = int(cfg.get("compare_global_step", -1))
+    episode_id = int(episode_id_value)
+    sample_name = f"compare_sim_rank{rank:02d}_step{global_step:06d}_ep{episode_id:02d}_ts{int(start_ts):04d}.npz"
+    sample_path = os.path.join(sim_dir, sample_name)
+    manifest_path = os.path.join(sim_dir, f"correction_data_manifest_rank{max(0, rank):02d}.jsonl")
+    corr_actions = (
+        np.zeros((0, 14), dtype=np.float32)
+        if corr_action_chunk_raw is None
+        else np.asarray(corr_action_chunk_raw, dtype=np.float32)
+    )
+    arrays = {
+        "corr_action_chunk_raw": corr_actions,
+    }
+    if corr_qpos_raw is not None:
+        arrays["corr_qpos_raw"] = np.asarray(corr_qpos_raw, dtype=np.float32)
+    if perturb_action_prefix_raw is not None:
+        arrays["perturb_action_prefix_raw"] = np.asarray(perturb_action_prefix_raw, dtype=np.float32)
+    if perturb_start_qpos_raw is not None:
+        arrays["perturb_start_qpos_raw"] = np.asarray(perturb_start_qpos_raw, dtype=np.float32)
+    if perturb_final_qpos_raw is not None:
+        arrays["perturb_final_qpos_raw"] = np.asarray(perturb_final_qpos_raw, dtype=np.float32)
+    if error_action_prefix_raw is not None:
+        arrays["error_action_prefix_raw"] = np.asarray(error_action_prefix_raw, dtype=np.float32)
+    np.savez_compressed(sample_path, **arrays)
+
+    manifest_record = {
+        "rank": int(rank),
+        "global_step": int(global_step),
+        "batch_index": 0,
+        "path": str(sample_path),
+        "task_name": str(task_name_full),
+        "episode_id": int(episode_id),
+        "start_ts": int(start_ts),
+        "raw_data_dir": str(raw_data_dir),
+        "sampled_phase_key": sampled_unit.get("phase_key"),
+        "sampled_phase_bin_id": sampled_unit.get("phase_bin_id"),
+        "sampled_phase_instance_idx": sampled_unit.get("phase_instance_idx"),
+        "sampled_error_mode": sampled_unit.get("error_mode"),
+        "sampled_active_arm_pattern": sampled_unit.get("active_arm_pattern"),
+        "forced_dir_bin_id": sampled_unit.get("dir_bin_id"),
+        "forced_mag_bin_id": sampled_unit.get("mag_bin_id"),
+        "perturb_action_prefix_len": (
+            0 if perturb_action_prefix_raw is None else int(np.asarray(perturb_action_prefix_raw).shape[0])
+        ),
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
+
+    repo_root = str(cfg.get("compare_repo_root", "") or "/data/zhenyangfan/RoboTwin")
+    command = [
+        sys.executable,
+        "policy/SmolVLA/replay_correction_samples.py",
+        "--run-dir",
+        sim_dir,
+        "--output-dir",
+        sim_dir,
+        "--select",
+        "first",
+        "--num-samples",
+        "1",
+        "--fps",
+        str(int(cfg.get("world_model_compare_sim_fps", 10))),
+        "--hold-frames",
+        str(int(cfg.get("world_model_compare_sim_hold_frames", 4))),
+    ]
+    command_path = os.path.join(sim_dir, "run_sim_replay.sh")
+    with open(command_path, "w", encoding="utf-8") as f:
+        f.write("#!/bin/bash\n")
+        f.write("set -euo pipefail\n")
+        f.write(f"cd {repo_root}\n")
+        f.write(" ".join(command) + "\n")
+    try:
+        os.chmod(command_path, 0o755)
+    except OSError:
+        pass
+
+    result = {
+        "sample_path": _debug_relpath(sample_path),
+        "manifest_path": _debug_relpath(manifest_path),
+        "command_path": _debug_relpath(command_path),
+        "autorun": bool(cfg.get("world_model_compare_sim_autorun", False)),
+        "note": "Run command_path to produce simulator replay video under compare/sim.",
+    }
+    if bool(cfg.get("world_model_compare_sim_autorun", False)):
+        stdout_path = os.path.join(sim_dir, "sim_replay_stdout.txt")
+        stderr_path = os.path.join(sim_dir, "sim_replay_stderr.txt")
+        try:
+            with open(stdout_path, "w", encoding="utf-8") as out_f, open(stderr_path, "w", encoding="utf-8") as err_f:
+                completed = subprocess.run(
+                    command,
+                    cwd=repo_root,
+                    stdout=out_f,
+                    stderr=err_f,
+                    check=False,
+                    timeout=float(cfg.get("world_model_compare_sim_timeout_s", 600.0)),
+                )
+            result.update(
+                {
+                    "returncode": int(completed.returncode),
+                    "stdout_path": _debug_relpath(stdout_path),
+                    "stderr_path": _debug_relpath(stderr_path),
+                }
+            )
+        except Exception as exc:
+            result["error"] = repr(exc)
+    return result
 
 
 def _image_sharpness_score(image_t: torch.Tensor) -> float:
@@ -95,6 +549,12 @@ def _evac_blur_filter_result(
         "region": "active_gripper_patch" if bbox_xyxy is not None else "full_image",
         "bbox_xyxy": None if bbox_xyxy is None else [int(v) for v in bbox_xyxy],
     }
+
+
+def _correction_prefix_len(cfg: dict, rollout_exec_steps: int, chunk_size: int) -> int:
+    if bool(cfg.get("full_chunk_recovery", False)):
+        return int(max(1, chunk_size))
+    return int(np.clip(int(rollout_exec_steps), 1, max(1, chunk_size - 1)))
 
 
 def _pose_wxyz_to_matrix_np(position: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
@@ -180,8 +640,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     sampled_entry_prob_within_mode=None, sampled_unit_prob=None,
                     precomputed_action_chunk_raw=None):
     fk = modules['fk']
-    evac_model = modules['evac_model']
-    evac_cfg = modules['evac_config']
+    world_model_backend = _world_model_backend(cfg)
+    world_model_meta_filename = _world_model_runtime_meta_filename(world_model_backend)
     planner_l = modules['planner_left']
     planner_r = modules['planner_right']
 
@@ -269,8 +729,12 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     _dbg_rollout = []  # collect per-step debug info
     dyn_state = None
     act_raw = None
+    perturb_action_prefix_chunks = []
     rollout_steps_total = 0
     evac_rollout_videos = []
+    world_model_rollout_videos = []
+    world_model_compare_records = []
+    compare_sim_artifact = None
     recover_eval_any_unrecoverable = False
     recover_eval_first_unrecoverable_step = None
     recover_eval_last = {
@@ -334,8 +798,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     max_steps_eff = max_steps
 
     for step in range(max_steps_eff):
-        evac_debug_dir = (
-            os.path.join(debug_dir, 'evac', f'rollout_step_{step:03d}')
+        world_model_debug_dir = (
+            os.path.join(debug_dir, world_model_backend, f'rollout_step_{step:03d}')
             if (debug_dir and save_perturb_rollout_video)
             else None
         )
@@ -379,6 +843,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             forced_dir_bin_id=forced_dir_bin_fixed,
             forced_mag_bin_id=forced_mag_bin_fixed,
         )
+        perturb_action_prefix_chunks.append(np.asarray(act_raw, dtype=np.float32).copy())
 
         fk_poses = [(lp.copy(), lq.copy(), rp.copy(), rq.copy())]  # current state
         grip_list = [(left_grip, right_grip)]
@@ -390,27 +855,39 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                              fr['right'][0].copy(), fr['right'][1].copy()))
             grip_list.append((ar[6], ar[13]))
 
-        pred = evac_inference(
-            evac_model,
-            evac_cfg,
+        pred = _world_model_inference(
+            modules,
+            cfg,
             curr_image[0],
             fk_poses,
             grip_list,
             raw_data,
             device,
-            save_dir=evac_debug_dir,
-            infer_kwargs=cfg['evac_infer_kwargs'],
+            save_dir=world_model_debug_dir,
         )
-        if evac_debug_dir is not None:
-            _vpath = os.path.join(evac_debug_dir, 'outputs.mp4')
-            _mpath = os.path.join(evac_debug_dir, 'evac_runtime_meta.json')
-            evac_rollout_videos.append({
-                'step': int(step),
-                'path': _debug_relpath(_vpath),
-                'exists': bool(os.path.exists(_vpath)),
-                'runtime_meta_path': _debug_relpath(_mpath),
-                'runtime_meta_exists': bool(os.path.exists(_mpath)),
-            })
+        if world_model_debug_dir is not None:
+            _main_video_record = _world_model_video_record(
+                backend=world_model_backend,
+                step=int(step),
+                save_dir=world_model_debug_dir,
+                source="main_backend",
+            )
+            evac_rollout_videos.append(_main_video_record)
+            world_model_rollout_videos.append(_main_video_record)
+            _compare_records = _run_world_model_compare(
+                modules,
+                cfg,
+                curr_image[0],
+                fk_poses,
+                grip_list,
+                raw_data,
+                device,
+                debug_dir=debug_dir,
+                step=int(step),
+                main_backend=world_model_backend,
+                main_save_dir=world_model_debug_dir,
+            )
+            world_model_compare_records.extend(_compare_records)
         new_img = curr_image.clone()
         if tuple(pred.shape) != tuple(new_img[0].shape):
             pred_rs = torch.nn.functional.interpolate(
@@ -469,8 +946,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     "min_dist": float(min_dist),
                     "recover_eval_enable": bool(recover_eval_enable),
                     "recover_eval_last": {"recoverable": None, "mode": sampled_error_mode},
+                    "world_model_backend": world_model_backend,
                     "evac_blur_filter": evac_blur_filter,
                     "evac_rollout_videos": evac_rollout_videos,
+                    "world_model_rollout_videos": world_model_rollout_videos,
+                    "world_model_compare": world_model_compare_records,
                     "debug_dir": debug_dir,
                     "error_action_prefix_raw": np.asarray(act_raw, dtype=np.float32).copy(),
                 }
@@ -676,27 +1156,27 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                                 _fr['right'][0].copy(), _fr['right'][1].copy(),
                             ))
                             grip_eval_list.append((float(_ar[6]), float(_ar[13])))
-                        evac_recover_eval_dir = os.path.join(
-                            debug_dir, 'evac_recover_eval', f'rollout_step_{step:03d}'
+                        world_model_recover_eval_dir = os.path.join(
+                            debug_dir, f'{world_model_backend}_recover_eval', f'rollout_step_{step:03d}'
                         )
-                        recover_eval_rollout_last_img = evac_inference(
-                            evac_model,
-                            evac_cfg,
+                        recover_eval_rollout_last_img = _world_model_inference(
+                            modules,
+                            cfg,
                             curr_image[0],
                             fk_eval_poses,
                             grip_eval_list,
                             raw_data,
                             device,
-                            save_dir=evac_recover_eval_dir,
-                            infer_kwargs=cfg.get('evac_infer_kwargs'),
+                            save_dir=world_model_recover_eval_dir,
                         )
-                        _vpath_recover = os.path.join(evac_recover_eval_dir, 'outputs.mp4')
-                        _mpath_recover = os.path.join(evac_recover_eval_dir, 'evac_runtime_meta.json')
+                        _vpath_recover = os.path.join(world_model_recover_eval_dir, 'outputs.mp4')
+                        _mpath_recover = os.path.join(world_model_recover_eval_dir, world_model_meta_filename)
                         recover_eval_video = {
                             'path': _debug_relpath(_vpath_recover),
                             'exists': bool(os.path.exists(_vpath_recover)),
                             'runtime_meta_path': _debug_relpath(_mpath_recover),
                             'runtime_meta_exists': bool(os.path.exists(_mpath_recover)),
+                            'backend': world_model_backend,
                             'bridge_steps': int(_bridge_meta.get('bridge_steps', 0)),
                             'bridge_left_status': _bridge_meta.get('left_status'),
                             'bridge_right_status': _bridge_meta.get('right_status'),
@@ -1071,12 +1551,39 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     force_generate_correction = False
     if correction_force_generate:
         force_generate_correction = True
-        if debug_dir is not None:
-            _dbg_rollout.append({
-                'step': int(max_steps_eff),
-                'reason': 'correction_force_generate',
-                'max_rollout_steps': int(max_steps),
-            })
+    if debug_dir is not None:
+        _dbg_rollout.append({
+            'step': int(max_steps_eff),
+            'reason': 'correction_force_generate',
+            'max_rollout_steps': int(max_steps),
+        })
+    perturb_action_prefix_raw = (
+        np.concatenate(perturb_action_prefix_chunks, axis=0).astype(np.float32)
+        if len(perturb_action_prefix_chunks) > 0
+        else None
+    )
+    perturb_start_qpos_raw = np.asarray(qpos_raw, dtype=np.float32).copy()
+    perturb_final_qpos_raw = np.asarray(curr_qpos_raw, dtype=np.float32).copy()
+    perturb_delta_linf = (
+        None
+        if perturb_action_prefix_raw is None
+        else float(np.max(np.abs(perturb_final_qpos_raw - perturb_start_qpos_raw)))
+    )
+    perturb_delta_l2 = (
+        None
+        if perturb_action_prefix_raw is None
+        else float(np.linalg.norm(perturb_final_qpos_raw - perturb_start_qpos_raw))
+    )
+    compare_sim_artifact = _write_compare_sim_artifact(
+        cfg,
+        debug_dir,
+        raw_data,
+        int(start_ts),
+        sampled_unit=sampled_unit,
+        perturb_action_prefix_raw=perturb_action_prefix_raw,
+        perturb_start_qpos_raw=perturb_start_qpos_raw,
+        perturb_final_qpos_raw=perturb_final_qpos_raw,
+    )
     perturb_compare_meta = None
     if debug_dir is not None:
         _dbg_corr_cmp = os.path.join(debug_dir, 'correction')
@@ -1180,6 +1687,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     ),
                     'recover_eval_last': recover_eval_last,
                     'gt_projection_on_original': gt_projection_meta,
+                    'world_model_compare': world_model_compare_records,
+                    'world_model_compare_sim': compare_sim_artifact,
                     'rollout': _rollout_skip
                 }, _f, indent=2)
         if nearest_mode == "gripper_close":
@@ -1217,9 +1726,21 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                 None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
             ),
             "recover_eval_last": recover_eval_last,
+            "world_model_backend": world_model_backend,
             "evac_rollout_videos": evac_rollout_videos,
+            "world_model_rollout_videos": world_model_rollout_videos,
+            "world_model_compare": world_model_compare_records,
+            "world_model_compare_sim": compare_sim_artifact,
             "debug_dir": debug_dir,
             "error_action_prefix_raw": error_action_prefix_raw,
+            "perturb_action_prefix_raw": perturb_action_prefix_raw,
+            "perturb_action_prefix_len": (
+                0 if perturb_action_prefix_raw is None else int(perturb_action_prefix_raw.shape[0])
+            ),
+            "perturb_start_qpos_raw": perturb_start_qpos_raw,
+            "perturb_final_qpos_raw": perturb_final_qpos_raw,
+            "perturb_delta_linf": perturb_delta_linf,
+            "perturb_delta_l2": perturb_delta_l2,
         }
         return (None, None, None, None, corr_meta)
 
@@ -1273,7 +1794,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     if nearest_mode == "gripper_close":
         # Dedicated correction for early-close error:
         # 1) quickly reopen gripper, 2) follow GT forward.
-        prefix_len = int(np.clip(int(rollout_exec_steps), 1, max(1, chunk_size - 1)))
+        prefix_len = _correction_prefix_len(cfg, rollout_exec_steps, chunk_size)
         # For gripper_close correction, compose tail directly from sampled start_ts.
         # Do not shift by rollout_steps_total.
         follow_idx = 0
@@ -1337,7 +1858,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         # 2) then follow GT from start_ts forward to fill the rest of chunk_size.
         import sapien
         _recover_mode = str(nearest_mode)
-        prefix_len = int(np.clip(int(rollout_exec_steps), 1, max(1, chunk_size - 1)))
+        prefix_len = _correction_prefix_len(cfg, rollout_exec_steps, chunk_size)
         follow_idx = 0
         follow_abs = int(start_ts)
         suffix_len = int(max(0, chunk_size - prefix_len))
@@ -1484,6 +2005,22 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     is_pad[:chunk_size] = False
 
     qn = (curr_qpos_raw - norm_stats['qpos_mean']) / norm_stats['qpos_std']
+    compare_sim_error_prefix_raw = corr[
+        : int(np.clip(int(rollout_exec_steps), 1, int(corr.shape[0])))
+    ].astype(np.float32).copy()
+    compare_sim_artifact = _write_compare_sim_artifact(
+        cfg,
+        debug_dir,
+        raw_data,
+        int(start_ts),
+        sampled_unit=sampled_unit,
+        perturb_action_prefix_raw=perturb_action_prefix_raw,
+        perturb_start_qpos_raw=perturb_start_qpos_raw,
+        perturb_final_qpos_raw=perturb_final_qpos_raw,
+        corr_action_chunk_raw=corr,
+        corr_qpos_raw=curr_qpos_raw,
+        error_action_prefix_raw=compare_sim_error_prefix_raw,
+    )
 
     # --- debug: save correction summary jsons ---
     evac_corr_video = None
@@ -1509,25 +2046,27 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                         _fr['right'][0].copy(), _fr['right'][1].copy(),
                     ))
                     grip_corr_list.append((float(_ar[6]), float(_ar[13])))
-                evac_corr_dir = os.path.join(debug_dir, 'evac_correction', 'rollout_step_000')
-                evac_inference(
-                    evac_model,
-                    evac_cfg,
+                world_model_corr_dir = os.path.join(
+                    debug_dir, f'{world_model_backend}_correction', 'rollout_step_000'
+                )
+                _world_model_inference(
+                    modules,
+                    cfg,
                     curr_image[0],
                     fk_corr_poses,
                     grip_corr_list,
                     raw_data,
                     device,
-                    save_dir=evac_corr_dir,
-                    infer_kwargs=cfg.get('evac_infer_kwargs'),
+                    save_dir=world_model_corr_dir,
                 )
-                _vpath_corr = os.path.join(evac_corr_dir, 'outputs.mp4')
-                _mpath_corr = os.path.join(evac_corr_dir, 'evac_runtime_meta.json')
+                _vpath_corr = os.path.join(world_model_corr_dir, 'outputs.mp4')
+                _mpath_corr = os.path.join(world_model_corr_dir, world_model_meta_filename)
                 evac_corr_video = {
                     'path': _debug_relpath(_vpath_corr),
                     'exists': bool(os.path.exists(_vpath_corr)),
                     'runtime_meta_path': _debug_relpath(_mpath_corr),
                     'runtime_meta_exists': bool(os.path.exists(_mpath_corr)),
+                    'backend': world_model_backend,
                     'num_actions': int(corr.shape[0]),
                 }
             except Exception as _exc_corr_video:
@@ -1541,20 +2080,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     raise
         # Save correction projection overlays on original/corrected images.
         try:
-            _cimg = (curr_image[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-            _oimg = (image_data_s[0].detach().cpu().permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+            _cimg = _tensor_chw_to_bgr_u8(curr_image[0])
+            _oimg = _tensor_chw_to_bgr_u8(image_data_s[0])
             gt_ref_idx = int(np.clip(start_ts, 0, raw_data['left_endpose'].shape[0] - 1))
-            try:
-                ep_path = raw_data.get('episode_path', None)
-                if ep_path is not None and os.path.isfile(ep_path):
-                    import h5py
-                    with h5py.File(ep_path, 'r') as _f_gt:
-                        _enc = bytes(_f_gt['observation/head_camera/rgb'][gt_ref_idx])
-                    _gt = cv2.imdecode(np.frombuffer(_enc, np.uint8), cv2.IMREAD_COLOR)
-                    if _gt is not None and _gt.size > 0:
-                        _oimg = _gt
-            except Exception:
-                pass
 
             if _oimg.shape[:2] != _cimg.shape[:2]:
                 _oimg = cv2.resize(_oimg, (_cimg.shape[1], _cimg.shape[0]), interpolation=cv2.INTER_LINEAR)
@@ -1837,8 +2365,8 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             _annotate_start_end(_overlay_c, luv, "L", (0, 255, 0))
             _annotate_start_end(_overlay_c, ruv, "R", (0, 0, 255))
 
-            cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
-            cv2.imwrite(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _overlay_gt)
+            _write_bgr_image(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+            _write_bgr_image(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _overlay_gt)
         except Exception:
             try:
                 import traceback
@@ -1849,13 +2377,13 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             # Best-effort fallback: still dump base original/corrected images.
             try:
                 if '_overlay_c' in locals():
-                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
+                    _write_bgr_image(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _overlay_c)
                 elif '_cimg' in locals():
-                    cv2.imwrite(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _cimg)
+                    _write_bgr_image(os.path.join(_dbg_corr, 'corr_projection_on_corrected.png'), _cimg)
                 if '_overlay_gt' in locals():
-                    cv2.imwrite(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _overlay_gt)
+                    _write_bgr_image(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _overlay_gt)
                 elif '_oimg' in locals():
-                    cv2.imwrite(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _oimg)
+                    _write_bgr_image(os.path.join(_dbg_corr, 'gt_projection_on_original.png'), _oimg)
             except Exception:
                 pass
 
@@ -1994,6 +2522,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             ),
             'recover_eval_last': recover_eval_last,
             'rollout': _closed_loop_rollouts,
+            'world_model_backend': world_model_backend,
+            'world_model_compare': world_model_compare_records,
+            'world_model_compare_sim': compare_sim_artifact,
             'evac_correction_video': evac_corr_video,
         }
         with open(os.path.join(_dbg_corr, 'closed_loop_info.json'), 'w') as _f:
@@ -2027,6 +2558,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "forced_mag_bin_id": forced_mag_bin_fixed,
         "nearest_mode": nearest_mode,
         "rollout_exec_steps": int(rollout_exec_steps),
+        "full_chunk_recovery": bool(cfg.get("full_chunk_recovery", False)),
+        "correction_prefix_len": int(prefix_len),
+        "error_action_prefix_len": int(prefix_len_meta),
         "t_star": int(t_star),
         "min_dist": float(min_dist),
         "recover_eval_enable": bool(recover_eval_enable),
@@ -2035,10 +2569,22 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             None if recover_eval_first_unrecoverable_step is None else int(recover_eval_first_unrecoverable_step)
         ),
         "recover_eval_last": recover_eval_last,
+        "world_model_backend": world_model_backend,
         "evac_rollout_videos": evac_rollout_videos,
+        "world_model_rollout_videos": world_model_rollout_videos,
+        "world_model_compare": world_model_compare_records,
+        "world_model_compare_sim": compare_sim_artifact,
         "evac_correction_video": evac_corr_video,
         "debug_dir": debug_dir,
         "error_action_prefix_raw": error_action_prefix_raw,
+        "perturb_action_prefix_raw": perturb_action_prefix_raw,
+        "perturb_action_prefix_len": (
+            0 if perturb_action_prefix_raw is None else int(perturb_action_prefix_raw.shape[0])
+        ),
+        "perturb_start_qpos_raw": perturb_start_qpos_raw,
+        "perturb_final_qpos_raw": perturb_final_qpos_raw,
+        "perturb_delta_linf": perturb_delta_linf,
+        "perturb_delta_l2": perturb_delta_l2,
     }
 
     return (

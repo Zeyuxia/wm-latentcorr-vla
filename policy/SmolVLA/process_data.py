@@ -2,19 +2,21 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import cv2
 import h5py
 import numpy as np
 
-from src.lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-
 FILE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = FILE_DIR.parents[1]
 RAW_DATA_ROOT = REPO_ROOT / "data"
 PROCESSED_ROOT = FILE_DIR / "data"
+os.environ["HF_HOME"] = str((FILE_DIR / ".hf_home").resolve())
+os.environ["HF_DATASETS_CACHE"] = str((FILE_DIR / ".hf_home" / "datasets").resolve())
+
+from src.lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 DEFAULT_TASKS = [
     "open_laptop",
@@ -64,7 +66,11 @@ def decode_head_camera(image_bytes) -> np.ndarray:
     image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Failed to decode head_camera frame")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # Legacy RoboTwin hdf5 files were JPEG-encoded with cv2.imencode from
+    # simulator RGB arrays.  cv2.imdecode therefore returns a BGR-ordered array
+    # whose channel values match the simulator/eval RGB semantics when passed
+    # directly to the LeRobot video writer.  Converting BGR->RGB here would
+    # preserve the red/blue swap present in those legacy JPEGs.
     return cv2.resize(image, (640, 480), interpolation=cv2.INTER_AREA)
 
 
@@ -113,13 +119,13 @@ def convert_episode(dataset: LeRobotDataset, episode_path: Path, task_name: str,
     print(f"Converted {task_name}: {episode_path.name}")
 
 
-def convert_task(task_name: str, task_config: str, expert_data_num: int, fps: int) -> Path:
+def convert_task(task_name: str, task_config: str, expert_data_num: int, fps: int, output_suffix: str) -> Path:
     task_dir = RAW_DATA_ROOT / task_name / task_config
     raw_data_dir = task_dir / "data"
     if not raw_data_dir.is_dir():
         raise FileNotFoundError(f"Missing raw data directory: {raw_data_dir}")
 
-    output_repo_id = f"robotwin_{task_name}_{task_config}_{expert_data_num}_cam_high"
+    output_repo_id = f"robotwin_{task_name}_{task_config}_{expert_data_num}_cam_high{output_suffix}"
     output_dir = PROCESSED_ROOT / output_repo_id
     if output_dir.exists():
         raise FileExistsError(f"Output dataset already exists: {output_dir}")
@@ -167,6 +173,11 @@ def parse_args():
     parser.add_argument("task_config", nargs="?", default="demo_clean")
     parser.add_argument("expert_data_num", nargs="?", type=int, default=50)
     parser.add_argument("--fps", type=int, default=50)
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        help="Suffix appended to generated repo ids, e.g. '_rgbfix'.",
+    )
     return parser.parse_args()
 
 
@@ -174,7 +185,7 @@ def main():
     args = parse_args()
     tasks = DEFAULT_TASKS if args.task_name == "all" else [args.task_name]
     for task_name in tasks:
-        convert_task(task_name, args.task_config, args.expert_data_num, args.fps)
+        convert_task(task_name, args.task_config, args.expert_data_num, args.fps, args.output_suffix)
 
 
 if __name__ == "__main__":

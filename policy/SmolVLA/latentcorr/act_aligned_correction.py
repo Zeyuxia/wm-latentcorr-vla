@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import os
 import sys
+import traceback
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROBOTWIN_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", "..", ".."))
@@ -18,6 +19,7 @@ for _path in (_ROBOTWIN_ROOT, _SMOLVLA_EVAC_ROOT, _SMOLVLA_EVAC_MODULE_ROOT):
     sys.path.insert(0, _path)
 
 from policy.SmolVLA.latentcorr.correction_step import correction_step
+from policy.SmolVLA.latentcorr.correction_cosmos_rollout import build_cosmos_client_from_cfg
 from policy.SmolVLA.latentcorr.correction_utils import build_evac_infer_kwargs
 
 
@@ -135,12 +137,13 @@ class ACTAlignedCorrectionConfig:
     recover_eval_nearest_window_radius: int = 16
     recover_eval_video_bridge_steps: int = 16
     rollout_exec_steps: int = 16
+    full_chunk_recovery: bool = False
     chunk_size: int = 50
     max_action_len: int = 50
     orient_weight: float = 0.0573
     gripper_penalty: float = 1.0
     enable_perturb: bool = True
-    perturb_eef_fail_gain: float = 0.08
+    perturb_eef_fail_gain: float = 0.05
     perturb_rot_max_deg: float = 15.0
     nearest_window_radius: int = 12
     perturb_gripper_close_min: float = 0.10
@@ -166,11 +169,68 @@ class ACTAlignedCorrectionConfig:
     evac_dc_v_blur_on_reuse: bool = False
     evac_dc_v_blur_kernel: int = 3
     evac_dc_v_blur_strength: float = 0.15
+    world_model_backend: str = "evac"
+    cosmos_root: str = "/data/zhenyangfan/cosmos-predict2.5"
+    cosmos_python_bin: str = "/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python"
+    cosmos_checkpoint_path: str = ""
+    cosmos_experiment: str = "robotwin_dualarm_actioncond_2b_256_320"
+    cosmos_config_file: str = "cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py"
+    cosmos_cuda_visible_devices: str = ""
+    cosmos_context_parallel_size: int = 1
+    cosmos_chunk_size: int = 12
+    cosmos_guidance: int = 7
+    cosmos_resolution: str = "256,320"
+    cosmos_fps_downsample_ratio: int = 1
+    cosmos_gripper_scale: float = 1.0
+    cosmos_invert_gripper: bool = True
+    cosmos_num_steps: int = 35
+    cosmos_save_fps: int = 30
+    cosmos_num_latent_conditional_frames: int = 1
+    cosmos_action_scaler: float = 20.0
+    cosmos_action_stats_path: str = ""
+    cosmos_action_normalization_clip: float | None = None
+    cosmos_use_quat: bool = False
+    cosmos_prompt: str = ""
+    cosmos_negative_prompt: str = ""
+    cosmos_seed: int = 0
+    cosmos_work_dir: str = ""
+    cosmos_execution_mode: str = "worker"
+    cosmos_startup_timeout_s: float = 600.0
+    cosmos_request_timeout_s: float = 900.0
+    world_model_compare_mode: bool = False
+    world_model_compare_backends: tuple[str, ...] = ()
+    world_model_compare_sim: bool = True
+    world_model_compare_sim_autorun: bool = False
+    world_model_compare_sim_timeout_s: float = 600.0
+    world_model_compare_cosmos_autorun: bool = False
 
     def to_runtime_dict(self) -> dict[str, Any]:
         runtime = self.__dict__.copy()
         runtime["evac_infer_kwargs"] = build_evac_infer_kwargs(runtime)
         return runtime
+
+
+def _parse_world_model_compare_backends(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_items = value.replace(";", ",").split(",")
+    else:
+        raw_items = []
+        for item in list(value):
+            raw_items.extend(str(item).replace(";", ",").split(","))
+    backends: list[str] = []
+    for item in raw_items:
+        backend = str(item).strip().lower()
+        if not backend:
+            continue
+        if backend not in {"evac", "cosmos"}:
+            raise ValueError(
+                f"Unsupported world-model compare backend={backend!r}; expected evac or cosmos."
+            )
+        if backend not in backends:
+            backends.append(backend)
+    return tuple(backends)
 
 
 def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorrectionConfig:
@@ -179,6 +239,11 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         evac_dc_budget = float(evac_dc_budget)
         if evac_dc_budget < 0.0:
             evac_dc_budget = None
+    world_model_compare_backends = _parse_world_model_compare_backends(
+        getattr(args, "world_model_compare_backends", ())
+    )
+    if bool(getattr(args, "world_model_compare_mode", False)) and not world_model_compare_backends:
+        world_model_compare_backends = ("evac", "cosmos")
     return ACTAlignedCorrectionConfig(
         max_rollout_steps=1,
         correction_force_generate=bool(getattr(args, "correction_force_generate", False)),
@@ -192,12 +257,13 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         recover_eval_nearest_window_radius=int(getattr(args, "recover_eval_nearest_window_radius", 16)),
         recover_eval_video_bridge_steps=int(getattr(args, "recover_eval_video_bridge_steps", 16)),
         rollout_exec_steps=int(getattr(args, "act_aligned_rollout_exec_steps", getattr(args, "prefix_steps", 16))),
+        full_chunk_recovery=bool(getattr(args, "act_aligned_full_chunk_recovery", False)),
         chunk_size=int(getattr(args, "act_chunk_size", 50) or 50),
         max_action_len=int(max_action_len),
         orient_weight=float(getattr(args, "planner_orient_weight", 0.0573)),
         gripper_penalty=float(getattr(args, "planner_gripper_penalty", 1.0)),
         enable_perturb=bool(getattr(args, "act_aligned_enable_perturb", True)),
-        perturb_eef_fail_gain=float(getattr(args, "act_aligned_perturb_eef_fail_gain", 0.08)),
+        perturb_eef_fail_gain=float(getattr(args, "act_aligned_perturb_eef_fail_gain", 0.05)),
         perturb_rot_max_deg=float(getattr(args, "act_aligned_perturb_rot_max_deg", 15.0)),
         nearest_window_radius=int(getattr(args, "planner_nearest_window_radius", 12)),
         perturb_gripper_close_min=float(getattr(args, "act_aligned_perturb_gripper_close_min", 0.10)),
@@ -223,6 +289,50 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         evac_dc_v_blur_on_reuse=bool(getattr(args, "evac_dc_v_blur_on_reuse", False)),
         evac_dc_v_blur_kernel=int(getattr(args, "evac_dc_v_blur_kernel", 3)),
         evac_dc_v_blur_strength=float(getattr(args, "evac_dc_v_blur_strength", 0.15)),
+        world_model_backend=str(getattr(args, "world_model_backend", "evac")).strip().lower(),
+        cosmos_root=str(getattr(args, "cosmos_root", "/data/zhenyangfan/cosmos-predict2.5")),
+        cosmos_python_bin=str(getattr(args, "cosmos_python_bin", "/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")),
+        cosmos_checkpoint_path=str(getattr(args, "cosmos_checkpoint_path", "")),
+        cosmos_experiment=str(getattr(args, "cosmos_experiment", "robotwin_dualarm_actioncond_2b_256_320")),
+        cosmos_config_file=str(
+            getattr(
+                args,
+                "cosmos_config_file",
+                "cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py",
+            )
+        ),
+        cosmos_cuda_visible_devices=str(getattr(args, "cosmos_cuda_visible_devices", "")),
+        cosmos_context_parallel_size=int(getattr(args, "cosmos_context_parallel_size", 1)),
+        cosmos_chunk_size=int(getattr(args, "cosmos_chunk_size", 12)),
+        cosmos_guidance=int(getattr(args, "cosmos_guidance", 7)),
+        cosmos_resolution=str(getattr(args, "cosmos_resolution", "256,320")),
+        cosmos_fps_downsample_ratio=int(getattr(args, "cosmos_fps_downsample_ratio", 1)),
+        cosmos_gripper_scale=float(getattr(args, "cosmos_gripper_scale", 1.0)),
+        cosmos_invert_gripper=bool(getattr(args, "cosmos_invert_gripper", True)),
+        cosmos_num_steps=int(getattr(args, "cosmos_num_steps", 35)),
+        cosmos_save_fps=int(getattr(args, "cosmos_save_fps", 30)),
+        cosmos_num_latent_conditional_frames=int(getattr(args, "cosmos_num_latent_conditional_frames", 1)),
+        cosmos_action_scaler=float(getattr(args, "cosmos_action_scaler", 20.0)),
+        cosmos_action_stats_path=str(getattr(args, "cosmos_action_stats_path", "")),
+        cosmos_action_normalization_clip=(
+            None
+            if getattr(args, "cosmos_action_normalization_clip", None) in {None, "", "none", "None"}
+            else float(getattr(args, "cosmos_action_normalization_clip"))
+        ),
+        cosmos_use_quat=bool(getattr(args, "cosmos_use_quat", False)),
+        cosmos_prompt=str(getattr(args, "cosmos_prompt", "")),
+        cosmos_negative_prompt=str(getattr(args, "cosmos_negative_prompt", "")),
+        cosmos_seed=int(getattr(args, "cosmos_seed", getattr(args, "seed", 0))),
+        cosmos_work_dir=str(getattr(args, "cosmos_work_dir", "")),
+        cosmos_execution_mode=str(getattr(args, "cosmos_execution_mode", "worker")),
+        cosmos_startup_timeout_s=float(getattr(args, "cosmos_startup_timeout_s", 600.0)),
+        cosmos_request_timeout_s=float(getattr(args, "cosmos_request_timeout_s", 900.0)),
+        world_model_compare_mode=bool(getattr(args, "world_model_compare_mode", False)),
+        world_model_compare_backends=world_model_compare_backends,
+        world_model_compare_sim=bool(getattr(args, "world_model_compare_sim", True)),
+        world_model_compare_sim_autorun=bool(getattr(args, "world_model_compare_sim_autorun", False)),
+        world_model_compare_sim_timeout_s=float(getattr(args, "world_model_compare_sim_timeout_s", 600.0)),
+        world_model_compare_cosmos_autorun=bool(getattr(args, "world_model_compare_cosmos_autorun", False)),
     )
 
 
@@ -282,7 +392,20 @@ class ACTAlignedCorrectionBuilder:
     ):
         self.cfg = cfg
         self.device = torch.device(device)
-        if shared_evac_model is not None and shared_evac_config is not None:
+        backend = str(getattr(self.cfg, "world_model_backend", "evac")).strip().lower()
+        if backend not in {"evac", "cosmos"}:
+            raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac' or 'cosmos'.")
+        compare_backends = _parse_world_model_compare_backends(
+            getattr(self.cfg, "world_model_compare_backends", ())
+        )
+        compare_enabled = bool(getattr(self.cfg, "world_model_compare_mode", False))
+        compare_cosmos_autorun = bool(getattr(self.cfg, "world_model_compare_cosmos_autorun", False))
+        need_evac = bool(backend == "evac" or (compare_enabled and "evac" in compare_backends))
+        need_cosmos = bool(
+            backend == "cosmos"
+            or (compare_enabled and "cosmos" in compare_backends and compare_cosmos_autorun)
+        )
+        if need_evac and shared_evac_model is not None and shared_evac_config is not None:
             self.modules = _init_act_correction_modules_without_loading_evac(
                 shared_evac_model=shared_evac_model,
                 shared_evac_config=shared_evac_config,
@@ -290,7 +413,7 @@ class ACTAlignedCorrectionBuilder:
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
             )
-        else:
+        elif need_evac:
             if evac_ckpt is None or evac_config is None:
                 raise ValueError("Either shared EVAC model/config or evac_ckpt+evac_config must be provided.")
             self.modules = _init_act_correction_modules(
@@ -299,6 +422,23 @@ class ACTAlignedCorrectionBuilder:
                 urdf_path=urdf_path,
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
+                device=self.device,
+            )
+        else:
+            # Cosmos can run in a separate worker/direct runner. If EVAC is not
+            # needed for this run, keep only FK/planners in the policy process.
+            self.modules = _init_act_correction_modules_without_loading_evac(
+                shared_evac_model=None,
+                shared_evac_config=None,
+                urdf_path=urdf_path,
+                curobo_left_yml=curobo_left_yml,
+                curobo_right_yml=curobo_right_yml,
+            )
+        if need_cosmos:
+            if not str(getattr(self.cfg, "cosmos_checkpoint_path", "")).strip():
+                raise ValueError("cosmos_checkpoint_path is required when world_model_backend='cosmos'.")
+            self.modules["cosmos_client"] = build_cosmos_client_from_cfg(
+                self.cfg.to_runtime_dict(),
                 device=self.device,
             )
         self.fk = self.modules["fk"]
@@ -395,6 +535,7 @@ class ACTAlignedCorrectionBuilder:
                 "correction_branch": "error",
                 "skip_reason": "builder_exception",
                 "skip_error": repr(exc),
+                "skip_traceback": traceback.format_exc(),
             }
             return None
         if corr is None:
@@ -437,21 +578,25 @@ class ACTAlignedCorrectionBuilder:
                 raise ValueError(
                     f"Expected error_action_prefix_raw with shape [T,14], got {error_action_prefix_raw_np.shape}"
                 )
+            prefix_steps = int(self.cfg.rollout_exec_steps)
+            if hasattr(latent_model, "bridge_cfg") and hasattr(latent_model.bridge_cfg, "prefix_steps"):
+                prefix_steps = int(latent_model.bridge_cfg.prefix_steps)
+            prefix_steps = int(np.clip(prefix_steps, 1, max(1, self.cfg.max_action_len)))
             prefix_len = int(error_action_prefix_raw_np.shape[0])
-            if prefix_len > self.cfg.rollout_exec_steps:
-                error_action_prefix_raw_np = error_action_prefix_raw_np[: self.cfg.rollout_exec_steps]
+            if prefix_len > prefix_steps:
+                error_action_prefix_raw_np = error_action_prefix_raw_np[:prefix_steps]
                 prefix_len = int(error_action_prefix_raw_np.shape[0])
             error_action_prefix_raw = torch.zeros(
-                (self.cfg.rollout_exec_steps, 14), dtype=torch.float32, device=self.device
+                (prefix_steps, 14), dtype=torch.float32, device=self.device
             )
             error_action_prefix_raw[:prefix_len] = torch.from_numpy(error_action_prefix_raw_np).to(self.device)
-            if prefix_len > 0 and prefix_len < self.cfg.rollout_exec_steps:
+            if prefix_len > 0 and prefix_len < prefix_steps:
                 error_action_prefix_raw[prefix_len:] = error_action_prefix_raw[prefix_len - 1]
 
             action_mean = torch.as_tensor(norm_stats["action_mean"], dtype=torch.float32, device=self.device)
             action_std = torch.as_tensor(norm_stats["action_std"], dtype=torch.float32, device=self.device)
             error_action_prefix_norm = (error_action_prefix_raw - action_mean.view(1, -1)) / action_std.view(1, -1)
-            error_is_pad_prefix = torch.ones((self.cfg.rollout_exec_steps,), dtype=torch.bool, device=self.device)
+            error_is_pad_prefix = torch.ones((prefix_steps,), dtype=torch.bool, device=self.device)
             error_is_pad_prefix[:prefix_len] = False
         return {
             "corr_image": corr_image,

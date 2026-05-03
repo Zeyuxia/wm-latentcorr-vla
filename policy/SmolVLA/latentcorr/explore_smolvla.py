@@ -226,12 +226,39 @@ def shuffle_episode_ids_for_rank(episode_ids: list[int], seed: int, rank: int, t
     return [ids[int(idx)] for idx in perm]
 
 
+def parse_compare_backends(value) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw_items = value.replace(";", ",").split(",")
+    else:
+        raw_items = []
+        for item in list(value):
+            raw_items.extend(str(item).replace(";", ",").split(","))
+    out: set[str] = set()
+    for item in raw_items:
+        backend = str(item).strip().lower()
+        if not backend:
+            continue
+        if backend not in {"evac", "cosmos"}:
+            raise ValueError(f"Unsupported compare backend={backend!r}; expected evac/cosmos")
+        out.add(backend)
+    return out
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("explore smolvla latentcorr")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--smolvla_pretrained_path", type=str, required=True)
     parser.add_argument("--stage1_ckpt", type=str, default="")
     parser.add_argument("--multi_task_names", nargs="+", required=True)
+    parser.add_argument("--latent_dataset_source", type=str, default=os.environ.get("SMOLVLA_LATENT_DATA_SOURCE", ""))
+    parser.add_argument(
+        "--latent_dataset_root",
+        type=str,
+        default=os.environ.get("SMOLVLA_LATENT_DATA_ROOT", "/data/zhenyangfan/RoboTwin/policy/SmolVLA/data"),
+    )
+    parser.add_argument("--latent_dataset_suffix", type=str, default=os.environ.get("SMOLVLA_LATENT_DATA_SUFFIX", ""))
     parser.add_argument("--instruction_type", type=str, required=True)
     parser.add_argument("--evac_ckpt", type=str, required=True)
     parser.add_argument("--evac_config", type=str, required=True)
@@ -292,6 +319,44 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--evac_dc_v_blur_on_reuse", type=str2bool, default=False)
     parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
     parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
+    parser.add_argument("--world_model_backend", type=str, choices=["evac", "cosmos"], default="evac")
+    parser.add_argument("--cosmos_execution_mode", type=str, choices=["worker", "direct"], default="worker")
+    parser.add_argument("--cosmos_root", type=str, default="/data/zhenyangfan/cosmos-predict2.5")
+    parser.add_argument("--cosmos_python_bin", type=str, default="/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")
+    parser.add_argument("--cosmos_checkpoint_path", type=str, default="")
+    parser.add_argument("--cosmos_experiment", type=str, default="robotwin_dualarm_actioncond_2b_256_320")
+    parser.add_argument(
+        "--cosmos_config_file",
+        type=str,
+        default="cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py",
+    )
+    parser.add_argument("--cosmos_cuda_visible_devices", type=str, default="")
+    parser.add_argument("--cosmos_context_parallel_size", type=int, default=1)
+    parser.add_argument("--cosmos_chunk_size", type=int, default=12)
+    parser.add_argument("--cosmos_guidance", type=int, default=7)
+    parser.add_argument("--cosmos_resolution", type=str, default="256,320")
+    parser.add_argument("--cosmos_fps_downsample_ratio", type=int, default=1)
+    parser.add_argument("--cosmos_gripper_scale", type=float, default=1.0)
+    parser.add_argument("--cosmos_invert_gripper", type=str2bool, default=True)
+    parser.add_argument("--cosmos_num_steps", type=int, default=35)
+    parser.add_argument("--cosmos_save_fps", type=int, default=30)
+    parser.add_argument("--cosmos_num_latent_conditional_frames", type=int, default=1)
+    parser.add_argument("--cosmos_action_scaler", type=float, default=20.0)
+    parser.add_argument("--cosmos_action_stats_path", type=str, default="")
+    parser.add_argument("--cosmos_action_normalization_clip", type=str, default="")
+    parser.add_argument("--cosmos_use_quat", type=str2bool, default=False)
+    parser.add_argument("--cosmos_prompt", type=str, default="")
+    parser.add_argument("--cosmos_negative_prompt", type=str, default="")
+    parser.add_argument("--cosmos_seed", type=int, default=0)
+    parser.add_argument("--cosmos_work_dir", type=str, default="")
+    parser.add_argument("--cosmos_startup_timeout_s", type=float, default=600.0)
+    parser.add_argument("--cosmos_request_timeout_s", type=float, default=900.0)
+    parser.add_argument("--world_model_compare_mode", type=str2bool, default=False)
+    parser.add_argument("--world_model_compare_backends", nargs="*", default=[])
+    parser.add_argument("--world_model_compare_sim", type=str2bool, default=True)
+    parser.add_argument("--world_model_compare_sim_autorun", type=str2bool, default=False)
+    parser.add_argument("--world_model_compare_sim_timeout_s", type=float, default=600.0)
+    parser.add_argument("--world_model_compare_cosmos_autorun", type=str2bool, default=False)
     parser.add_argument("--fail_fast_on_error", type=str2bool, default=False)
     return parser
 
@@ -305,15 +370,57 @@ def main() -> None:
         args.world_size = int(accelerator.num_processes)
     if str(args.device).startswith("cuda"):
         args.device = str(accelerator.device)
+    compare_backends = (
+        parse_compare_backends(args.world_model_compare_backends)
+        if bool(args.world_model_compare_mode)
+        else set()
+    )
+    if bool(args.world_model_compare_mode) and not compare_backends:
+        compare_backends = {"evac", "cosmos"}
+    need_cosmos_backend = bool(
+        str(args.world_model_backend).strip().lower() == "cosmos"
+        or ("cosmos" in compare_backends and bool(args.world_model_compare_cosmos_autorun))
+    )
+    need_evac_backend = bool(
+        str(args.world_model_backend).strip().lower() == "evac"
+        or "evac" in compare_backends
+    )
+    if need_cosmos_backend and not str(args.cosmos_cuda_visible_devices).strip():
+        local_cuda_index = 0
+        if str(args.device).startswith("cuda") and ":" in str(args.device):
+            try:
+                local_cuda_index = int(str(args.device).split(":", 1)[1])
+            except ValueError:
+                local_cuda_index = 0
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        visible_ids = [item.strip() for item in visible.split(",") if item.strip()]
+        args.cosmos_cuda_visible_devices = (
+            visible_ids[local_cuda_index] if 0 <= local_cuda_index < len(visible_ids) else str(local_cuda_index)
+        )
     device_obj = torch.device(args.device)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
 
+    if str(args.latent_dataset_source).strip():
+        os.environ["SMOLVLA_LATENT_DATA_SOURCE"] = str(args.latent_dataset_source).strip()
+    if str(args.latent_dataset_root).strip():
+        os.environ["SMOLVLA_LATENT_DATA_ROOT"] = str(Path(args.latent_dataset_root).resolve())
+    if str(args.latent_dataset_suffix).strip():
+        os.environ["SMOLVLA_LATENT_DATA_SUFFIX"] = str(args.latent_dataset_suffix).strip()
+
     task_specs = resolve_multitask_specs(list(args.multi_task_names), SIM_TASK_CONFIGS, raw_data_root_overrides=None)
+    if (
+        need_cosmos_backend
+        and str(args.cosmos_execution_mode).strip().lower() != "direct"
+        and not str(args.cosmos_work_dir).strip()
+    ):
+        mode_dir = "cosmos_workers"
+        args.cosmos_work_dir = str(output_dir / mode_dir / f"rank{int(args.rank):02d}")
+    if need_cosmos_backend and not str(args.cosmos_checkpoint_path).strip():
+        raise ValueError("--cosmos_checkpoint_path is required when using Cosmos as main or compare backend")
     evac_cfg_for_dataset = OmegaConf.load(args.evac_config)
     evac_sample_size = tuple(int(x) for x in evac_cfg_for_dataset.data.params.train.params.sample_size)
     interrupted = {"flag": False}
@@ -389,7 +496,7 @@ def main() -> None:
         evac_ckpt=args.evac_ckpt,
         evac_config=args.evac_config,
         device=args.device,
-        load_rollout_model=True,
+        load_rollout_model=need_evac_backend,
     )
     init_teacher_latent = teacher.encode_image(
         init_sample["image_t"][0].unsqueeze(0).to(device=device_obj, dtype=torch.float32)
@@ -400,14 +507,22 @@ def main() -> None:
         model.load_state_dict(stage1_ckpt["model"], strict=True)
     model.to(device_obj)
     model.eval()
+    shared_evac_model = teacher.model
+    shared_evac_config = teacher.cfg
+    if str(args.world_model_backend).strip().lower() == "cosmos" and not need_evac_backend:
+        del teacher
+        shared_evac_model = None
+        shared_evac_config = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     correction_builder = ACTAlignedCorrectionBuilder(
         cfg=build_act_aligned_cfg_from_args(args, max_action_len=int(args.act_chunk_size)),
         urdf_path=args.urdf_path,
         curobo_left_yml=args.curobo_left_yml,
         curobo_right_yml=args.curobo_right_yml,
         device=args.device,
-        shared_evac_model=teacher.model,
-        shared_evac_config=teacher.cfg,
+        shared_evac_model=shared_evac_model,
+        shared_evac_config=shared_evac_config,
     )
 
     if accelerator.is_main_process:
@@ -647,6 +762,7 @@ def main() -> None:
                 bool(args.save_correction_debug)
                 or bool(args.save_perturb_rollout_video)
                 or bool(args.recover_eval_save_video)
+                or bool(args.world_model_compare_mode)
             ):
                 phase_bin_id = int(batch["sampled_phase_bin_id"][0].item())
                 sample_debug_dir = (
@@ -656,6 +772,12 @@ def main() -> None:
                     / f"step_{processed_samples - 1:06d}"
                     / f"bi{phase_bin_id}"
                 )
+            correction_builder.cfg.compare_task_name_full = str(spec.task_name)
+            correction_builder.cfg.compare_episode_id = int(episode_id)
+            correction_builder.cfg.compare_rank = int(args.rank)
+            correction_builder.cfg.compare_global_step = int(processed_samples - 1)
+            correction_builder.cfg.compare_raw_data_dir = str(spec.raw_data_dir)
+            correction_builder.cfg.compare_repo_root = str(PROJECT_ROOT)
             correction = correction_builder.build(
                 latent_model=adapter,
                 image_t=batch["image_t"][0].to(args.device),
@@ -744,6 +866,7 @@ def main() -> None:
                             "recover_eval_failed_thresholds": recover_eval_last.get("failed_thresholds"),
                             "skip_reason": corr_meta.get("skip_reason"),
                             "skip_error": corr_meta.get("skip_error"),
+                            "skip_traceback": corr_meta.get("skip_traceback"),
                             "evac_blur_filter": corr_meta.get("evac_blur_filter"),
                         }
                     )
