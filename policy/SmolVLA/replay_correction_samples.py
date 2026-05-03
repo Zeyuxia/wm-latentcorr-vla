@@ -110,6 +110,7 @@ def load_task_args(task_name: str, task_config: str, save_path: Path | None = No
     args["eval_video_log"] = False
     args["eval_video_save_dir"] = None
     args["eval_mode"] = False
+    args["need_topp"] = False
     if save_path is not None:
         args["save_path"] = str(save_path)
 
@@ -439,6 +440,11 @@ def replay_record(
 
     with np.load(record["path"]) as sample:
         corr_actions = sample["corr_action_chunk_raw"].astype(np.float32)
+        sim_compare_actions = (
+            sample["sim_compare_action_chunk_raw"].astype(np.float32)
+            if "sim_compare_action_chunk_raw" in sample
+            else None
+        )
         corr_qpos = sample["corr_qpos_raw"].astype(np.float32) if "corr_qpos_raw" in sample else None
         perturb_actions = (
             sample["perturb_action_prefix_raw"].astype(np.float32)
@@ -460,6 +466,11 @@ def replay_record(
             if "error_action_prefix_raw" in sample
             else None
         )
+    if sim_compare_actions is not None:
+        # World-model compare predicts the result of the perturb/action prefix
+        # from the clean start image.  Replay that exact prefix once in the
+        # simulator while keeping the original correction chunk intact.
+        perturb_actions = sim_compare_actions
 
     sample_tag = (
         f"{task}_rank{int(record.get('rank', -1)):02d}_step{int(record.get('global_step', -1)):06d}"

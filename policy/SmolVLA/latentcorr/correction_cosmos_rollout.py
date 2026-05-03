@@ -42,11 +42,12 @@ class CosmosRolloutClient:
         action_stats_path: str = "",
         action_normalization_clip: float | None = None,
         use_quat: bool = False,
+        quat_input_order: str = "xyzw",
         prompt: str = "",
         negative_prompt: str = "",
         seed: int = 0,
         work_dir: str | None = None,
-        execution_mode: str = "worker",
+        execution_mode: str = "direct",
         startup_timeout_s: float = 600.0,
         request_timeout_s: float = 900.0,
     ):
@@ -74,6 +75,10 @@ class CosmosRolloutClient:
         self.action_stats_path = str(action_stats_path or "")
         self.action_normalization_clip = action_normalization_clip
         self.use_quat = bool(use_quat)
+        quat_input_order = str(quat_input_order or "xyzw").strip().lower()
+        if quat_input_order not in {"wxyz", "xyzw"}:
+            raise ValueError(f"Unsupported Cosmos quat_input_order={quat_input_order!r}; expected 'wxyz' or 'xyzw'.")
+        self.quat_input_order = quat_input_order
         self.prompt = str(prompt or "")
         self.negative_prompt = str(negative_prompt or "")
         self.seed = int(seed)
@@ -150,6 +155,8 @@ class CosmosRolloutClient:
             self.action_stats_path,
             "--action_normalization_clip",
             "" if self.action_normalization_clip is None else str(float(self.action_normalization_clip)),
+            "--quat_input_order",
+            self.quat_input_order,
             "--prompt",
             self.prompt,
             "--negative_prompt",
@@ -184,6 +191,7 @@ class CosmosRolloutClient:
                 "" if self.action_normalization_clip is None else str(float(self.action_normalization_clip))
             ),
             use_quat=self.use_quat,
+            quat_input_order=self.quat_input_order,
             prompt=self.prompt,
             negative_prompt=self.negative_prompt,
             seed=self.seed,
@@ -374,7 +382,7 @@ class CosmosRolloutClient:
                 raise RuntimeError(f"Unexpected Cosmos direct batch response: {type(response)!r}")
             return response.float()
         except Exception as exc:
-            self._write_error(None, exc)
+            self._write_error({"save_dir": save_dir}, exc)
             raise
 
     def infer(
@@ -502,11 +510,12 @@ def build_cosmos_client_from_cfg(cfg: dict[str, Any], device: str | torch.device
             else float(cfg.get("cosmos_action_normalization_clip"))
         ),
         use_quat=bool(cfg.get("cosmos_use_quat", False)),
+        quat_input_order=str(cfg.get("cosmos_quat_input_order", "xyzw")),
         prompt=str(cfg.get("cosmos_prompt", "")),
         negative_prompt=str(cfg.get("cosmos_negative_prompt", "")),
         seed=int(cfg.get("cosmos_seed", cfg.get("seed", 0))),
         work_dir=str(cfg.get("cosmos_work_dir", "")) or None,
-        execution_mode=str(cfg.get("cosmos_execution_mode", "worker")),
+        execution_mode=str(cfg.get("cosmos_execution_mode", "direct")),
         startup_timeout_s=float(cfg.get("cosmos_startup_timeout_s", 600.0)),
         request_timeout_s=float(cfg.get("cosmos_request_timeout_s", 900.0)),
     )
@@ -528,6 +537,7 @@ def write_cosmos_client_summary(client: CosmosRolloutClient, output_dir: str) ->
         "action_scaler": client.action_scaler,
         "action_stats_path": client.action_stats_path,
         "action_normalization_clip": client.action_normalization_clip,
+        "quat_input_order": client.quat_input_order,
         "execution_mode": client.execution_mode,
         "worker_log_path": client.log_path,
         "worker_socket_path": client.socket_path,

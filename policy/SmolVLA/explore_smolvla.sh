@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
 LOCAL_SRC_DIR="${SCRIPT_DIR}/src"
 
 source /data/miniconda3/etc/profile.d/conda.sh
-SMOLVLA_CONDA_ENV=${SMOLVLA_CONDA_ENV:-smolvla}
+SMOLVLA_CONDA_ENV=${SMOLVLA_CONDA_ENV:-smolvla_cosmos}
 conda activate "${SMOLVLA_CONDA_ENV}"
 cd /data/zhenyangfan/RoboTwin
 
@@ -28,7 +28,7 @@ INSTRUCTION_TYPE=seen
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
 WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-evac}
-COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE:-worker}
+COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE:-direct}
 COSMOS_ROOT=${COSMOS_ROOT:-${SCRIPT_DIR}/cosmos-predict2.5}
 COSMOS_TARGET_ROOT=${COSMOS_TARGET_ROOT:-/data/zhenyangfan/cosmos-predict2.5}
 COSMOS_PYTHON_BIN=${COSMOS_PYTHON_BIN:-${COSMOS_TARGET_ROOT}/.venv/bin/python}
@@ -50,6 +50,9 @@ COSMOS_ACTION_SCALER=${COSMOS_ACTION_SCALER:-20.0}
 COSMOS_ACTION_STATS_PATH=${COSMOS_ACTION_STATS_PATH:-}
 COSMOS_ACTION_NORMALIZATION_CLIP=${COSMOS_ACTION_NORMALIZATION_CLIP:-}
 COSMOS_USE_QUAT=${COSMOS_USE_QUAT:-false}
+# The current RoboTwin Cosmos checkpoint was trained with the converter that
+# read endpose quaternions as xyzw. Keep online FK action conditioning aligned.
+COSMOS_QUAT_INPUT_ORDER=${COSMOS_QUAT_INPUT_ORDER:-xyzw}
 COSMOS_PROMPT=${COSMOS_PROMPT:-}
 COSMOS_NEGATIVE_PROMPT=${COSMOS_NEGATIVE_PROMPT:-}
 COSMOS_SEED=${COSMOS_SEED:-0}
@@ -62,6 +65,7 @@ WORLD_MODEL_COMPARE_SIM=${WORLD_MODEL_COMPARE_SIM:-true}
 WORLD_MODEL_COMPARE_SIM_AUTORUN=${WORLD_MODEL_COMPARE_SIM_AUTORUN:-false}
 WORLD_MODEL_COMPARE_SIM_TIMEOUT_S=${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S:-600}
 WORLD_MODEL_COMPARE_COSMOS_AUTORUN=${WORLD_MODEL_COMPARE_COSMOS_AUTORUN:-false}
+EXPLORE_DEBUG_MAX_SAMPLES=${EXPLORE_DEBUG_MAX_SAMPLES:-0}
 URDF_PATH=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 CUROBO_LEFT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
 CUROBO_RIGHT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_right.yml
@@ -98,7 +102,7 @@ EXPLORE_ERROR_MODES=(
 )
 EXPLORE_DISABLE_PHASE_BIN_SKIP=false
 EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT=true
-ACT_ALIGNED_ROLLOUT_EXEC_STEPS=16
+ACT_ALIGNED_ROLLOUT_EXEC_STEPS=12
 PLANNER_ORIENT_WEIGHT=0.0573
 PLANNER_GRIPPER_PENALTY=1.0
 PLANNER_NEAREST_WINDOW_RADIUS=12
@@ -326,6 +330,7 @@ CMD=(
     --cosmos_action_stats_path "${COSMOS_ACTION_STATS_PATH}" \
     --cosmos_action_normalization_clip "${COSMOS_ACTION_NORMALIZATION_CLIP}" \
     --cosmos_use_quat "${COSMOS_USE_QUAT}" \
+    --cosmos_quat_input_order "${COSMOS_QUAT_INPUT_ORDER}" \
     --cosmos_prompt "${COSMOS_PROMPT}" \
     --cosmos_negative_prompt "${COSMOS_NEGATIVE_PROMPT}" \
     --cosmos_seed "${COSMOS_SEED}" \
@@ -337,7 +342,8 @@ CMD=(
     --world_model_compare_sim "${WORLD_MODEL_COMPARE_SIM}" \
     --world_model_compare_sim_autorun "${WORLD_MODEL_COMPARE_SIM_AUTORUN}" \
     --world_model_compare_sim_timeout_s "${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S}" \
-    --world_model_compare_cosmos_autorun "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}"
+    --world_model_compare_cosmos_autorun "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}" \
+    --debug_max_samples_per_rank "${EXPLORE_DEBUG_MAX_SAMPLES}"
 )
 
 if [ -n "${STAGE1_CKPT}" ]; then
@@ -357,6 +363,9 @@ if [ "${WORLD_MODEL_COMPARE_MODE}" = "true" ]; then
   echo "World model compare backends: ${WORLD_MODEL_COMPARE_BACKENDS[*]}"
   echo "World model compare sim: ${WORLD_MODEL_COMPARE_SIM} autorun=${WORLD_MODEL_COMPARE_SIM_AUTORUN}"
   echo "World model compare cosmos autorun: ${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}"
+fi
+if [ "${EXPLORE_DEBUG_MAX_SAMPLES}" != "0" ]; then
+  echo "Explore debug max samples per rank: ${EXPLORE_DEBUG_MAX_SAMPLES}"
 fi
 if [ "${WORLD_MODEL_BACKEND}" = "cosmos" ] || [ "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}" = "true" ]; then
   echo "Cosmos execution mode: ${COSMOS_EXECUTION_MODE}"

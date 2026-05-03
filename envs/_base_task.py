@@ -76,7 +76,9 @@ class Base_Task(gym.Env):
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
 
-        self.need_topp = True  # TODO
+        # Keep TOPP/MPLib optional. Policy eval and saved-qpos replay only need
+        # the Curobo planner unless a caller explicitly asks for TOPP.
+        self.need_topp = bool(kwags.get("need_topp", False))
 
         # Random
         random_setting = kwags.get("domain_randomization")
@@ -392,6 +394,8 @@ class Base_Task(gym.Env):
         """
         load aloha robot urdf file, set root pose and set joints
         """
+        kwags = dict(kwags)
+        kwags.pop("need_topp", None)
         if not hasattr(self, "robot"):
             self.robot = Robot(self.scene, self.need_topp, **kwags)
             self.robot.set_planner(self.scene)
@@ -1539,41 +1543,60 @@ class Base_Task(gym.Env):
             left_path = np.vstack((left_current_qpos, left_arm_actions))
             right_path = np.vstack((right_current_qpos, right_arm_actions))
 
-            # ========== TOPP ==========
-            # TODO
+            # ========== TOPP / direct qpos fallback ==========
+            fallback_steps = 50
+
+            def _direct_qpos_result(curr_qpos, target_qpos):
+                pos = np.linspace(curr_qpos, target_qpos, fallback_steps, dtype=np.float32)
+                vel = np.zeros_like(pos, dtype=np.float32)
+                return {
+                    "position": pos,
+                    "velocity": vel,
+                }
+
+            left_result = None
+            right_result = None
             topp_left_flag, topp_right_flag = True, True
 
-            try:
-                times, left_pos, left_vel, acc, duration = (self.robot.left_mplib_planner.TOPP(left_path,
-                                                                                            1 / 250,
-                                                                                            verbose=True))
-                left_result = dict()
-                left_result["position"], left_result["velocity"] = left_pos, left_vel
+            if self.need_topp and hasattr(self.robot, "left_mplib_planner"):
+                try:
+                    times, left_pos, left_vel, acc, duration = (
+                        self.robot.left_mplib_planner.TOPP(left_path, 1 / 250, verbose=True)
+                    )
+                    left_result = {
+                        "position": left_pos,
+                        "velocity": left_vel,
+                    }
+                    left_n_step = left_result["position"].shape[0]
+                except Exception:
+                    left_result = None
+                    left_n_step = 0
+            else:
+                left_n_step = 0
+
+            if left_result is None or left_n_step == 0:
+                left_result = _direct_qpos_result(left_current_qpos, left_arm_actions[0])
                 left_n_step = left_result["position"].shape[0]
-            except Exception as e:
-                # print("left arm TOPP error: ", e)
-                topp_left_flag = False
-                left_n_step = 50  # fixed
 
-            if left_n_step == 0:
-                topp_left_flag = False
-                left_n_step = 50  # fixed
+            if self.need_topp and hasattr(self.robot, "right_mplib_planner"):
+                try:
+                    times, right_pos, right_vel, acc, duration = (
+                        self.robot.right_mplib_planner.TOPP(right_path, 1 / 250, verbose=True)
+                    )
+                    right_result = {
+                        "position": right_pos,
+                        "velocity": right_vel,
+                    }
+                    right_n_step = right_result["position"].shape[0]
+                except Exception:
+                    right_result = None
+                    right_n_step = 0
+            else:
+                right_n_step = 0
 
-            try:
-                times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
-                                                                                                1 / 250,
-                                                                                                verbose=True))
-                right_result = dict()
-                right_result["position"], right_result["velocity"] = right_pos, right_vel
+            if right_result is None or right_n_step == 0:
+                right_result = _direct_qpos_result(right_current_qpos, right_arm_actions[0])
                 right_n_step = right_result["position"].shape[0]
-            except Exception as e:
-                # print("right arm TOPP error: ", e)
-                topp_right_flag = False
-                right_n_step = 50  # fixed
-
-            if right_n_step == 0:
-                topp_right_flag = False
-                right_n_step = 50  # fixed
         
         elif action_type == 'ee':
 

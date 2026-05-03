@@ -38,6 +38,7 @@ policy/TinyVLA/unet_diffusion_policy_results
 policy/TinyVLA/src/nvidia-curobo/
 act-*
 wandb
+policy/PI05_LatentCorr
 
 # Environment-specific generated content
 envs/curobo/
@@ -65,3 +66,4 @@ viewer_show.*
 # downloaded files
 downloads/
 .codex
+debug_color_check/

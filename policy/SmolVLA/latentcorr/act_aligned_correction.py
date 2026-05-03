@@ -35,6 +35,9 @@ def _init_act_correction_modules(
     from omegaconf import OmegaConf
     from policy.ACT.util.fk_sapien import SapienFK
 
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.set_device(torch.device(device))
+
     # EVAC has its own `utils` package; keep it ahead of ACT's `utils.py`.
     for _path in (_SMOLVLA_EVAC_ROOT, _SMOLVLA_EVAC_MODULE_ROOT):
         if _path in sys.path:
@@ -74,8 +77,8 @@ def _init_act_correction_modules(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml)
+    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=device)
+    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=device)
     return {
         "evac_model": evac_model,
         "evac_config": evac_cfg,
@@ -91,9 +94,13 @@ def _init_act_correction_modules_without_loading_evac(
     urdf_path: str,
     curobo_left_yml: str,
     curobo_right_yml: str,
+    device: str | torch.device = "cuda:0",
 ) -> dict[str, Any]:
     import sapien
     from policy.ACT.util.fk_sapien import SapienFK
+
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.set_device(torch.device(device))
 
     _env_robot_dir = os.path.join(_ROBOTWIN_ROOT, "envs", "robot")
     _curobo_src_dir = os.path.join(_ROBOTWIN_ROOT, "envs", "curobo", "src")
@@ -112,8 +119,8 @@ def _init_act_correction_modules_without_loading_evac(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml)
+    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=device)
+    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=device)
     return {
         "evac_model": shared_evac_model,
         "evac_config": shared_evac_config,
@@ -136,7 +143,7 @@ class ACTAlignedCorrectionConfig:
     recover_eval_rot_thresh_deg: float = 10.0
     recover_eval_nearest_window_radius: int = 16
     recover_eval_video_bridge_steps: int = 16
-    rollout_exec_steps: int = 16
+    rollout_exec_steps: int = 12
     full_chunk_recovery: bool = False
     chunk_size: int = 50
     max_action_len: int = 50
@@ -190,11 +197,12 @@ class ACTAlignedCorrectionConfig:
     cosmos_action_stats_path: str = ""
     cosmos_action_normalization_clip: float | None = None
     cosmos_use_quat: bool = False
+    cosmos_quat_input_order: str = "xyzw"
     cosmos_prompt: str = ""
     cosmos_negative_prompt: str = ""
     cosmos_seed: int = 0
     cosmos_work_dir: str = ""
-    cosmos_execution_mode: str = "worker"
+    cosmos_execution_mode: str = "direct"
     cosmos_startup_timeout_s: float = 600.0
     cosmos_request_timeout_s: float = 900.0
     world_model_compare_mode: bool = False
@@ -256,7 +264,7 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         recover_eval_rot_thresh_deg=float(getattr(args, "recover_eval_rot_thresh_deg", 10.0)),
         recover_eval_nearest_window_radius=int(getattr(args, "recover_eval_nearest_window_radius", 16)),
         recover_eval_video_bridge_steps=int(getattr(args, "recover_eval_video_bridge_steps", 16)),
-        rollout_exec_steps=int(getattr(args, "act_aligned_rollout_exec_steps", getattr(args, "prefix_steps", 16))),
+        rollout_exec_steps=int(getattr(args, "act_aligned_rollout_exec_steps", 12)),
         full_chunk_recovery=bool(getattr(args, "act_aligned_full_chunk_recovery", False)),
         chunk_size=int(getattr(args, "act_chunk_size", 50) or 50),
         max_action_len=int(max_action_len),
@@ -320,11 +328,12 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
             else float(getattr(args, "cosmos_action_normalization_clip"))
         ),
         cosmos_use_quat=bool(getattr(args, "cosmos_use_quat", False)),
+        cosmos_quat_input_order=str(getattr(args, "cosmos_quat_input_order", "xyzw")),
         cosmos_prompt=str(getattr(args, "cosmos_prompt", "")),
         cosmos_negative_prompt=str(getattr(args, "cosmos_negative_prompt", "")),
         cosmos_seed=int(getattr(args, "cosmos_seed", getattr(args, "seed", 0))),
         cosmos_work_dir=str(getattr(args, "cosmos_work_dir", "")),
-        cosmos_execution_mode=str(getattr(args, "cosmos_execution_mode", "worker")),
+        cosmos_execution_mode=str(getattr(args, "cosmos_execution_mode", "direct")),
         cosmos_startup_timeout_s=float(getattr(args, "cosmos_startup_timeout_s", 600.0)),
         cosmos_request_timeout_s=float(getattr(args, "cosmos_request_timeout_s", 900.0)),
         world_model_compare_mode=bool(getattr(args, "world_model_compare_mode", False)),
@@ -412,6 +421,7 @@ class ACTAlignedCorrectionBuilder:
                 urdf_path=urdf_path,
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
+                device=self.device,
             )
         elif need_evac:
             if evac_ckpt is None or evac_config is None:
@@ -433,6 +443,7 @@ class ACTAlignedCorrectionBuilder:
                 urdf_path=urdf_path,
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
+                device=self.device,
             )
         if need_cosmos:
             if not str(getattr(self.cfg, "cosmos_checkpoint_path", "")).strip():

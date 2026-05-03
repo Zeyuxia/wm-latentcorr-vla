@@ -210,6 +210,8 @@ def _write_cosmos_offline_command(cfg: dict, save_dir: str, request_path: str) -
         str(cfg.get("cosmos_action_stats_path", "")),
         "--action_normalization_clip",
         "" if cfg.get("cosmos_action_normalization_clip", None) in {None, "", "none", "None"} else str(cfg.get("cosmos_action_normalization_clip")),
+        "--quat_input_order",
+        str(cfg.get("cosmos_quat_input_order", "xyzw")),
         "--prompt",
         str(cfg.get("cosmos_prompt", "")),
         "--negative_prompt",
@@ -406,6 +408,10 @@ def _write_compare_sim_artifact(
     arrays = {
         "corr_action_chunk_raw": corr_actions,
     }
+    if perturb_action_prefix_raw is not None:
+        # This is the exact action sequence used by EVAC/Cosmos world-model rollout.
+        # Simulator compare should replay this sequence, not infer it from correction fields.
+        arrays["sim_compare_action_chunk_raw"] = np.asarray(perturb_action_prefix_raw, dtype=np.float32)
     if corr_qpos_raw is not None:
         arrays["corr_qpos_raw"] = np.asarray(corr_qpos_raw, dtype=np.float32)
     if perturb_action_prefix_raw is not None:
@@ -479,6 +485,31 @@ def _write_compare_sim_artifact(
     if bool(cfg.get("world_model_compare_sim_autorun", False)):
         stdout_path = os.path.join(sim_dir, "sim_replay_stdout.txt")
         stderr_path = os.path.join(sim_dir, "sim_replay_stderr.txt")
+        run_env = os.environ.copy()
+        visible = [item.strip() for item in str(run_env.get("CUDA_VISIBLE_DEVICES", "")).split(",") if item.strip()]
+        if visible and 0 <= rank < len(visible):
+            # replay_correction_samples imports CUDA-backed planners that default to cuda:0.
+            # In multi-rank compare runs, restrict each replay subprocess to its rank-local GPU.
+            run_env["CUDA_VISIBLE_DEVICES"] = visible[rank]
+        # This subprocess is just a local simulator replay.  It must not inherit
+        # accelerate's distributed environment, otherwise CUDA/SAPIEN/Warp may
+        # think it belongs to the outer 4-rank job.
+        for key in (
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_RANK",
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "ACCELERATE_PROCESS_INDEX",
+            "ACCELERATE_NUM_PROCESSES",
+            "ACCELERATE_LOCAL_PROCESS_INDEX",
+        ):
+            run_env.pop(key, None)
+        run_env.setdefault("MPLCONFIGDIR", os.path.join(sim_dir, "mplconfig"))
         try:
             with open(stdout_path, "w", encoding="utf-8") as out_f, open(stderr_path, "w", encoding="utf-8") as err_f:
                 completed = subprocess.run(
@@ -488,6 +519,7 @@ def _write_compare_sim_artifact(
                     stderr=err_f,
                     check=False,
                     timeout=float(cfg.get("world_model_compare_sim_timeout_s", 600.0)),
+                    env=run_env,
                 )
             result.update(
                 {
@@ -925,6 +957,27 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     "sampled_error_mode": sampled_error_mode,
                     "evac_blur_filter": evac_blur_filter,
                 }
+                perturb_action_prefix_raw = (
+                    np.concatenate(perturb_action_prefix_chunks, axis=0).astype(np.float32)
+                    if len(perturb_action_prefix_chunks) > 0
+                    else None
+                )
+                perturb_start_qpos_raw = np.asarray(qpos_raw, dtype=np.float32).copy()
+                perturb_final_qpos_raw = (
+                    np.asarray(act_raw[-1], dtype=np.float32).copy()
+                    if act_raw is not None and len(act_raw) > 0
+                    else np.asarray(curr_qpos_raw, dtype=np.float32).copy()
+                )
+                compare_sim_artifact = _write_compare_sim_artifact(
+                    cfg,
+                    debug_dir,
+                    raw_data,
+                    int(start_ts),
+                    sampled_unit=sampled_unit,
+                    perturb_action_prefix_raw=perturb_action_prefix_raw,
+                    perturb_start_qpos_raw=perturb_start_qpos_raw,
+                    perturb_final_qpos_raw=perturb_final_qpos_raw,
+                )
                 corr_meta = {
                     "correction_generated": False,
                     "closed_loop_fallback_used": False,
@@ -951,6 +1004,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     "evac_rollout_videos": evac_rollout_videos,
                     "world_model_rollout_videos": world_model_rollout_videos,
                     "world_model_compare": world_model_compare_records,
+                    "world_model_compare_sim": compare_sim_artifact,
                     "debug_dir": debug_dir,
                     "error_action_prefix_raw": np.asarray(act_raw, dtype=np.float32).copy(),
                 }
@@ -974,6 +1028,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                             'evac_blur_filter': evac_blur_filter,
                             't_star': int(t_star),
                             'min_dist': float(min_dist),
+                            'world_model_compare_sim': compare_sim_artifact,
                             'rollout': _dbg_rollout + [blur_rollout_record],
                         }, _f, indent=2, ensure_ascii=False)
                 return (None, None, None, None, corr_meta)

@@ -21,11 +21,34 @@ try:
         MotionGenPlanConfig,
         PoseCostMetric,
     )
+    from curobo.types.base import TensorDeviceType
     from curobo.util import logger
     import torch
     import yaml
-    from curobo.util import logger
     logger.setup_logger(level="error", logger_name="curobo")
+
+    def _current_cuda_device() -> torch.device:
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        try:
+            return torch.device(f"cuda:{int(torch.cuda.current_device())}")
+        except Exception:
+            return torch.device("cuda:0")
+
+    def _normalize_torch_device(device):
+        if device is None:
+            return _current_cuda_device()
+        if isinstance(device, torch.device):
+            if device.type == "cuda" and device.index is None:
+                return _current_cuda_device()
+            return device
+        device_str = str(device).strip()
+        if not device_str:
+            return _current_cuda_device()
+        device_str = device_str.lower()
+        if device_str == "cuda":
+            return _current_cuda_device()
+        return torch.device(device_str)
 
     class CuroboPlanner:
 
@@ -35,18 +58,22 @@ try:
             active_joints_name,
             all_joints,
             yml_path=None,
+            device=None,
         ):
             super().__init__()
             ta.setup_logging("CRITICAL")  # hide logging
-            logger.setup_logger(level="error", logger_name="'curobo")
+            logger.setup_logger(level="error", logger_name="curobo")
 
-            if yml_path != None:
-                self.yml_path = yml_path
-            else:
+            if yml_path is None:
                 raise ValueError("[Planner.py]: CuroboPlanner yml_path is None!")
+            self.yml_path = yml_path
             self.robot_origion_pose = robot_origion_pose
             self.active_joints_name = active_joints_name
             self.all_joints = all_joints
+            self.device = _normalize_torch_device(device)
+            if self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
+            self.tensor_args = TensorDeviceType(device=self.device)
 
             # translate from baselink to arm's base
             with open(self.yml_path, "r") as f:
@@ -74,6 +101,7 @@ try:
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
+                tensor_args=self.tensor_args,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
             )
@@ -83,6 +111,7 @@ try:
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
+                tensor_args=self.tensor_args,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
                 num_graph_seeds=1,
@@ -128,7 +157,7 @@ try:
             joint_angles = [curr_joint_pos[index] for index in joint_indices]
             joint_angles = [round(angle, 5) for angle in joint_angles]  # avoid the precision problem
             start_joint_states = JointState.from_position(
-                torch.tensor(joint_angles).cuda().reshape(1, -1),
+                torch.tensor(joint_angles, dtype=torch.float32, device=self.device).reshape(1, -1),
                 joint_names=self.active_joints_name,
             )
             # plan
@@ -208,12 +237,12 @@ try:
                 base_target_pose_list = list(base_target_pose_p) + list(base_target_pose_q)
                 poses_list.append(base_target_pose_list)
 
-            poses_cuda = torch.tensor(poses_list, dtype=torch.float32).cuda()
+            poses_cuda = torch.tensor(poses_list, dtype=torch.float32, device=self.device)
             goal_pose_of_ee = CuroboPose(poses_cuda[:, :3], poses_cuda[:, 3:])
             joint_indices = [self.all_joints.index(name) for name in self.active_joints_name if name in self.all_joints]
             joint_angles = [curr_joint_pos[index] for index in joint_indices]
             joint_angles = [round(angle, 5) for angle in joint_angles]  # avoid the precision problem
-            joint_angles_cuda = (torch.tensor(joint_angles, dtype=torch.float32).cuda().reshape(1, -1))
+            joint_angles_cuda = torch.tensor(joint_angles, dtype=torch.float32, device=self.device).reshape(1, -1)
             joint_angles_cuda = torch.cat([joint_angles_cuda] * num_poses, dim=0)
             start_joint_states = JointState.from_position(joint_angles_cuda, joint_names=self.active_joints_name)
             # plan

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
 import traceback
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from multiprocessing.connection import Listener
 from pathlib import Path
 
@@ -21,6 +23,107 @@ def _parse_optional_float(value: str | None) -> float | None:
     return float(text)
 
 
+@contextmanager
+def _cosmos_log_context():
+    if str(os.environ.get("SMOLVLA_COSMOS_VERBOSE", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        with nullcontext():
+            yield
+        return
+    with open(os.devnull, "w") as devnull:
+        with redirect_stdout(devnull), redirect_stderr(devnull):
+            yield
+
+
+@contextmanager
+def _single_rank_distributed_context(enabled: bool = True):
+    """Make Cosmos behave like a rank-local single-GPU world model.
+
+    SmolVLA already runs under accelerate/DDP.  For EVAC-style compare, each
+    rank should load and run its own world model on its own CUDA device.  Cosmos'
+    loader otherwise notices the outer process group and tries to do rank0-only
+    checkpoint loading plus broadcasts across all SmolVLA ranks.  Patch only
+    Cosmos' distributed helper module so the outer torch.distributed group stays
+    intact for SmolVLA progress synchronization.
+    """
+    if not enabled:
+        yield
+        return
+
+    patched = []
+    env_keys = (
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+    )
+    old_env = {key: os.environ.get(key) for key in env_keys}
+
+    def _patch(obj, name: str, value) -> None:
+        if hasattr(obj, name):
+            patched.append((obj, name, getattr(obj, name)))
+            setattr(obj, name, value)
+
+    try:
+        # Cosmos' inference stack was written to also support torchrun/context
+        # parallelism.  SmolVLA already owns the outer process group via
+        # accelerate, so make Cosmos see a rank-local single-process world while
+        # it initializes and runs.  Do not destroy or modify the real outer
+        # process group.
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["GROUP_RANK"] = "0"
+        os.environ["ROLE_RANK"] = "0"
+        os.environ["ROLE_WORLD_SIZE"] = "1"
+
+        from cosmos_predict2._src.imaginaire.utils import distributed as cosmos_distributed
+
+        _patch(cosmos_distributed, "init", lambda: 0)
+        _patch(cosmos_distributed, "get_rank", lambda group=None: 0)
+        _patch(cosmos_distributed, "get_world_size", lambda group=None: 1)
+        _patch(cosmos_distributed, "is_rank0", lambda: True)
+        _patch(cosmos_distributed, "is_local_rank0", lambda: True)
+        _patch(cosmos_distributed, "barrier", lambda: None)
+        _patch(cosmos_distributed, "broadcast", lambda tensor, *args, **kwargs: tensor)
+        _patch(cosmos_distributed, "sync_model_states", lambda *args, **kwargs: None)
+        _patch(cosmos_distributed, "all_gather_tensor", lambda tensor: [tensor])
+        _patch(cosmos_distributed, "gather_object", lambda payload: [payload])
+        _patch(cosmos_distributed, "dist_reduce_tensor", lambda tensor, *args, **kwargs: tensor)
+    except Exception:
+        pass
+    try:
+        from cosmos_predict2._src.imaginaire.utils import log as cosmos_log
+
+        _patch(cosmos_log, "_get_rank", lambda group=None: 0)
+    except Exception:
+        pass
+    try:
+        import cosmos_predict2.config as cosmos_config
+
+        _patch(cosmos_config, "is_rank0", lambda: True)
+        try:
+            cosmos_config.is_rank0.cache_clear()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        yield
+    finally:
+        for obj, name, old_value in reversed(patched):
+            setattr(obj, name, old_value)
+        for key, old_value in old_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
 def _quat_wxyz_to_euler_xyz(quat_wxyz: np.ndarray) -> np.ndarray:
     from scipy.spatial.transform import Rotation as R
 
@@ -32,9 +135,31 @@ def _quat_wxyz_to_euler_xyz(quat_wxyz: np.ndarray) -> np.ndarray:
     return R.from_quat([q[1], q[2], q[3], q[0]]).as_euler("xyz").astype(np.float32)
 
 
+def _quat_xyzw_to_euler_xyz(quat_xyzw: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation as R
+
+    q = np.asarray(quat_xyzw, dtype=np.float64).reshape(4,)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8:
+        return np.zeros(3, dtype=np.float32)
+    q = q / norm
+    return R.from_quat(q).as_euler("xyz").astype(np.float32)
+
+
+def _quat_to_cosmos_euler_xyz(quat: np.ndarray, quat_input_order: str) -> np.ndarray:
+    order = str(quat_input_order or "xyzw").strip().lower()
+    if order == "wxyz":
+        return _quat_wxyz_to_euler_xyz(quat)
+    if order == "xyzw":
+        return _quat_xyzw_to_euler_xyz(quat)
+    raise ValueError(f"Unsupported Cosmos quat_input_order={quat_input_order!r}; expected 'wxyz' or 'xyzw'.")
+
+
 def _poses_to_cosmos_state_data(
     fk_poses: np.ndarray,
     grippers: np.ndarray,
+    *,
+    quat_input_order: str = "xyzw",
 ) -> dict[str, list]:
     fk_poses = np.asarray(fk_poses, dtype=np.float32)
     grippers = np.asarray(grippers, dtype=np.float32)
@@ -50,8 +175,12 @@ def _poses_to_cosmos_state_data(
         lq = np.asarray(pose[3:7], dtype=np.float32)
         rp = np.asarray(pose[7:10], dtype=np.float32)
         rq = np.asarray(pose[10:14], dtype=np.float32)
-        left_states.append(np.concatenate([lp, _quat_wxyz_to_euler_xyz(lq)], axis=0).astype(float).tolist())
-        right_states.append(np.concatenate([rp, _quat_wxyz_to_euler_xyz(rq)], axis=0).astype(float).tolist())
+        left_states.append(
+            np.concatenate([lp, _quat_to_cosmos_euler_xyz(lq, quat_input_order)], axis=0).astype(float).tolist()
+        )
+        right_states.append(
+            np.concatenate([rp, _quat_to_cosmos_euler_xyz(rq, quat_input_order)], axis=0).astype(float).tolist()
+        )
 
     return {
         "state": left_states,
@@ -64,6 +193,7 @@ def _poses_to_cosmos_state_data(
 class CosmosActionConditionedRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self._single_rank_distributed = int(getattr(args, "context_parallel_size", 1)) <= 1
         cosmos_root = Path(args.cosmos_root).resolve()
         config_file = str(args.config_file)
         if Path(config_file).is_absolute():
@@ -83,27 +213,32 @@ class CosmosActionConditionedRunner:
             # Keep that behavior during initialization, but do not leak it to
             # the SmolVLA process when this runner is used in direct mode.
             os.chdir(cosmos_root)
-            import torchvision
-            from cosmos_predict2._src.predict2.action.robot_action_utils import get_action_sequence_from_states
-            from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
-            from cosmos_predict2.config import DEFAULT_NEGATIVE_PROMPT
+            with _single_rank_distributed_context(self._single_rank_distributed):
+                import torchvision
+                from cosmos_predict2._src.predict2.action.robot_action_utils import get_action_sequence_from_states
+                from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
+                from cosmos_predict2.config import DEFAULT_NEGATIVE_PROMPT
 
-            self.torchvision = torchvision
-            self.get_action_sequence_from_states = get_action_sequence_from_states
-            self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
-            self.video2world = Video2WorldInference(
-                experiment_name=args.experiment,
-                ckpt_path=args.checkpoint_path,
-                s3_credential_path="",
-                context_parallel_size=int(args.context_parallel_size),
-                config_file=args.config_file,
-            )
+                self.torchvision = torchvision
+                self.get_action_sequence_from_states = get_action_sequence_from_states
+                self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
+                self.video2world = Video2WorldInference(
+                    experiment_name=args.experiment,
+                    ckpt_path=args.checkpoint_path,
+                    s3_credential_path="",
+                    context_parallel_size=int(args.context_parallel_size),
+                    config_file=args.config_file,
+                )
         finally:
             os.chdir(old_cwd)
         self.expected_action_dim = int(self.video2world.model.config.net.action_dim)
 
     def _build_actions(self, fk_poses: np.ndarray, grippers: np.ndarray) -> np.ndarray:
-        data = _poses_to_cosmos_state_data(fk_poses, grippers)
+        data = _poses_to_cosmos_state_data(
+            fk_poses,
+            grippers,
+            quat_input_order=str(getattr(self.args, "quat_input_order", "xyzw")),
+        )
         actions = self.get_action_sequence_from_states(
             data,
             fps_downsample_ratio=int(self.args.fps_downsample_ratio),
@@ -124,6 +259,30 @@ class CosmosActionConditionedRunner:
                 f"Cosmos action shape {actions.shape} does not match model action_dim={self.expected_action_dim}"
             )
         return actions
+
+    @staticmethod
+    def _action_summary(actions: np.ndarray) -> dict:
+        arr = np.asarray(actions, dtype=np.float32)
+        if arr.size == 0:
+            return {"shape": list(arr.shape), "empty": True}
+        left = arr[:, :7]
+        right = arr[:, 7:14] if arr.shape[1] >= 14 else np.zeros((arr.shape[0], 0), dtype=arr.dtype)
+        payload = {
+            "shape": [int(x) for x in arr.shape],
+            "empty": False,
+            "min": arr.min(axis=0).astype(float).tolist(),
+            "max": arr.max(axis=0).astype(float).tolist(),
+            "mean": arr.mean(axis=0).astype(float).tolist(),
+            "first": arr[0].astype(float).tolist(),
+            "last": arr[-1].astype(float).tolist(),
+        }
+        if left.size:
+            payload["left_xyz_sum"] = left[:, :3].sum(axis=0).astype(float).tolist()
+            payload["left_xyz_l2_total"] = float(np.linalg.norm(left[:, :3], axis=1).sum())
+        if right.size:
+            payload["right_xyz_sum"] = right[:, :3].sum(axis=0).astype(float).tolist()
+            payload["right_xyz_l2_total"] = float(np.linalg.norm(right[:, :3], axis=1).sum())
+        return payload
 
     def _run_impl(
         self,
@@ -154,7 +313,7 @@ class CosmosActionConditionedRunner:
         prompt = str(self.args.prompt or "")
         negative_prompt = str(self.args.negative_prompt or "") or self.default_negative_prompt
 
-        with torch.no_grad():
+        with torch.no_grad(), _single_rank_distributed_context(self._single_rank_distributed):
             for local_action_idx in range(0, int(actions.shape[0]), chunk_size):
                 actions_valid = actions[local_action_idx : local_action_idx + chunk_size]
                 valid_len = int(actions_valid.shape[0])
@@ -172,19 +331,20 @@ class CosmosActionConditionedRunner:
                 vid_input = (vid_input * 255.0).to(torch.uint8)
                 vid_input = vid_input.unsqueeze(0).permute(0, 2, 1, 3, 4)
 
-                video = self.video2world.generate_vid2world(
-                    prompt=prompt,
-                    input_path=vid_input,
-                    action=torch.from_numpy(actions_chunk).float(),
-                    guidance=int(self.args.guidance),
-                    num_video_frames=num_video_frames,
-                    num_latent_conditional_frames=int(self.args.num_latent_conditional_frames),
-                    resolution=str(self.args.resolution),
-                    seed=int(self.args.seed) + int(local_action_idx),
-                    negative_prompt=negative_prompt,
-                    num_steps=int(self.args.num_steps),
-                    fps=float(self.args.save_fps),
-                )
+                with _cosmos_log_context():
+                    video = self.video2world.generate_vid2world(
+                        prompt=prompt,
+                        input_path=vid_input,
+                        action=torch.from_numpy(actions_chunk).float(),
+                        guidance=int(self.args.guidance),
+                        num_video_frames=num_video_frames,
+                        num_latent_conditional_frames=int(self.args.num_latent_conditional_frames),
+                        resolution=str(self.args.resolution),
+                        seed=int(self.args.seed) + int(local_action_idx),
+                        negative_prompt=negative_prompt,
+                        num_steps=int(self.args.num_steps),
+                        fps=float(self.args.save_fps),
+                    )
                 video_normalized = (video + 1.0) / 2.0
                 video_clamped = (
                     (torch.clamp(video_normalized[0], 0, 1) * 255)
@@ -215,12 +375,14 @@ class CosmosActionConditionedRunner:
             "action_dim": int(actions.shape[1]),
             "fps_downsample_ratio": int(self.args.fps_downsample_ratio),
             "invert_gripper": bool(self.args.invert_gripper),
+            "quat_input_order": str(getattr(self.args, "quat_input_order", "xyzw")),
             "action_scaler": float(self.args.action_scaler),
             "action_stats_path": str(self.args.action_stats_path),
             "action_normalization_clip": _parse_optional_float(self.args.action_normalization_clip),
             "num_steps": int(self.args.num_steps),
             "guidance": int(self.args.guidance),
             "save_fps": int(self.args.save_fps),
+            "action_summary": self._action_summary(actions),
             "chunks": chunk_records,
         }
         if save_dir:
@@ -228,6 +390,9 @@ class CosmosActionConditionedRunner:
             video_path = os.path.join(save_dir, "outputs.mp4")
             mediapy.write_video(video_path, np.asarray(frames_out, dtype=np.uint8), fps=int(self.args.save_fps))
             cv2.imwrite(os.path.join(save_dir, "input_frame.png"), frames_out[0][:, :, ::-1])
+            np.save(os.path.join(save_dir, "actions.npy"), actions.astype(np.float32))
+            with open(os.path.join(save_dir, "action_summary.json"), "w", encoding="utf-8") as f:
+                json.dump(meta["action_summary"], f, indent=2, ensure_ascii=False)
             with open(os.path.join(save_dir, "cosmos_runtime_meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, ensure_ascii=False)
 
@@ -238,18 +403,27 @@ class CosmosActionConditionedRunner:
         response_npy = str(request["response_npy"])
         save_dir = request.get("save_dir")
 
-        payload = np.load(request_npz)
-        curr_image = np.asarray(payload["curr_image"], dtype=np.float32)
-        fk_poses = np.asarray(payload["fk_poses"], dtype=np.float32)
-        grippers = np.asarray(payload["grippers"], dtype=np.float32)
-        result = self._run_impl(curr_image, fk_poses, grippers, save_dir=save_dir)
-        out_img = result["out_img"]
-        np.save(response_npy, out_img)
-        return {
-            "ok": True,
-            "response_npy": response_npy,
-            "meta": result["meta"],
-        }
+        try:
+            with np.load(request_npz) as payload:
+                curr_image = np.asarray(payload["curr_image"], dtype=np.float32)
+                fk_poses = np.asarray(payload["fk_poses"], dtype=np.float32)
+                grippers = np.asarray(payload["grippers"], dtype=np.float32)
+            result = self._run_impl(curr_image, fk_poses, grippers, save_dir=save_dir)
+            out_img = result["out_img"]
+            np.save(response_npy, out_img)
+            return {
+                "ok": True,
+                "response_npy": response_npy,
+                "meta": result["meta"],
+            }
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
 
     def run_batch(
         self,
@@ -276,8 +450,21 @@ class CosmosActionConditionedRunner:
             dtype=np.float32,
         )
         grippers_np = np.asarray(grippers, dtype=np.float32)
-        result = self._run_impl(curr_image_np, fk_poses_np, grippers_np, save_dir=save_dir)
-        return torch.from_numpy(result["out_img"]).float()
+        try:
+            result = self._run_impl(curr_image_np, fk_poses_np, grippers_np, save_dir=save_dir)
+            return torch.from_numpy(result["out_img"]).float()
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
 
     def close(self) -> None:
         try:
@@ -307,6 +494,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--action_stats_path", type=str, default="")
     parser.add_argument("--action_normalization_clip", type=str, default="")
     parser.add_argument("--use_quat", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--quat_input_order", type=str, choices=["wxyz", "xyzw"], default="xyzw")
     parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--negative_prompt", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)

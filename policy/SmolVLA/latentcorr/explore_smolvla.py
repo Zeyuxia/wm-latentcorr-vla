@@ -320,7 +320,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
     parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
     parser.add_argument("--world_model_backend", type=str, choices=["evac", "cosmos"], default="evac")
-    parser.add_argument("--cosmos_execution_mode", type=str, choices=["worker", "direct"], default="worker")
+    parser.add_argument("--cosmos_execution_mode", type=str, choices=["worker", "direct"], default="direct")
     parser.add_argument("--cosmos_root", type=str, default="/data/zhenyangfan/cosmos-predict2.5")
     parser.add_argument("--cosmos_python_bin", type=str, default="/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")
     parser.add_argument("--cosmos_checkpoint_path", type=str, default="")
@@ -345,6 +345,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cosmos_action_stats_path", type=str, default="")
     parser.add_argument("--cosmos_action_normalization_clip", type=str, default="")
     parser.add_argument("--cosmos_use_quat", type=str2bool, default=False)
+    parser.add_argument("--cosmos_quat_input_order", type=str, choices=["wxyz", "xyzw"], default="xyzw")
     parser.add_argument("--cosmos_prompt", type=str, default="")
     parser.add_argument("--cosmos_negative_prompt", type=str, default="")
     parser.add_argument("--cosmos_seed", type=int, default=0)
@@ -357,6 +358,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--world_model_compare_sim_autorun", type=str2bool, default=False)
     parser.add_argument("--world_model_compare_sim_timeout_s", type=float, default=600.0)
     parser.add_argument("--world_model_compare_cosmos_autorun", type=str2bool, default=False)
+    parser.add_argument(
+        "--debug_max_samples_per_rank",
+        type=int,
+        default=int(os.environ.get("EXPLORE_DEBUG_MAX_SAMPLES_PER_RANK", os.environ.get("EXPLORE_DEBUG_MAX_SAMPLES", "0"))),
+        help="Stop each rank after this many explore samples. 0 disables the debug limit.",
+    )
     parser.add_argument("--fail_fast_on_error", type=str2bool, default=False)
     return parser
 
@@ -386,18 +393,17 @@ def main() -> None:
         or "evac" in compare_backends
     )
     if need_cosmos_backend and not str(args.cosmos_cuda_visible_devices).strip():
-        local_cuda_index = 0
-        if str(args.device).startswith("cuda") and ":" in str(args.device):
-            try:
-                local_cuda_index = int(str(args.device).split(":", 1)[1])
-            except ValueError:
-                local_cuda_index = 0
+        local_cuda_index = int(getattr(args, "rank", 0) or 0)
+        if local_cuda_index < 0:
+            local_cuda_index = 0
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         visible_ids = [item.strip() for item in visible.split(",") if item.strip()]
         args.cosmos_cuda_visible_devices = (
             visible_ids[local_cuda_index] if 0 <= local_cuda_index < len(visible_ids) else str(local_cuda_index)
         )
     device_obj = torch.device(args.device)
+    if torch.cuda.is_available() and device_obj.type == "cuda":
+        torch.cuda.set_device(device_obj)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(int(args.seed))
@@ -532,6 +538,7 @@ def main() -> None:
     world_size = int(max(1, int(args.world_size)))
     failure_explore_k_global = int(max(1, int(args.failure_explore_k)))
     failure_explore_k_local = int(max(1, (failure_explore_k_global + world_size - 1) // world_size))
+    debug_max_samples_per_rank = int(max(0, int(args.debug_max_samples_per_rank)))
 
     task_run_stats: dict[str, dict] = {}
     task_order: list[str] = []
@@ -880,6 +887,10 @@ def main() -> None:
             if completed_units >= int(ctx["total_units"]):
                 ctx["local_task_done"] = True
             overall_current_samples_local, overall_completed_units_local = _compute_local_task_progress()
+            if debug_max_samples_per_rank > 0 and int(overall_current_samples_local) >= debug_max_samples_per_rank:
+                for stop_ctx in task_contexts:
+                    stop_ctx["local_task_done"] = True
+                overall_current_samples_local, overall_completed_units_local = _compute_local_task_progress()
             local_all_done = bool(all(bool(item["local_task_done"]) for item in task_contexts))
             explore_progress = sync_all_explore_status(
                 local_current_samples=int(overall_current_samples_local),
