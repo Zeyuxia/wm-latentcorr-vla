@@ -164,6 +164,39 @@ class ActionConditionedPredictor(nn.Module):
         return z
 
 
+class FutureTokenPredictor(nn.Module):
+    """
+    Predict the deployable future condition token directly from current observation features.
+
+    Input:
+    - pooled current latent from projector
+    - current normalized qpos
+
+    Output:
+    - token in ACT hidden space, ready to be consumed by ACT as external_latent_input
+    """
+
+    def __init__(self, latent_channels: int, state_dim: int, hidden_dim: int, token_dim: int):
+        super().__init__()
+        in_dim = int(latent_channels) + int(state_dim)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, token_dim),
+        )
+
+    def forward(self, z_t: torch.Tensor, qpos_t: torch.Tensor) -> torch.Tensor:
+        if z_t.ndim != 4:
+            raise ValueError(f"z_t must be (B, C, H, W), got {z_t.shape}")
+        if qpos_t.ndim != 2:
+            raise ValueError(f"qpos_t must be (B, A), got {qpos_t.shape}")
+        pooled = F.adaptive_avg_pool2d(z_t, output_size=1).flatten(1)
+        x = torch.cat([pooled, qpos_t], dim=1)
+        return self.net(x)
+
+
 class LatentActionDecoder(nn.Module):
     """
     Decode latent map to action prefix chunk.

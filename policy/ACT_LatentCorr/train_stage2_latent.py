@@ -346,13 +346,257 @@ def _set_explore_local_k_for_loader(loader, k_local: int) -> None:
             leaf.set_explore_local_k(int(k_local))
 
 
-def _record_explore_trial_for_loader(loader, unit_idx: int, episode_id: int, start_ts: int) -> None:
+def _record_explore_trial_for_loader(
+    loader,
+    unit_idx: int,
+    episode_id: int,
+    start_ts: int,
+    task_name: str | None = None,
+) -> int:
     if loader is None:
-        return
+        return 0
+    ds = getattr(loader, "dataset", None)
+    leaves = list(_iter_leaf_datasets(ds))
+    if not leaves:
+        return 0
+    target_task = str(task_name or "").strip()
+    applied = 0
+    if target_task != "":
+        for leaf in leaves:
+            leaf_task = str(getattr(leaf, "_task_name", "")).strip()
+            if leaf_task != target_task:
+                continue
+            if hasattr(leaf, "record_explore_trial") and bool(
+                leaf.record_explore_trial(int(unit_idx), int(episode_id), int(start_ts))
+            ):
+                applied += 1
+            break
+        return int(applied)
+    if len(leaves) == 1:
+        leaf = leaves[0]
+        if hasattr(leaf, "record_explore_trial") and bool(
+            leaf.record_explore_trial(int(unit_idx), int(episode_id), int(start_ts))
+        ):
+            applied += 1
+    return int(applied)
+
+
+def _restore_explore_trials_for_loader(loader, trials: list[dict], single_task_name: str | None = None) -> dict[str, int]:
+    stats = {
+        "trial_count": int(len(trials)),
+        "restored": 0,
+        "applied": 0,
+        "completed_units": 0,
+        "current_trial_count_sum": 0,
+        "skipped_missing_task": 0,
+        "skipped_missing_unit": 0,
+        "skipped_invalid_unit": 0,
+        "dataset_count": 0,
+    }
+    if loader is None:
+        return stats
+    ds = getattr(loader, "dataset", None)
+    leaves = list(_iter_leaf_datasets(ds))
+    stats["dataset_count"] = int(len(leaves))
+    if not leaves:
+        return stats
+    leaf_by_task: dict[str, Any] = {}
+    for leaf in leaves:
+        leaf_task = str(getattr(leaf, "_task_name", "")).strip()
+        if leaf_task == "" and len(leaves) == 1 and single_task_name:
+            leaf_task = str(single_task_name)
+        if leaf_task != "":
+            leaf_by_task[leaf_task] = leaf
+        if hasattr(leaf, "set_explore_unit_idx"):
+            leaf.set_explore_unit_idx(0)
+    for trial in list(trials or []):
+        if not isinstance(trial, dict):
+            continue
+        task_name = str(trial.get("task_name", "")).strip()
+        if task_name == "":
+            if len(leaves) == 1 and single_task_name:
+                task_name = str(single_task_name)
+            else:
+                matched_tasks = []
+                for leaf_task, leaf in leaf_by_task.items():
+                    can_restore = getattr(leaf, "can_restore_explore_trial", None)
+                    if callable(can_restore) and bool(can_restore(trial)):
+                        matched_tasks.append(leaf_task)
+                if len(matched_tasks) == 1:
+                    task_name = str(matched_tasks[0])
+                else:
+                    stats["skipped_missing_task"] += 1
+                    continue
+        leaf = leaf_by_task.get(task_name)
+        if leaf is None:
+            stats["skipped_missing_task"] += 1
+            continue
+        try:
+            episode_id = int(trial["episode_id"])
+            start_ts = int(trial["start_ts"])
+        except Exception:
+            stats["skipped_invalid_unit"] += 1
+            continue
+        if "sampled_explore_unit_idx" in trial:
+            try:
+                unit_idx = int(trial["sampled_explore_unit_idx"])
+            except Exception:
+                stats["skipped_invalid_unit"] += 1
+                continue
+        else:
+            infer_fn = getattr(leaf, "_infer_explore_unit_idx_from_trial", None)
+            if not callable(infer_fn):
+                stats["skipped_missing_unit"] += 1
+                continue
+            inferred = infer_fn(trial)
+            if inferred is None:
+                stats["skipped_missing_unit"] += 1
+                continue
+            unit_idx = int(inferred)
+        can_restore = getattr(leaf, "can_restore_explore_trial", None)
+        if callable(can_restore) and (not bool(can_restore(trial))):
+            stats["skipped_invalid_unit"] += 1
+            continue
+        stats["restored"] += 1
+        stats["applied"] += int(
+            _record_explore_trial_for_loader(
+                loader,
+                int(unit_idx),
+                int(episode_id),
+                int(start_ts),
+                task_name=task_name,
+            )
+        )
+    for leaf in leaves:
+        stats["completed_units"] += int(getattr(leaf, "_explore_completed_unit_count", 0))
+        stats["current_trial_count_sum"] += int(getattr(leaf, "_explore_trial_count_local", 0))
+    return stats
+
+
+def _collect_explore_state_for_loader(loader) -> dict:
+    payload = {"version": 1, "leaves": []}
+    if loader is None:
+        return payload
     ds = getattr(loader, "dataset", None)
     for leaf in _iter_leaf_datasets(ds):
-        if hasattr(leaf, "record_explore_trial"):
-            leaf.record_explore_trial(int(unit_idx), int(episode_id), int(start_ts))
+        export_fn = getattr(leaf, "export_explore_state", None)
+        if callable(export_fn):
+            try:
+                state = export_fn()
+            except Exception:
+                continue
+            if isinstance(state, dict):
+                payload["leaves"].append(state)
+    return payload
+
+
+def _load_explore_live_state(failure_table_dir: str, rank: int) -> dict:
+    rank_suffix = f"_rank{int(rank):02d}"
+    state_path = os.path.join(failure_table_dir, f"failure_state_live{rank_suffix}.json")
+    if not os.path.isfile(state_path):
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _restore_explore_state_for_loader(loader, payload: dict, single_task_name: str | None = None) -> dict[str, int]:
+    stats = {
+        "dataset_count": 0,
+        "matched_datasets": 0,
+        "applied_datasets": 0,
+        "completed_units": 0,
+        "current_trial_count_sum": 0,
+    }
+    if loader is None or not isinstance(payload, dict):
+        return stats
+    leaves_payload = list(payload.get("leaves", []))
+    if not leaves_payload:
+        return stats
+    ds = getattr(loader, "dataset", None)
+    leaves = list(_iter_leaf_datasets(ds))
+    stats["dataset_count"] = int(len(leaves))
+    if not leaves:
+        return stats
+    leaf_map: dict[tuple[str, str], object] = {}
+    fallback_leaf = leaves[0] if len(leaves) == 1 else None
+    for leaf in leaves:
+        leaf_task = str(getattr(leaf, "_task_name", "")).strip()
+        if leaf_task == "" and fallback_leaf is not None and single_task_name:
+            leaf_task = str(single_task_name)
+        leaf_dir = str(getattr(leaf, "dataset_dir", "")).strip()
+        leaf_map[(leaf_task, leaf_dir)] = leaf
+        if leaf_task != "":
+            leaf_map[(leaf_task, "")] = leaf
+    for state in leaves_payload:
+        if not isinstance(state, dict):
+            continue
+        state_task = str(state.get("task_name", "")).strip()
+        state_dir = str(state.get("dataset_dir", "")).strip()
+        leaf = leaf_map.get((state_task, state_dir)) or leaf_map.get((state_task, ""))
+        if leaf is None and fallback_leaf is not None:
+            leaf = fallback_leaf
+        if leaf is None:
+            continue
+        stats["matched_datasets"] += 1
+        restore_fn = getattr(leaf, "restore_explore_state", None)
+        if not callable(restore_fn):
+            continue
+        try:
+            leaf_stats = restore_fn(state)
+        except Exception:
+            continue
+        if bool(leaf_stats.get("applied", False)):
+            stats["applied_datasets"] += 1
+            stats["completed_units"] += int(leaf_stats.get("completed_units", 0))
+            stats["current_trial_count_sum"] += int(leaf_stats.get("current_trial_count", 0))
+    return stats
+
+
+def _load_explore_live_trials(failure_table_dir: str, rank: int) -> list[dict]:
+    rank_suffix = f"_rank{int(rank):02d}"
+    trials_path = os.path.join(failure_table_dir, f"failure_trials_live{rank_suffix}.json")
+    if not os.path.isfile(trials_path):
+        return []
+    try:
+        with open(trials_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+    return list(payload) if isinstance(payload, list) else []
+
+
+def _rebuild_failure_stats_from_trials(trials: list[dict]) -> dict[tuple, dict]:
+    failure_stats: dict[tuple, dict] = {}
+    for trial in list(trials or []):
+        if not isinstance(trial, dict):
+            continue
+        try:
+            key = (
+                str(trial.get("task_name", "")).strip(),
+                str(trial["phase_key"]),
+                int(trial["phase_instance_idx"]),
+                int(trial["phase_bin_id"]),
+                str(trial["error_mode"]),
+                str(trial.get("active_arm_pattern", "both")),
+                int(trial["dir_bin_id"]),
+                int(trial["mag_bin_id"]),
+            )
+            sample_uid = (int(trial["episode_id"]), int(trial["start_ts"]))
+            recoverable = bool(trial.get("recoverable", False))
+        except Exception:
+            continue
+        if key not in failure_stats:
+            failure_stats[key] = {"n": 0, "n_recover": 0, "seen_samples": set()}
+        if sample_uid in failure_stats[key]["seen_samples"]:
+            continue
+        failure_stats[key]["seen_samples"].add(sample_uid)
+        failure_stats[key]["n"] += 1
+        failure_stats[key]["n_recover"] += int(recoverable)
+    return failure_stats
 
 
 def _get_explore_num_units(loader) -> int:
@@ -1027,6 +1271,9 @@ def main():
         trials_path = os.path.join(failure_table_dir, f"failure_trials_live{rank_suffix}.json")
         with open(trials_path, "w", encoding="utf-8") as f:
             json.dump(list(failure_trials), f, indent=2, ensure_ascii=False)
+        state_path = os.path.join(failure_table_dir, f"failure_state_live{rank_suffix}.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(_collect_explore_state_for_loader(explore_dataloader), f, indent=2, ensure_ascii=False)
         meta = {
             "version": 1,
             "mode": "explore_meta_live",
@@ -1065,6 +1312,57 @@ def main():
             if explore_num_units > 0:
                 _set_explore_unit_idx_for_loader(explore_dataloader, 0)
                 _set_explore_local_k_for_loader(explore_dataloader, failure_explore_k_local)
+            failure_trials = _load_explore_live_trials(failure_table_dir, rank)
+            failure_stats = _rebuild_failure_stats_from_trials(failure_trials)
+            exact_state_payload = _load_explore_live_state(failure_table_dir, rank)
+            exact_state_stats = _restore_explore_state_for_loader(
+                explore_dataloader,
+                exact_state_payload,
+                single_task_name=args.task_name if not is_multitask else None,
+            )
+            resume_source = "state"
+            restored_stats = None
+            if int(exact_state_stats["applied_datasets"]) <= 0:
+                resume_source = "trials"
+                restored_stats = _restore_explore_trials_for_loader(
+                    explore_dataloader,
+                    failure_trials,
+                    single_task_name=args.task_name if not is_multitask else None,
+                )
+            if failure_trials:
+                if resume_source == "state":
+                    print(
+                        "[stage2] explore live resume "
+                        f"rank={int(rank)} source=state "
+                        f"matched_datasets={int(exact_state_stats['matched_datasets'])}/{int(exact_state_stats['dataset_count'])} "
+                        f"applied_datasets={int(exact_state_stats['applied_datasets'])} "
+                        f"completed_units={int(exact_state_stats['completed_units'])} "
+                        f"current_trial_count_sum={int(exact_state_stats['current_trial_count_sum'])}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[stage2] explore live resume "
+                        f"rank={int(rank)} source=trials "
+                        f"restored={int(restored_stats['restored'])}/{len(failure_trials)} "
+                        f"applied={int(restored_stats['applied'])} "
+                        f"completed_units={int(restored_stats['completed_units'])} "
+                        f"datasets={int(restored_stats['dataset_count'])} "
+                        f"skipped_missing_task={int(restored_stats['skipped_missing_task'])} "
+                        f"skipped_missing_unit={int(restored_stats['skipped_missing_unit'])} "
+                        f"skipped_invalid_unit={int(restored_stats['skipped_invalid_unit'])}",
+                        flush=True,
+                    )
+                    if is_multitask and (
+                        int(restored_stats["skipped_missing_task"]) > 0
+                        or int(restored_stats["skipped_missing_unit"]) > 0
+                    ):
+                        print(
+                            "[stage2] warning: multitask explore live trials are missing task_name and/or "
+                            "sampled_explore_unit_idx; exact resume is only guaranteed for runs written by "
+                            "the newer code.",
+                            flush=True,
+                        )
             init_unit_idx = _get_current_explore_unit_idx(explore_dataloader)
             init_trial_count = _get_current_explore_trial_count(explore_dataloader)
             init_completed_units = int(_get_explore_completed_unit_count(explore_dataloader))
@@ -1212,6 +1510,7 @@ def main():
                         trial = {
                             "epoch": int(epoch),
                             "global_step": int(global_step),
+                            "task_name": str(task_i),
                             "episode_id": int(ep_id),
                             "start_ts": int(start_ts_list[i]),
                             "phase_key": str(phase_key),
@@ -1221,13 +1520,24 @@ def main():
                             "active_arm_pattern": str(active_pattern_key),
                             "dir_bin_id": int(forced_dir_bin_ids[i]),
                             "mag_bin_id": int(forced_mag_bin_ids[i]),
+                            "sampled_explore_unit_idx": int(sample_unit_idx),
                             "recoverable": bool(recoverable),
                             "recover_eval_mode": recover_eval_last.get("mode"),
                             "recover_eval_metric_name": recover_eval_last.get("metric_name"),
                             "recover_eval_metric": recover_eval_last.get("metric"),
                             "recover_eval_threshold": recover_eval_last.get("threshold"),
                         }
+                        applied_trial = _record_explore_trial_for_loader(
+                            explore_dataloader,
+                            sample_unit_idx,
+                            int(ep_id),
+                            int(start_ts_list[i]),
+                            task_name=task_i,
+                        )
+                        if int(applied_trial) <= 0:
+                            continue
                         key = (
+                            str(task_i),
                             str(trial["phase_key"]),
                             int(trial["phase_instance_idx"]),
                             int(trial["phase_bin_id"]),
@@ -1245,12 +1555,6 @@ def main():
                         failure_stats[key]["n"] += 1
                         failure_stats[key]["n_recover"] += int(recoverable)
                         failure_trials.append(trial)
-                        _record_explore_trial_for_loader(
-                            explore_dataloader,
-                            sample_unit_idx,
-                            int(ep_id),
-                            int(start_ts_list[i]),
-                        )
 
                     curr_unit_idx = _get_current_explore_unit_idx(explore_dataloader)
                     curr_trial_count = _get_current_explore_trial_count(explore_dataloader)

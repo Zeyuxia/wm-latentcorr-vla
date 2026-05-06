@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -56,14 +57,77 @@ EXPLORE_ERROR_MODE_SORT_KEYS = {
 }
 
 
+def _normalize_quality_value(value) -> bool:
+    return str(value).strip().lower() in {"y", "yes", "true", "1", "ok", "good"}
+
+
+def _parse_markdown_quality_record(path: str, backend: str) -> dict[tuple[str, str, str], bool]:
+    source_path = Path(path).resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"world-model quality record not found: {source_path}")
+    backend = str(backend).strip().lower()
+    quality_col = f"{backend}_quality"
+    records: dict[tuple[str, str, str], bool] = {}
+    header: list[str] | None = None
+    with source_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line.startswith("|") or not line.endswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not cells:
+                continue
+            lowered = [cell.lower() for cell in cells]
+            if lowered == ["---"] * len(lowered) or all(set(cell) <= {"-", ":"} for cell in lowered):
+                continue
+            if {"task", "phase", "error_mode"}.issubset(set(lowered)):
+                header = lowered
+                continue
+            if header is None:
+                continue
+            if len(cells) != len(header):
+                continue
+            row = {header[idx]: cells[idx].strip() for idx in range(len(header))}
+            if quality_col not in row:
+                continue
+            task = str(row.get("task", "")).strip().lower()
+            phase = str(row.get("phase", "")).strip().lower()
+            error_mode = str(row.get("error_mode", "")).strip().lower()
+            if not task or not phase or not error_mode:
+                continue
+            records[(task, phase, error_mode)] = _normalize_quality_value(row.get(quality_col))
+    if not records:
+        raise ValueError(f"No usable rows for {quality_col!r} in world-model quality record: {source_path}")
+    return records
+
+
+def _infer_task_key_from_paths(dataset_dir: str, raw_data_dir: str | None) -> str:
+    candidates: list[str] = []
+    for value in (raw_data_dir, dataset_dir):
+        if not value:
+            continue
+        path = Path(str(value))
+        candidates.extend([part.lower() for part in path.parts])
+        candidates.append(path.name.lower())
+    known_tasks = (
+        "open_laptop",
+        "pick_dual_bottles",
+        "put_bottles_dustbin",
+        "place_burger_fries",
+        "handover_block",
+    )
+    for task in known_tasks:
+        if any(task == item or task in item for item in candidates):
+            return task
+    return ""
+
+
 def _phase_allows_explore_error_mode(phase_key: str, error_mode: str) -> bool:
     phase_key = str(phase_key).strip().lower()
     error_mode = str(error_mode).strip().lower()
-    if phase_key in {"pregrasp", "approach"}:
-        return error_mode in {"translation", "rotation", "gripper_close"}
     if phase_key in {"transport", "place"}:
         return error_mode in {"translation", "rotation"}
-    return False
+    return error_mode in {"translation", "rotation", "gripper_close"}
 
 
 def _safe_float_or_nan(value) -> float:
@@ -75,22 +139,46 @@ def _safe_float_or_nan(value) -> float:
         return float("nan")
 
 
-def _phase_unit_sort_key(unit: dict) -> tuple[int, int, int, int]:
+def _phase_unit_sort_key(
+    unit: dict,
+    *,
+    phase_sort_keys: dict[str, int] | None = None,
+) -> tuple[int, int, int, int]:
+    phase_sort_keys = EXPLORE_PHASE_SORT_KEYS if phase_sort_keys is None else phase_sort_keys
+    phase_key = str(unit["phase_key"])
+    phase_rank = phase_sort_keys.get(phase_key)
+    if phase_rank is None:
+        phase_rank = int(phase_key_to_id(phase_key))
     return (
-        int(EXPLORE_PHASE_SORT_KEYS.get(str(unit["phase_key"]), int(phase_key_to_id(str(unit["phase_key"]))))),
+        int(phase_rank),
         int(unit["phase_instance_idx"]),
         int(unit["phase_bin_id"]),
         int(EXPLORE_ACTIVE_ARM_PATTERN_SORT_KEYS.get(str(unit["active_arm_pattern"]), 999)),
     )
 
 
-def _explore_unit_sort_key(unit: dict) -> tuple[int, int, int, int, int, int, int]:
+def _explore_unit_sort_key(
+    unit: dict,
+    *,
+    phase_sort_keys: dict[str, int] | None = None,
+    error_mode_sort_keys: dict[str, int] | None = None,
+) -> tuple[int, int, int, int, int, int, int]:
+    phase_sort_keys = EXPLORE_PHASE_SORT_KEYS if phase_sort_keys is None else phase_sort_keys
+    error_mode_sort_keys = EXPLORE_ERROR_MODE_SORT_KEYS if error_mode_sort_keys is None else error_mode_sort_keys
+    phase_key = str(unit["phase_key"])
+    mode_key = str(unit["error_mode"])
+    phase_rank = phase_sort_keys.get(phase_key)
+    if phase_rank is None:
+        phase_rank = int(phase_key_to_id(phase_key))
+    mode_rank = error_mode_sort_keys.get(mode_key)
+    if mode_rank is None:
+        mode_rank = int(error_mode_key_to_id(mode_key))
     return (
-        int(EXPLORE_PHASE_SORT_KEYS.get(str(unit["phase_key"]), int(phase_key_to_id(str(unit["phase_key"]))))),
+        int(phase_rank),
+        int(mode_rank),
         int(unit["phase_instance_idx"]),
         int(unit["phase_bin_id"]),
         int(EXPLORE_ACTIVE_ARM_PATTERN_SORT_KEYS.get(str(unit["active_arm_pattern"]), 999)),
-        int(EXPLORE_ERROR_MODE_SORT_KEYS.get(str(unit["error_mode"]), int(error_mode_key_to_id(str(unit["error_mode"]))))),
         int(unit["dir_bin_id"]),
         int(unit["mag_bin_id"]),
     )
@@ -124,6 +212,8 @@ class FailureAwareStage2Dataset(Dataset):
         explore_error_modes: list[str] | None = None,
         explore_disable_phase_bin_skip: bool = False,
         explore_skip_open_laptop_transport: bool = False,
+        world_model_quality_record: str = "",
+        world_model_quality_backend: str = "evac",
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -145,10 +235,25 @@ class FailureAwareStage2Dataset(Dataset):
         self.perturb_eef_fail_gain = float(perturb_eef_fail_gain)
         self.perturb_rot_max_deg = float(perturb_rot_max_deg)
         self.evac_sample_size = None if evac_sample_size is None else (int(evac_sample_size[0]), int(evac_sample_size[1]))
-        self.explore_phase_keys = None if not explore_phase_keys else {str(x).strip().lower() for x in explore_phase_keys if str(x).strip()}
-        self.explore_error_modes = None if not explore_error_modes else {str(x).strip().lower() for x in explore_error_modes if str(x).strip()}
+        self.explore_phase_key_order = (
+            None if not explore_phase_keys else [str(x).strip().lower() for x in explore_phase_keys if str(x).strip()]
+        )
+        self.explore_error_mode_order = (
+            None if not explore_error_modes else [str(x).strip().lower() for x in explore_error_modes if str(x).strip()]
+        )
+        self.explore_phase_keys = None if self.explore_phase_key_order is None else set(self.explore_phase_key_order)
+        self.explore_error_modes = None if self.explore_error_mode_order is None else set(self.explore_error_mode_order)
         self.explore_disable_phase_bin_skip = bool(explore_disable_phase_bin_skip)
         self.explore_skip_open_laptop_transport = bool(explore_skip_open_laptop_transport)
+        self.world_model_quality_record = str(world_model_quality_record or "").strip()
+        self.world_model_quality_backend = str(world_model_quality_backend or "evac").strip().lower()
+        self.task_key = _infer_task_key_from_paths(self.dataset_dir, self.raw_data_dir)
+        self._world_model_quality_allow: dict[tuple[str, str, str], bool] | None = None
+        if self.world_model_quality_record:
+            self._world_model_quality_allow = _parse_markdown_quality_record(
+                self.world_model_quality_record,
+                self.world_model_quality_backend,
+            )
         set_failure_param_bins(
             translation_dir_bins=failure_translation_dir_bins,
             translation_mag_bins=failure_translation_mag_bins,
@@ -188,6 +293,16 @@ class FailureAwareStage2Dataset(Dataset):
         if phase_key in {"pregrasp", "place"}:
             return phase_bin_id == int(self.failure_phase_bins) - 1
         return False
+
+    def _world_model_quality_allows_unit(self, unit: dict) -> bool:
+        if not self._world_model_quality_allow:
+            return True
+        task = str(self.task_key).strip().lower()
+        phase = str(unit.get("phase_key", "")).strip().lower()
+        mode = str(unit.get("error_mode", "")).strip().lower()
+        if not task:
+            return False
+        return bool(self._world_model_quality_allow.get((task, phase, mode), False))
 
     def _resolve_start_bounds(self, episode_id: int) -> tuple[int, int] | None:
         max_start = self._resolve_max_start(int(episode_id))
@@ -313,10 +428,15 @@ class FailureAwareStage2Dataset(Dataset):
             "perturb_eef_fail_gain": float(self.perturb_eef_fail_gain),
             "perturb_rot_max_deg": float(self.perturb_rot_max_deg),
             "evac_sample_size": None if self.evac_sample_size is None else list(self.evac_sample_size),
-            "explore_phase_keys": None if self.explore_phase_keys is None else sorted(self.explore_phase_keys),
-            "explore_error_modes": None if self.explore_error_modes is None else sorted(self.explore_error_modes),
+            "explore_phase_keys": self.explore_phase_key_order,
+            "explore_error_modes": self.explore_error_mode_order,
             "explore_disable_phase_bin_skip": bool(self.explore_disable_phase_bin_skip),
             "explore_skip_open_laptop_transport": bool(self.explore_skip_open_laptop_transport),
+            "world_model_quality_record": (
+                "" if not self.world_model_quality_record else self._file_signature(self.world_model_quality_record)
+            ),
+            "world_model_quality_backend": str(self.world_model_quality_backend),
+            "task_key": str(self.task_key),
         }
 
     def _explore_cache_path_and_key(self) -> tuple[str, dict]:
@@ -384,15 +504,25 @@ class FailureAwareStage2Dataset(Dataset):
             rot_dir_bins = int(bin_cfg["rotation_dir_bins"])
             rot_mag_bins = int(bin_cfg["rotation_mag_bins"])
             def add_if_valid(unit: dict) -> None:
+                if not self._world_model_quality_allows_unit(unit):
+                    return
                 if self._unit_has_local_candidate(unit):
                     units.append(unit)
+
+            phase_sort_keys = (
+                EXPLORE_PHASE_SORT_KEYS
+                if self.explore_phase_key_order is None
+                else {key: idx for idx, key in enumerate(self.explore_phase_key_order)}
+            )
+            error_mode_order = self.explore_error_mode_order or list(FAILURE_ERROR_MODES)
+            error_mode_sort_keys = {key: idx for idx, key in enumerate(error_mode_order)}
 
             for phase_unit in phase_units:
                 phase_key = str(phase_unit["phase_key"])
                 phase_instance_idx = int(phase_unit["phase_instance_idx"])
                 phase_bin_id = int(phase_unit["phase_bin_id"])
                 active_arm_pattern = str(phase_unit["active_arm_pattern"])
-                for mode in FAILURE_ERROR_MODES:
+                for mode in error_mode_order:
                     if self.explore_error_modes is not None and str(mode).strip().lower() not in self.explore_error_modes:
                         continue
                     if not _phase_allows_explore_error_mode(phase_key, mode):
@@ -440,7 +570,14 @@ class FailureAwareStage2Dataset(Dataset):
                                 "weight": 1.0,
                             }
                         )
-            self._explore_units = sorted(units, key=_explore_unit_sort_key)
+            self._explore_units = sorted(
+                units,
+                key=lambda unit: _explore_unit_sort_key(
+                    unit,
+                    phase_sort_keys=phase_sort_keys,
+                    error_mode_sort_keys=error_mode_sort_keys,
+                ),
+            )
             self._rebuild_explore_unit_targets()
             self._save_explore_unit_cache()
             return
@@ -556,6 +693,8 @@ class FailureAwareStage2Dataset(Dataset):
                     continue
                 phase_instance_idx = int(meta["phase_instance_idx"])
                 phase_bin_id = int(meta["phase_bin_id"])
+                if self._is_open_laptop_dataset() and phase_key in {"transport", "place"}:
+                    continue
                 raw_active_arm_pattern = str(meta.get("active_arm_pattern", "both")).strip().lower()
                 try:
                     active_arm_pattern = canonicalize_active_arm_pattern_key(raw_active_arm_pattern)
@@ -586,7 +725,12 @@ class FailureAwareStage2Dataset(Dataset):
                             "active_arm_pattern": expanded_pattern,
                         }
                     )
-        return sorted(units, key=_phase_unit_sort_key)
+        phase_sort_keys = (
+            EXPLORE_PHASE_SORT_KEYS
+            if self.explore_phase_key_order is None
+            else {key: idx for idx, key in enumerate(self.explore_phase_key_order)}
+        )
+        return sorted(units, key=lambda unit: _phase_unit_sort_key(unit, phase_sort_keys=phase_sort_keys))
 
     def _get_episode_len(self, episode_id: int) -> int:
         episode_id = int(episode_id)
@@ -1202,6 +1346,8 @@ def build_failure_table_dataset(
     explore_error_modes: list[str] | None = None,
     explore_disable_phase_bin_skip: bool = False,
     explore_skip_open_laptop_transport: bool = False,
+    world_model_quality_record: str = "",
+    world_model_quality_backend: str = "evac",
 ) -> tuple[FailureAwareStage2Dataset, dict[str, np.ndarray]]:
     stats = get_norm_stats(dataset_dir, num_episodes)
     valid_ids = list_valid_episode_ids(dataset_dir, num_episodes, future_offset)
@@ -1231,5 +1377,7 @@ def build_failure_table_dataset(
         explore_error_modes=explore_error_modes,
         explore_disable_phase_bin_skip=explore_disable_phase_bin_skip,
         explore_skip_open_laptop_transport=explore_skip_open_laptop_transport,
+        world_model_quality_record=world_model_quality_record,
+        world_model_quality_backend=world_model_quality_backend,
     )
     return dataset, stats

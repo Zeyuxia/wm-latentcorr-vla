@@ -66,6 +66,8 @@ def generate_offline_failure_tables(
     failure_rotation_mag_bins: int,
     perturb_eef_fail_gain: float,
     perturb_rot_max_deg: float,
+    world_model_quality_record: str = "",
+    world_model_quality_backend: str = "evac",
 ) -> str:
     out_root = Path(output_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -99,6 +101,8 @@ def generate_offline_failure_tables(
             perturb_eef_fail_gain=float(perturb_eef_fail_gain),
             perturb_rot_max_deg=float(perturb_rot_max_deg),
             evac_sample_size=evac_sample_size,
+            world_model_quality_record=str(world_model_quality_record),
+            world_model_quality_backend=str(world_model_quality_backend),
         )
         entries = _serialize_entries(list(dataset._explore_units))
         task_dir = out_root / _task_dir_name(spec.task_name)
@@ -170,6 +174,8 @@ def main() -> None:
     parser.add_argument("--failure_rotation_mag_bins", type=int, default=1)
     parser.add_argument("--perturb_eef_fail_gain", type=float, default=0.05)
     parser.add_argument("--perturb_rot_max_deg", type=float, default=10.0)
+    parser.add_argument("--world_model_quality_record", type=str, default="")
+    parser.add_argument("--world_model_quality_backend", type=str, default="evac")
     args = parser.parse_args()
 
     manifest_path = generate_offline_failure_tables(
@@ -188,6 +194,8 @@ def main() -> None:
         failure_rotation_mag_bins=int(args.failure_rotation_mag_bins),
         perturb_eef_fail_gain=float(args.perturb_eef_fail_gain),
         perturb_rot_max_deg=float(args.perturb_rot_max_deg),
+        world_model_quality_record=str(args.world_model_quality_record),
+        world_model_quality_backend=str(args.world_model_quality_backend),
     )
     print(f"multitask_failure_manifest={manifest_path}", flush=True)
 

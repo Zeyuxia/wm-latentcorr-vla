@@ -56,6 +56,7 @@ class FailureAwareStage2Dataset(Dataset):
         failure_rotation_dir_bins: int = 6,
         failure_rotation_mag_bins: int = 3,
         failure_explore_k: int = 1,
+        task_name: str = "",
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -74,6 +75,7 @@ class FailureAwareStage2Dataset(Dataset):
         if self.failure_mode not in {"off", "train", "explore"}:
             raise ValueError(f"Invalid failure_mode={failure_mode!r}, expected off|train|explore")
         self.failure_table_path = str(failure_table_path).strip()
+        self._task_name = str(task_name).strip()
         self.failure_phase_bins = int(max(1, failure_phase_bins))
         self.failure_explore_k = int(max(1, failure_explore_k))
         self.failure_skip_approach_bins = 0
@@ -207,6 +209,7 @@ class FailureAwareStage2Dataset(Dataset):
                 )
                 parsed.append(
                     {
+                        "task_name": str(item.get("task_name", "")).strip(),
                         "phase_key": phase_key,
                         "phase_instance_idx": phase_instance_idx,
                         "phase_bin_id": phase_bin_id,
@@ -226,11 +229,43 @@ class FailureAwareStage2Dataset(Dataset):
         if not parsed:
             raise ValueError(f"No valid entries in failure_table: {path}")
 
-        self._failure_entries = parsed
+        has_task_scoped_entries = any(str(item.get("task_name", "")).strip() != "" for item in parsed)
+        if self._task_name and has_task_scoped_entries:
+            parsed = [item for item in parsed if str(item.get("task_name", "")).strip() == self._task_name]
+            if not parsed:
+                raise ValueError(
+                    f"No failure entries for task_name={self._task_name!r} remain in failure_table: {path}"
+                )
+        elif self._task_name and self.failure_mode == "train":
+            print(
+                f"[failure-dataset] warning: task_name={self._task_name} is using an unscoped failure table "
+                f"without task_name entries: {path}",
+                flush=True,
+            )
+
+        valid_parsed: list[dict] = []
+        dropped_invalid = 0
+        for item in parsed:
+            if self._unit_has_local_candidate(item):
+                valid_parsed.append(item)
+            else:
+                dropped_invalid += 1
+
+        if dropped_invalid > 0:
+            print(
+                f"[failure-dataset] pruned {dropped_invalid} invalid failure entries without local candidates "
+                f"for dataset={self.dataset_dir}",
+                flush=True,
+            )
+
+        if not valid_parsed:
+            raise ValueError(f"No valid local failure entries remain after pruning: {path}")
+
+        self._failure_entries = valid_parsed
         by_mode: dict[str, list[dict]] = {}
         mode_scores: list[tuple[str, float]] = []
         for mode in _FAILURE_ERROR_MODES:
-            mode_entries = [x for x in parsed if str(x.get("error_mode", "")) == mode]
+            mode_entries = [x for x in valid_parsed if str(x.get("error_mode", "")) == mode]
             if not mode_entries:
                 continue
             by_mode[mode] = mode_entries
@@ -433,6 +468,27 @@ class FailureAwareStage2Dataset(Dataset):
         self._phase_scan_cache[key] = info
         return info
 
+    def _unit_has_local_candidate(self, unit: dict) -> bool:
+        n_ep = len(self.episode_ids)
+        for ofs in range(n_ep):
+            ep = int(self.episode_ids[ofs])
+            max_start = self._resolve_max_start(ep)
+            min_start = 0 if self.failure_mode == "explore" else self._resolve_min_start(ep, max_start)
+            scan = self._scan_phase_bins(ep, min_start, max_start)
+            for _, meta in scan.items():
+                if str(meta["phase_key"]) != str(unit["phase_key"]):
+                    continue
+                target_phase_inst = unit.get("phase_instance_idx")
+                if target_phase_inst is not None and int(meta.get("phase_instance_idx", -1)) != int(target_phase_inst):
+                    continue
+                if int(meta["phase_bin_id"]) != int(unit["phase_bin_id"]):
+                    continue
+                target_pat = unit.get("active_arm_pattern")
+                if target_pat is not None and str(meta["active_arm_pattern"]) != str(target_pat):
+                    continue
+                return True
+        return False
+
     def _select_failure_unit(self) -> tuple[dict, int] | None:
         if self.failure_mode == "explore":
             if not self._explore_units:
@@ -520,6 +576,37 @@ class FailureAwareStage2Dataset(Dataset):
                 "sampled_entry_prob_within_mode": unit.get("sampled_entry_prob_within_mode", None),
                 "sampled_unit_prob": unit.get("sampled_unit_prob", None),
             }
+        if self.failure_mode == "train":
+            key_fields = (
+                "phase_key",
+                "phase_instance_idx",
+                "phase_bin_id",
+                "error_mode",
+                "active_arm_pattern",
+                "dir_bin_id",
+                "mag_bin_id",
+            )
+            self._failure_entries = [
+                x for x in self._failure_entries
+                if not all(x.get(k) == unit.get(k) for k in key_fields)
+            ]
+            mode = str(unit.get("error_mode", ""))
+            if mode in self._failure_entries_by_mode:
+                self._failure_entries_by_mode[mode] = [
+                    x for x in self._failure_entries_by_mode[mode]
+                    if not all(x.get(k) == unit.get(k) for k in key_fields)
+                ]
+                if not self._failure_entries_by_mode[mode]:
+                    self._failure_entries_by_mode.pop(mode, None)
+                    if self._failure_mode_probs is not None:
+                        self._failure_mode_probs.pop(mode, None)
+            if self._failure_entries:
+                print(
+                    "[failure-dataset] dropped runtime invalid failure unit without local candidate: "
+                    f"{unit} (dataset={self.dataset_dir})",
+                    flush=True,
+                )
+                return self._sample_start_ts_from_failure_unit(base_index)
         raise RuntimeError(
             "Failure unit has no local candidate: "
             f"{unit} (dataset={self.dataset_dir})"
@@ -565,20 +652,249 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_seen_samples = set()
         self._explore_completed_unit_count = 0
 
-    def record_explore_trial(self, unit_idx: int, episode_id: int, start_ts: int) -> None:
+    def _infer_explore_unit_idx_from_trial(self, trial: dict) -> int | None:
+        if self.failure_mode != "explore" or not self._explore_units or not isinstance(trial, dict):
+            return None
+        try:
+            phase_key = str(trial["phase_key"])
+            phase_instance_idx = int(trial["phase_instance_idx"])
+            phase_bin_id = int(trial["phase_bin_id"])
+            error_mode = str(trial["error_mode"])
+            active_arm_pattern = str(trial.get("active_arm_pattern", "both"))
+            dir_bin_id = int(trial.get("dir_bin_id", -1))
+            mag_bin_id = int(trial.get("mag_bin_id", -1))
+        except Exception:
+            return None
+        for unit_idx, unit in enumerate(self._explore_units):
+            if str(unit.get("phase_key")) != phase_key:
+                continue
+            if int(unit.get("phase_instance_idx", -1)) != phase_instance_idx:
+                continue
+            if int(unit.get("phase_bin_id", -1)) != phase_bin_id:
+                continue
+            if str(unit.get("error_mode", "")) != error_mode:
+                continue
+            unit_pat = unit.get("active_arm_pattern")
+            if unit_pat is not None and str(unit_pat) != active_arm_pattern:
+                continue
+            if int(unit.get("dir_bin_id", -1)) != dir_bin_id:
+                continue
+            if int(unit.get("mag_bin_id", -1)) != mag_bin_id:
+                continue
+            return int(unit_idx)
+        return None
+
+    def can_restore_explore_trial(self, trial: dict) -> bool:
+        if self.failure_mode != "explore" or not isinstance(trial, dict):
+            return False
+        try:
+            episode_id = int(trial["episode_id"])
+            start_ts = int(trial["start_ts"])
+            phase_key = str(trial["phase_key"])
+            phase_instance_idx = int(trial["phase_instance_idx"])
+            phase_bin_id = int(trial["phase_bin_id"])
+            active_arm_pattern = str(trial.get("active_arm_pattern", "both"))
+        except Exception:
+            return False
+        if episode_id not in self.episode_ids:
+            return False
+        max_start = self._resolve_max_start(episode_id)
+        min_start = 0 if self.failure_mode == "explore" else self._resolve_min_start(episode_id, max_start)
+        scan = self._scan_phase_bins(episode_id, min_start, max_start)
+        meta = scan.get(start_ts)
+        if not isinstance(meta, dict):
+            return False
+        if str(meta.get("phase_key", "")) != phase_key:
+            return False
+        if int(meta.get("phase_instance_idx", -1)) != phase_instance_idx:
+            return False
+        if int(meta.get("phase_bin_id", -1)) != phase_bin_id:
+            return False
+        if str(meta.get("active_arm_pattern", "")) != active_arm_pattern:
+            return False
+        return self._infer_explore_unit_idx_from_trial(trial) is not None
+
+    def restore_explore_trials(self, trials: list[dict] | None) -> dict[str, int]:
+        self._explore_curr_unit_idx = 0
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+        self._explore_completed_unit_count = 0
+        stats = {
+            "restored": 0,
+            "applied": 0,
+            "completed_units": 0,
+            "current_unit_idx": 0,
+            "current_trial_count": 0,
+            "skipped_missing_unit": 0,
+            "skipped_invalid_unit": 0,
+        }
         if self.failure_mode != "explore":
-            return
+            return stats
         if not self._explore_units:
-            return
+            return stats
+        unit_samples: dict[int, set[tuple[int, int]]] = {}
+        for trial in list(trials or []):
+            if not isinstance(trial, dict):
+                continue
+            try:
+                episode_id = int(trial["episode_id"])
+                start_ts = int(trial["start_ts"])
+            except Exception:
+                stats["skipped_invalid_unit"] += 1
+                continue
+            if "sampled_explore_unit_idx" in trial:
+                try:
+                    unit_idx = int(trial["sampled_explore_unit_idx"])
+                except Exception:
+                    stats["skipped_invalid_unit"] += 1
+                    continue
+            else:
+                inferred_unit_idx = self._infer_explore_unit_idx_from_trial(trial)
+                if inferred_unit_idx is None:
+                    stats["skipped_missing_unit"] += 1
+                    continue
+                unit_idx = int(inferred_unit_idx)
+            if unit_idx < 0:
+                stats["skipped_invalid_unit"] += 1
+                continue
+            if not self.can_restore_explore_trial(trial):
+                stats["skipped_invalid_unit"] += 1
+                continue
+            sample_uid = (int(episode_id), int(start_ts))
+            unit_samples.setdefault(int(unit_idx), set()).add(sample_uid)
+            stats["restored"] += 1
+        total_units = int(len(self._explore_units))
+        completed_units = 0
+        curr_unit_idx = 0
+        curr_seen_samples: set[tuple[int, int]] = set()
+        curr_trial_count = 0
+        for unit_idx in range(total_units):
+            seen = unit_samples.get(int(unit_idx), set())
+            if len(seen) >= int(self._explore_k_local):
+                completed_units += 1
+                continue
+            curr_unit_idx = int(unit_idx)
+            curr_seen_samples = set(seen)
+            curr_trial_count = int(len(curr_seen_samples))
+            break
+        else:
+            curr_unit_idx = 0 if total_units <= 0 else int(total_units % max(1, total_units))
+            curr_seen_samples = set()
+            curr_trial_count = 0
+        self._explore_curr_unit_idx = int(curr_unit_idx)
+        self._explore_trial_count_local = int(curr_trial_count)
+        self._explore_seen_samples = set(curr_seen_samples)
+        self._explore_completed_unit_count = int(completed_units)
+        stats["applied"] = int(
+            sum(
+                min(len(unit_samples.get(int(unit_idx), set())), int(self._explore_k_local))
+                for unit_idx in range(total_units)
+            )
+        )
+        stats["completed_units"] = int(completed_units)
+        stats["current_unit_idx"] = int(curr_unit_idx)
+        stats["current_trial_count"] = int(curr_trial_count)
+        return stats
+
+    def export_explore_state(self) -> dict:
+        return {
+            "version": 1,
+            "task_name": str(self._task_name),
+            "dataset_dir": str(self.dataset_dir),
+            "failure_mode": str(self.failure_mode),
+            "total_units": int(len(self._explore_units)),
+            "k_local": int(self._explore_k_local),
+            "current_unit_idx": int(self._explore_curr_unit_idx),
+            "trial_count_local": int(self._explore_trial_count_local),
+            "completed_unit_count": int(self._explore_completed_unit_count),
+            "seen_samples": [[int(ep), int(ts)] for ep, ts in sorted(self._explore_seen_samples)],
+        }
+
+    def restore_explore_state(self, state: dict | None) -> dict[str, int | bool]:
+        info = {
+            "applied": False,
+            "completed_units": 0,
+            "current_unit_idx": 0,
+            "current_trial_count": 0,
+            "reason": "invalid_state",
+        }
+        self._explore_curr_unit_idx = 0
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+        self._explore_completed_unit_count = 0
+        if self.failure_mode != "explore":
+            info["reason"] = "not_explore_mode"
+            return info
+        if not self._explore_units:
+            info["reason"] = "no_units"
+            return info
+        if not isinstance(state, dict):
+            info["reason"] = "state_not_dict"
+            return info
+        try:
+            total_units = int(state.get("total_units", -1))
+            k_local = int(state.get("k_local", -1))
+            curr_unit_idx = int(state.get("current_unit_idx", 0))
+            curr_trial_count = int(state.get("trial_count_local", 0))
+            completed_unit_count = int(state.get("completed_unit_count", 0))
+            seen_samples_raw = list(state.get("seen_samples", []))
+        except Exception:
+            info["reason"] = "state_parse_error"
+            return info
+        if total_units != int(len(self._explore_units)):
+            info["reason"] = "total_units_mismatch"
+            return info
+        if k_local != int(self._explore_k_local):
+            info["reason"] = "k_local_mismatch"
+            return info
+        if total_units > 0:
+            curr_unit_idx = int(np.clip(curr_unit_idx, 0, total_units - 1))
+        else:
+            curr_unit_idx = 0
+        completed_unit_count = int(np.clip(completed_unit_count, 0, total_units))
+        curr_trial_count = int(np.clip(curr_trial_count, 0, max(0, self._explore_k_local - 1)))
+        seen_samples: set[tuple[int, int]] = set()
+        for item in seen_samples_raw:
+            try:
+                ep_id, start_ts = item
+                seen_samples.add((int(ep_id), int(start_ts)))
+            except Exception:
+                continue
+        if len(seen_samples) < curr_trial_count:
+            info["reason"] = "seen_samples_shorter_than_trial_count"
+            return info
+        if len(seen_samples) > curr_trial_count:
+            seen_samples = set(list(sorted(seen_samples))[:curr_trial_count])
+        self._explore_curr_unit_idx = int(curr_unit_idx)
+        self._explore_trial_count_local = int(curr_trial_count)
+        self._explore_seen_samples = set(seen_samples)
+        self._explore_completed_unit_count = int(completed_unit_count)
+        info.update(
+            {
+                "applied": True,
+                "completed_units": int(completed_unit_count),
+                "current_unit_idx": int(curr_unit_idx),
+                "current_trial_count": int(curr_trial_count),
+                "reason": "ok",
+            }
+        )
+        return info
+
+    def record_explore_trial(self, unit_idx: int, episode_id: int, start_ts: int) -> bool:
+        if self.failure_mode != "explore":
+            return False
+        if not self._explore_units:
+            return False
         if int(unit_idx) != int(self._explore_curr_unit_idx):
-            return
+            return False
         sample_uid = (int(episode_id), int(start_ts))
         if sample_uid in self._explore_seen_samples:
-            return
+            return False
         self._explore_seen_samples.add(sample_uid)
         self._explore_trial_count_local += 1
         if int(self._explore_trial_count_local) >= int(self._explore_k_local):
             self._advance_explore_unit(count_as_completed=True)
+        return True
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
         if self.failure_mode in {"train", "explore"}:
@@ -683,6 +999,8 @@ class MultiTaskFailureAwareStage2Dataset(Dataset):
             raise ValueError("MultiTaskFailureAwareStage2Dataset requires at least one dataset")
         self.datasets = list(datasets)
         self.task_specs = list(task_specs)
+        for ds, spec in zip(self.datasets, self.task_specs):
+            setattr(ds, "_task_name", str(spec.task_name))
         self._cumulative = np.cumsum([len(ds) for ds in self.datasets]).astype(np.int64)
 
     def __len__(self) -> int:
@@ -768,6 +1086,7 @@ def build_failure_table_dataset(
         failure_rotation_dir_bins=failure_rotation_dir_bins,
         failure_rotation_mag_bins=failure_rotation_mag_bins,
         failure_explore_k=failure_explore_k,
+        task_name="",
     )
     return dataset, stats
 
@@ -829,6 +1148,7 @@ def build_multitask_failure_table_dataset(
                 failure_rotation_dir_bins=failure_rotation_dir_bins,
                 failure_rotation_mag_bins=failure_rotation_mag_bins,
                 failure_explore_k=failure_explore_k,
+                task_name=str(spec.task_name),
             )
         )
     return MultiTaskFailureAwareStage2Dataset(datasets, task_specs), stats

@@ -579,6 +579,32 @@ _CONFIGS = [
         batch_size=64,
         fsdp_devices=1,  # refer line 359
     ),
+    # pi05_base by full, RobotWin single-view (cam_high only)
+    TrainConfig(
+        name="pi05_aloha_robotwin_singleview_base",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="your_repo_id",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        fsdp_devices=1,
+    ),
     # pi0_base by lora
     TrainConfig(
         name="pi0_base_aloha_robotwin_lora",

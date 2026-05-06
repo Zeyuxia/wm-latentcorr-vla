@@ -73,8 +73,8 @@ def _init_act_correction_modules(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml)
+    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=device)
+    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=device)
     return {
         "evac_model": evac_model,
         "evac_config": evac_cfg,
@@ -111,8 +111,8 @@ def _init_act_correction_modules_without_loading_evac(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml)
+    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=next(shared_evac_model.parameters()).device)
+    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=next(shared_evac_model.parameters()).device)
     return {
         "evac_model": shared_evac_model,
         "evac_config": shared_evac_config,
@@ -141,6 +141,7 @@ class ACTAlignedCorrectionConfig:
     recover_eval_rot_thresh_deg: float = 10.0
     recover_eval_nearest_window_radius: int = 16
     recover_eval_video_bridge_steps: int = 16
+    evac_ddim_steps: int = 27
     correction_interp_nearest_enable: bool = False
     correction_interp_prefix_ratio: float = 0.6
     correction_planner_prefix_ratio: float = 0.5
@@ -211,6 +212,7 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         recover_eval_rot_thresh_deg=float(getattr(args, "recover_eval_rot_thresh_deg", 10.0)),
         recover_eval_nearest_window_radius=int(getattr(args, "recover_eval_nearest_window_radius", 16)),
         recover_eval_video_bridge_steps=int(getattr(args, "recover_eval_video_bridge_steps", 16)),
+        evac_ddim_steps=int(getattr(args, "ddim_steps", 27)),
         correction_interp_nearest_enable=bool(
             getattr(args, "act_aligned_correction_interp_nearest_enable", False)
         ),
@@ -333,6 +335,7 @@ class ACTAlignedCorrectionBuilder:
     ):
         self.cfg = cfg
         self.device = torch.device(device)
+        self._debug_device_logged = False
         if shared_evac_model is not None and shared_evac_config is not None:
             self.modules = _init_act_correction_modules_without_loading_evac(
                 shared_evac_model=shared_evac_model,
@@ -385,7 +388,32 @@ class ACTAlignedCorrectionBuilder:
         precomputed_action_chunk_norm: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         self._last_skip_meta = None
+        if self.device.type == "cuda":
+            torch.cuda.set_device(int(self.device.index if self.device.index is not None else 0))
         adapter = _ACTChunkPolicyAdapter(latent_model)
+        if os.environ.get("ACT_CORR_DEVICE_DEBUG", "").strip() == "1" and not self._debug_device_logged:
+            try:
+                evac_param = next(self.modules["evac_model"].parameters(), None)
+                evac_device = None if evac_param is None else str(evac_param.device)
+            except Exception:
+                evac_device = "<unknown>"
+            try:
+                latent_param = next(latent_model.parameters(), None)
+                latent_device = None if latent_param is None else str(latent_param.device)
+            except Exception:
+                latent_device = "<unknown>"
+            rank = os.environ.get("RANK", "?")
+            local_rank = os.environ.get("LOCAL_RANK", "?")
+            print(
+                "[act-corr-device-debug] "
+                f"rank={rank} local_rank={local_rank} builder_device={self.device} "
+                f"image_device={getattr(image_t, 'device', '<none>')} "
+                f"qpos_device={getattr(qpos_t, 'device', '<none>')} "
+                f"latent_device={latent_device} evac_device={evac_device} "
+                f"current_cuda={torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}",
+                flush=True,
+            )
+            self._debug_device_logged = True
         runtime_cfg = self.cfg.to_runtime_dict()
         if failure_mode_override is not None:
             runtime_cfg["failure_mode"] = str(failure_mode_override).strip().lower()

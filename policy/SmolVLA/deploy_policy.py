@@ -89,7 +89,7 @@ class SmolVLAEvalWrapper:
         if model_path.suffix != ".pt":
             raise ValueError(f"Unsupported SmolVLA model path format: {model_path}")
 
-        checkpoint = torch.load(str(model_path), map_location="cpu")
+        checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=False)
         if "args" not in checkpoint:
             raise KeyError(f"Missing 'args' in SmolVLA checkpoint: {model_path}")
         if "model" not in checkpoint:

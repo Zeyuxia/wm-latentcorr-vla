@@ -4,6 +4,7 @@ import math
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -187,6 +188,142 @@ def _print_evac_runtime_meta(meta):
         )
 
 
+def _write_h264_video_from_bgr_frames(frames, out_path, fps=30):
+    if not frames:
+        return False
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    height, width = frames[0].shape[:2]
+    if width % 2 != 0 or height % 2 != 0:
+        width = int(width - (width % 2))
+        height = int(height - (height % 2))
+        if width <= 0 or height <= 0:
+            return False
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{int(width)}x{int(height)}",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-crf",
+        "18",
+        str(out_path),
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert proc.stdin is not None
+        for frame in frames:
+            if frame.shape[:2] != (height, width):
+                import cv2
+
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            proc.stdin.write(np.ascontiguousarray(frame.astype(np.uint8)).tobytes())
+        proc.stdin.close()
+        return int(proc.wait()) == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+    except Exception:
+        try:
+            if "proc" in locals() and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        return False
+
+
+def _rewrite_evac_outputs_video_from_clean_frames(target_dir, fps=30):
+    """Make EVAC's public outputs.mp4 a clean rollout video.
+
+    EVAC internally writes outputs.mp4 as a composite of generated frames and a
+    trajectory/projection panel.  That is useful for low-level EVAC debugging but
+    confusing for our correction export visual checks.  Keep the composite as a
+    backup and rewrite outputs.mp4 from the clean frame_*.jpg files.
+    """
+    try:
+        import cv2
+
+        frame_names = sorted(
+            name
+            for name in os.listdir(target_dir)
+            if name.startswith("frame_") and name.lower().endswith((".jpg", ".jpeg", ".png"))
+        )
+        if not frame_names:
+            return False
+        frames = []
+        for name in frame_names:
+            frame = cv2.imread(os.path.join(target_dir, name), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+        if not frames:
+            return False
+
+        out_path = os.path.join(target_dir, "outputs.mp4")
+        composite_path = os.path.join(target_dir, "outputs_composite.mp4")
+        if os.path.isfile(out_path) and not os.path.isfile(composite_path):
+            try:
+                shutil.copy2(out_path, composite_path)
+            except Exception:
+                pass
+        tmp_path = os.path.join(target_dir, "outputs.clean_tmp.mp4")
+        ok = _write_h264_video_from_bgr_frames(frames, tmp_path, fps=fps)
+        if not ok:
+            writer = cv2.VideoWriter(
+                tmp_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps),
+                (int(frames[0].shape[1]), int(frames[0].shape[0])),
+            )
+            try:
+                for frame in frames:
+                    writer.write(frame)
+            finally:
+                writer.release()
+            ok = os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0
+        if ok:
+            os.replace(tmp_path, out_path)
+        else:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return ok
+    except Exception:
+        return False
+
+
+def _smolvla_rgb_chw_to_evac_rgb_chw(image: torch.Tensor) -> torch.Tensor:
+    """Convert SmolVLA image tensors to EVAC's RGB convention.
+
+    The SmolVLA/LeRobot pipeline carries RGB-semantic tensors.  Keep model
+    inputs unchanged here; only convert at OpenCV file I/O boundaries.
+    """
+    if image.ndim != 3 or int(image.shape[0]) != 3:
+        raise ValueError(f"Expected image tensor [3,H,W], got {tuple(image.shape)}")
+    return image.contiguous()
+
+
+def _evac_rgb_hwc_to_smolvla_rgb_hwc(frame: np.ndarray) -> np.ndarray:
+    frame = np.asarray(frame)
+    if frame.ndim != 3 or int(frame.shape[-1]) != 3:
+        raise ValueError(f"Expected EVAC RGB frame [H,W,3], got {frame.shape}")
+    return np.ascontiguousarray(frame)
+
+
 def evac_inference(
     evac_model,
     evac_cfg,
@@ -211,9 +348,8 @@ def evac_inference(
     n_states = len(fk_poses)
 
     h_native, w_native = raw_data["native_resolution"]
-    # Stage1 tensors are aligned to SmolVLA's RGB convention before reaching EVAC.
-    img_rgb = tvt.Resize((h_native, w_native))(curr_image)
-    memories = img_rgb.unsqueeze(1).repeat(1, n_prev, 1, 1)
+    img_evac_rgb = tvt.Resize((h_native, w_native))(_smolvla_rgb_chw_to_evac_rgb_chw(curr_image))
+    memories = img_evac_rgb.unsqueeze(1).repeat(1, n_prev, 1, 1)
 
     all_ends_p = np.zeros((n_states, 2, 3), dtype=np.float32)
     all_ends_o = np.zeros((n_states, 2, 4), dtype=np.float32)
@@ -316,13 +452,14 @@ def evac_inference(
 
     if save_dir is not None:
         try:
-            inp_rgb = np.clip((img_rgb.permute(1, 2, 0).cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
+            inp_rgb = np.clip((img_evac_rgb.permute(1, 2, 0).cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
             inp_bgr = inp_rgb[:, :, ::-1].copy()
             cv2.imwrite(os.path.join(target_dir, "input_frame.png"), inp_bgr)
         except Exception:
             pass
+        _rewrite_evac_outputs_video_from_clean_frames(target_dir, fps=30)
 
-    last_rgb = cv2.resize(frames[-1], (640, 480))
+    last_rgb = cv2.resize(_evac_rgb_hwc_to_smolvla_rgb_hwc(frames[-1]), (640, 480))
 
     if tmp_dir is not None:
         shutil.rmtree(tmp_dir, ignore_errors=True)

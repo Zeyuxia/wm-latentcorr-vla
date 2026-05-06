@@ -14,6 +14,7 @@ from .config_latent import DynamicsWarmupConfig, LatentLossConfig, LatentModelCo
 from .latent_modules import (
     ActionConditionedPredictor,
     DynamicsWarmup,
+    FutureTokenPredictor,
     LatentActionDecoder,
     LatentProjector,
     ResidualLatentAdapter,
@@ -25,6 +26,7 @@ class Stage1LossOutput:
     loss: torch.Tensor
     loss_action: torch.Tensor
     loss_action_conditioned: torch.Tensor
+    loss_condition_token: torch.Tensor
     loss_align: torch.Tensor
     loss_dynamics: torch.Tensor
     loss_wm_action_current: torch.Tensor
@@ -85,6 +87,7 @@ class ACTLatentStage1(nn.Module):
         self.wm_adapter: ResidualLatentAdapter | None = None
         self.readout_adapter: ResidualLatentAdapter | None = None
         self.predictor: ActionConditionedPredictor | None = None
+        self.future_token_predictor: FutureTokenPredictor | None = None
         self.action_decoder: LatentActionDecoder | None = None
         self.act_condition_proj: nn.Linear | None = None
         self.register_buffer(
@@ -186,6 +189,12 @@ class ACTLatentStage1(nn.Module):
             action_dim=self.latent_model_cfg.action_dim,
         ).to(z_act.device)
         hidden_dim = int(self.base_act.model.transformer.d_model)
+        self.future_token_predictor = FutureTokenPredictor(
+            latent_channels=c_wm,
+            state_dim=self.latent_model_cfg.state_dim,
+            hidden_dim=self.latent_model_cfg.predictor_mlp_hidden,
+            token_dim=hidden_dim,
+        ).to(z_act.device)
         self.act_condition_proj = nn.Linear(c_wm, hidden_dim).to(z_act.device)
         nn.init.zeros_(self.act_condition_proj.weight)
         nn.init.zeros_(self.act_condition_proj.bias)
@@ -212,6 +221,11 @@ class ACTLatentStage1(nn.Module):
         assert self.act_condition_proj is not None
         pooled = F.adaptive_avg_pool2d(z, output_size=1).flatten(1)
         token = self.act_condition_proj(pooled)
+        return token * float(scale)
+
+    def _predict_future_token(self, z_t: torch.Tensor, qpos_t: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        assert self.future_token_predictor is not None
+        token = self.future_token_predictor(z_t, qpos_t)
         return token * float(scale)
 
     def predict_act_chunk(self, qpos_t: torch.Tensor, image_t: torch.Tensor) -> torch.Tensor:
@@ -253,6 +267,22 @@ class ACTLatentStage1(nn.Module):
         token = self._latent_to_act_token(z_condition, scale=alpha_latent)
         return self.base_act(qpos_t, image_t, external_latent_input=token)
 
+    def predict_act_chunk_predicted_conditioned(
+        self,
+        qpos_t: torch.Tensor,
+        image_t: torch.Tensor,
+        wm_teacher,
+        alpha_latent: float = 1.0,
+    ) -> torch.Tensor:
+        z_act = self._extract_act_feature(image_t)
+        z_wm_t = wm_teacher.encode_image(image_t[:, 0])
+        self._lazy_init_heads(z_act, z_wm_t)
+        assert self.projector is not None
+        target_hw = (z_wm_t.shape[-2], z_wm_t.shape[-1])
+        z_proj = self.projector(z_act, target_hw=target_hw)
+        token = self._predict_future_token(z_proj, qpos_t, scale=alpha_latent)
+        return self.base_act(qpos_t, image_t, external_latent_input=token)
+
     def forward_stage1(
         self,
         image_t: torch.Tensor,
@@ -289,6 +319,7 @@ class ACTLatentStage1(nn.Module):
         assert self.readout_adapter is not None
         assert self.predictor is not None
         assert self.action_decoder is not None
+        assert self.future_token_predictor is not None
 
         target_hw = (z_wm_t.shape[-2], z_wm_t.shape[-1])
         z_proj = self.projector(z_act_latent, target_hw=target_hw)
@@ -309,11 +340,14 @@ class ACTLatentStage1(nn.Module):
 
         alpha_latent = self.beta_scheduler.weight(global_step)
         loss_action_conditioned = torch.zeros_like(loss_action)
+        teacher_cond_token = self._latent_to_act_token(z_wm_shared_t1.detach(), scale=1.0)
+        pred_cond_token = self._predict_future_token(z_for_pred, qpos_t, scale=1.0)
+        loss_condition_token = F.mse_loss(pred_cond_token, teacher_cond_token.detach())
         if use_act_head_conditioning:
-            # Stage-1 conditioned action loss follows the teacher-latent
-            # formulation: current observation plus future-state token should
-            # still imitate the action chunk starting at the current state.
-            cond_token = self._latent_to_act_token(z_wm_shared_t1.detach(), scale=alpha_latent)
+            # Deployable conditioned action loss: predict the future token
+            # directly from current observation/state, then consume it in the
+            # same ACT forward pass.
+            cond_token = pred_cond_token * float(alpha_latent)
             cond_loss_dict = self.base_act(
                 qpos_t,
                 image_t,
@@ -339,6 +373,7 @@ class ACTLatentStage1(nn.Module):
         loss = (
             (self.latent_loss_cfg.lambda_action * loss_action)
             + (lambda_action_conditioned_eff * loss_action_conditioned)
+            + (beta_dyn * self.latent_loss_cfg.lambda_condition_token * loss_condition_token)
             + (self.latent_loss_cfg.lambda_align * loss_align)
             + (self.latent_loss_cfg.lambda_wm_action_current * loss_wm_action_current)
             + (self.latent_loss_cfg.lambda_wm_action_future * loss_wm_action_future)
@@ -350,6 +385,7 @@ class ACTLatentStage1(nn.Module):
             loss=loss,
             loss_action=loss_action,
             loss_action_conditioned=loss_action_conditioned,
+            loss_condition_token=loss_condition_token,
             loss_align=loss_align,
             loss_dynamics=loss_dynamics,
             loss_wm_action_current=loss_wm_action_current,

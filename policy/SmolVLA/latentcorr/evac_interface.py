@@ -15,6 +15,13 @@ _SMOLVLA_EVAC_ROOT = os.path.realpath(os.path.join(_THIS_DIR, "..", "evac"))
 _SMOLVLA_EVAC_MODULE_ROOT = os.path.join(_SMOLVLA_EVAC_ROOT, "evac")
 
 
+def _smolvla_rgb_chw_to_evac_rgb_chw(image: torch.Tensor) -> torch.Tensor:
+    """SmolVLA/LeRobot tensors already carry RGB-semantic channel order."""
+    if image.ndim != 3 or int(image.shape[0]) != 3:
+        raise ValueError(f"Expected image tensor [3,H,W], got {tuple(image.shape)}")
+    return image.contiguous()
+
+
 class EvacLatentTeacher:
     """
     Minimal EVAC latent interface for SmolVLA latent training.
@@ -112,6 +119,7 @@ class EvacLatentTeacher:
         if image.ndim != 4:
             raise ValueError(f"image must be (B,3,H,W), got {image.shape}")
         image = image.to(device=self.device, dtype=torch.float32)
+        image = torch.stack([_smolvla_rgb_chw_to_evac_rgb_chw(item) for item in image], dim=0)
         sample_h, sample_w = tuple(self.cfg.data.params.train.params.sample_size)
         image = F.interpolate(image, size=(sample_h, sample_w), mode="bilinear", align_corners=False)
         image = (image * 2.0) - 1.0
@@ -210,9 +218,8 @@ class EvacLatentTeacher:
         delta_action[:, 7:13] = (delta_action[:, 7:13] - sep * stat_mean[:, 6:]) / (sep * stat_std[:, 6:])
 
         h_native, w_native = raw_data["native_resolution"]
-        # Stage1 image tensors follow SmolVLA/base-policy RGB convention.
-        img_rgb = tvt.Resize((h_native, w_native))(curr_image)
-        memories = img_rgb.unsqueeze(1).repeat(1, n_previous, 1, 1)
+        img_evac_rgb = tvt.Resize((h_native, w_native))(_smolvla_rgb_chw_to_evac_rgb_chw(curr_image))
+        memories = img_evac_rgb.unsqueeze(1).repeat(1, n_previous, 1, 1)
 
         ext_cv = raw_data["extrinsic_cv"]
         w2c = np.eye(4, dtype=np.float32)

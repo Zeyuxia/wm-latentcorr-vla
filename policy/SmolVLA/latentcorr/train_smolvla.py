@@ -76,6 +76,14 @@ def str2bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
+def scalar_to_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    if isinstance(value, np.generic):
+        return int(value.item())
+    return int(value)
+
+
 def _save_loss_batch_projection(
     save_dir: str,
     image_cam: torch.Tensor,
@@ -317,7 +325,11 @@ def save_stage1_correction_data(
 
 def build_accelerator() -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    return Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
+    return Accelerator(
+        step_scheduler_with_optimizer=False,
+        rng_types=[],
+        kwargs_handlers=[ddp_kwargs],
+    )
 
 
 def load_evac_sample_size(evac_config_path: str) -> tuple[int, int] | None:
@@ -480,8 +492,11 @@ def add_failure_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, default=15.0)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, default=0.10)
     parser.add_argument("--evac_blur_filter_enable", type=str2bool, default=False)
-    parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.25)
-    parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=24)
+    parser.add_argument("--evac_blur_filter_metric", type=str, choices=["sharpness_ratio", "grad_cosine", "mode_aware"], default="sharpness_ratio")
+    parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.75)
+    parser.add_argument("--evac_blur_filter_region", type=str, choices=["full_image", "active_gripper_patch"], default="active_gripper_patch")
+    parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=12)
+    parser.add_argument("--evac_blur_filter_gripper_axis_m", type=float, default=0.04)
     parser.add_argument("--debug_wm_correction", type=str2bool, default=False)
     parser.add_argument("--debug_wm_all_ranks", type=str2bool, default=False)
     parser.add_argument("--debug_loss_batch_projection", type=str2bool, default=False)
@@ -798,7 +813,7 @@ def resume_training_checkpoint(
     path = Path(checkpoint_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     lr_scheduler.load_state_dict(checkpoint["scheduler"])
@@ -844,7 +859,7 @@ def initialize_latent_policy_from_sample(
         image_t=raw_sample["image_t"],
         qpos_raw=raw_sample["qpos_raw"],
         action_chunk_raw=raw_sample["act_action_chunk_raw"],
-        episode_id=int(raw_sample["episode_id"].item()),
+        episode_id=scalar_to_int(raw_sample["episode_id"]),
     )
     teacher_latent = None
     if teacher is not None:
@@ -874,7 +889,7 @@ def build_stage1_samples_from_raw_batch(
             action_chunk_raw=raw_batch["act_action_chunk_raw"][batch_index],
             task_name=task_only,
             task_config=task_config,
-            episode_id=int(raw_batch["episode_id"][batch_index].item()),
+            episode_id=scalar_to_int(raw_batch["episode_id"][batch_index]),
             instruction_type=instruction_type,
         )
         samples.append(sample)
@@ -914,8 +929,8 @@ def build_stage1_correction_samples(
     for sample_index in range(correction_raw_batch["image_t"].shape[0]):
         task_name_full = correction_raw_batch["task_name"][sample_index]
         task_only, task_config = parse_task_parts(task_name_full)
-        episode_id = int(correction_raw_batch["episode_id"][sample_index].item())
-        start_ts = int(correction_raw_batch["start_ts"][sample_index].item())
+        episode_id = scalar_to_int(correction_raw_batch["episode_id"][sample_index])
+        start_ts = scalar_to_int(correction_raw_batch["start_ts"][sample_index])
         adapter = SampleBoundSmolVLAAdapter(
             latent_policy=latent_model,
             preprocess=preprocess,
@@ -1294,8 +1309,8 @@ def run_stage1(args: argparse.Namespace) -> None:
                         return raw_cache[cache_key]
 
                     for i in range(int(raw_batch["image_t"].shape[0])):
-                        ep_i = int(raw_batch["episode_id"][i].item())
-                        st_i = int(raw_batch["start_ts"][i].item())
+                        ep_i = scalar_to_int(raw_batch["episode_id"][i])
+                        st_i = scalar_to_int(raw_batch["start_ts"][i])
                         raw_dir_i = str(raw_batch["raw_data_dir"][i])
                         _save_loss_batch_projection(
                             str(loss_dbg_dir / f"base_{i:03d}_ep{ep_i}_ts{st_i:04d}"),
@@ -1525,7 +1540,7 @@ def run_stage2(args: argparse.Namespace) -> None:
         raw_sample=normal_dataset[0],
         teacher=teacher,
     )
-    stage1_checkpoint = torch.load(args.stage1_ckpt, map_location="cpu")
+    stage1_checkpoint = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
     model.load_state_dict(stage1_checkpoint["model"], strict=True)
     model.to(torch.device(args.device))
     correction_builder = ACTAlignedCorrectionBuilder(
@@ -1585,7 +1600,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                             image_t=normal_raw_batch["image_t"][sample_index],
                             qpos_raw=normal_raw_batch["qpos_raw"][sample_index],
                             action_chunk_raw=normal_raw_batch["act_action_chunk_raw"][sample_index],
-                            episode_id=int(normal_raw_batch["episode_id"][sample_index].item()),
+                            episode_id=scalar_to_int(normal_raw_batch["episode_id"][sample_index]),
                         )
                     )
                 normal_batch = stack_smolvla_batches(normal_samples)
@@ -1599,7 +1614,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                 for sample_index in range(correction_raw_batch["image_t"].shape[0]):
                     task_name_full = correction_raw_batch["task_name"][sample_index]
                     task_only, task_config = parse_task_parts(task_name_full)
-                    episode_id = int(correction_raw_batch["episode_id"][sample_index].item())
+                    episode_id = scalar_to_int(correction_raw_batch["episode_id"][sample_index])
                     adapter = SampleBoundSmolVLAAdapter(
                         latent_policy=latent_model,
                         preprocess=preprocess,
@@ -1621,7 +1636,7 @@ def run_stage2(args: argparse.Namespace) -> None:
                         qpos_t=correction_raw_batch["qpos_t"][sample_index].to(args.device),
                         raw_data=raw_cache[raw_cache_key],
                         norm_stats=norm_stats,
-                        start_ts=int(correction_raw_batch["start_ts"][sample_index].item()),
+                        start_ts=scalar_to_int(correction_raw_batch["start_ts"][sample_index]),
                         failure_mode_override="train",
                         sampled_phase_id=int(correction_raw_batch["sampled_phase_id"][sample_index].item()),
                         sampled_phase_bin_id=int(correction_raw_batch["sampled_phase_bin_id"][sample_index].item()),

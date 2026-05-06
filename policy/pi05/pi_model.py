@@ -26,10 +26,11 @@ from openpi.training import data_loader as _data_loader
 
 class PI0:
 
-    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step):
+    def __init__(self, train_config_name, model_name, checkpoint_id, pi0_step, camera_names=None):
         self.train_config_name = train_config_name
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
+        self.camera_names = tuple(camera_names or ("cam_high", "cam_right_wrist", "cam_left_wrist"))
 
         specified_path = f"policy/pi0/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
         entries = os.listdir(specified_path)
@@ -57,23 +58,16 @@ class PI0:
 
     # Update the observation window buffer
     def update_observation_window(self, img_arr, state):
-        img_front, img_right, img_left, puppet_arm = (
-            img_arr[0],
-            img_arr[1],
-            img_arr[2],
-            state,
-        )
-        img_front = np.transpose(img_front, (2, 0, 1))
-        img_right = np.transpose(img_right, (2, 0, 1))
-        img_left = np.transpose(img_left, (2, 0, 1))
+        if len(img_arr) != len(self.camera_names):
+            raise ValueError(f"Expected {len(self.camera_names)} images, got {len(img_arr)}")
+
+        images = {}
+        for camera_name, image in zip(self.camera_names, img_arr):
+            images[camera_name] = np.transpose(image, (2, 0, 1))
 
         self.observation_window = {
             "state": state,
-            "images": {
-                "cam_high": img_front,
-                "cam_left_wrist": img_left,
-                "cam_right_wrist": img_right,
-            },
+            "images": images,
             "prompt": self.instruction,
         }
 

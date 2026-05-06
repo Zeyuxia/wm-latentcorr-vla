@@ -157,8 +157,11 @@ class ACTAlignedCorrectionConfig:
     perturb_active_joint_delta_thresh: float = 0.01
     perturb_active_gripper_delta_thresh: float = 0.05
     evac_blur_filter_enable: bool = False
-    evac_blur_filter_min_ratio: float = 0.25
-    evac_blur_filter_patch_pad_px: int = 24
+    evac_blur_filter_metric: str = "sharpness_ratio"
+    evac_blur_filter_min_ratio: float = 0.75
+    evac_blur_filter_region: str = "active_gripper_patch"
+    evac_blur_filter_patch_pad_px: int = 12
+    evac_blur_filter_gripper_axis_m: float = 0.04
     sample_phase_window_len: int = 30
     failure_mode: str = "off"
     failure_phase_bins: int = 3
@@ -211,6 +214,7 @@ class ACTAlignedCorrectionConfig:
     world_model_compare_sim_autorun: bool = False
     world_model_compare_sim_timeout_s: float = 600.0
     world_model_compare_cosmos_autorun: bool = False
+    correction_generate_on_unrecoverable: bool = False
 
     def to_runtime_dict(self) -> dict[str, Any]:
         runtime = self.__dict__.copy()
@@ -278,8 +282,11 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         perturb_active_joint_delta_thresh=float(getattr(args, "planner_active_joint_delta_thresh", 0.01)),
         perturb_active_gripper_delta_thresh=float(getattr(args, "planner_active_gripper_delta_thresh", 0.05)),
         evac_blur_filter_enable=bool(getattr(args, "evac_blur_filter_enable", False)),
-        evac_blur_filter_min_ratio=float(getattr(args, "evac_blur_filter_min_ratio", 0.25)),
-        evac_blur_filter_patch_pad_px=int(getattr(args, "evac_blur_filter_patch_pad_px", 24)),
+        evac_blur_filter_metric=str(getattr(args, "evac_blur_filter_metric", "sharpness_ratio")),
+        evac_blur_filter_min_ratio=float(getattr(args, "evac_blur_filter_min_ratio", 0.75)),
+        evac_blur_filter_region=str(getattr(args, "evac_blur_filter_region", "active_gripper_patch")),
+        evac_blur_filter_patch_pad_px=int(getattr(args, "evac_blur_filter_patch_pad_px", 12)),
+        evac_blur_filter_gripper_axis_m=float(getattr(args, "evac_blur_filter_gripper_axis_m", 0.04)),
         sample_phase_window_len=int(getattr(args, "sample_phase_window_len", 30)),
         failure_mode=str(getattr(args, "failure_mode", "off")),
         failure_phase_bins=int(getattr(args, "failure_phase_bins", 3)),
@@ -342,6 +349,10 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         world_model_compare_sim_autorun=bool(getattr(args, "world_model_compare_sim_autorun", False)),
         world_model_compare_sim_timeout_s=float(getattr(args, "world_model_compare_sim_timeout_s", 600.0)),
         world_model_compare_cosmos_autorun=bool(getattr(args, "world_model_compare_cosmos_autorun", False)),
+        correction_generate_on_unrecoverable=bool(
+            getattr(args, "corr_export_dataset", False)
+            or getattr(args, "correction_generate_on_unrecoverable", False)
+        ),
     )
 
 

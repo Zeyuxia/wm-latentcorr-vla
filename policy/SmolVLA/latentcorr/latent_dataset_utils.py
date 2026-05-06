@@ -18,10 +18,26 @@ _DEFAULT_HF_HOME = os.path.join(_SMOLVLA_ROOT, ".hf_home")
 
 
 def act_processed_images_to_rgb(images: np.ndarray) -> np.ndarray:
-    """ACT processed hdf5 stores OpenCV-decoded images in BGR; SmolVLA expects RGB."""
+    """Return processed ACT hdf5 images as RGB-semantic arrays.
+
+    RoboTwin raw JPEGs were encoded from simulator RGB arrays through OpenCV,
+    so OpenCV decode preserves the simulator RGB channel values numerically.
+    The processed ACT hdf5 files therefore already carry RGB semantics even
+    though they passed through cv2.  Keep the default as identity to avoid
+    red/blue channel swaps in SmolVLA, EVAC input frames, and debug renders.
+    Set SMOLVLA_ACT_HDF5_COLOR_ORDER=bgr only for a dataset that was truly
+    written in OpenCV BGR order.
+    """
     if images.ndim < 4 or int(images.shape[-1]) != 3:
         raise ValueError(f"Expected images with trailing channel dimension 3, got {images.shape}")
-    return images[..., ::-1].copy()
+    color_order = str(os.environ.get("SMOLVLA_ACT_HDF5_COLOR_ORDER", "rgb")).strip().lower()
+    if color_order == "bgr":
+        return images[..., ::-1].copy()
+    if color_order != "rgb":
+        raise ValueError(
+            f"Unsupported SMOLVLA_ACT_HDF5_COLOR_ORDER={color_order!r}; expected 'rgb' or 'bgr'"
+        )
+    return np.ascontiguousarray(images)
 
 
 def _configure_lerobot_cache_env() -> None:
@@ -254,6 +270,15 @@ def load_episode_action_array(dataset_dir: str, episode_id: int) -> np.ndarray:
     path = os.path.join(dataset_dir, f"episode_{int(episode_id)}.hdf5")
     with h5py.File(path, "r") as root:
         return root["/action"][()].astype(np.float32)
+
+
+def load_episode_qpos_action_arrays(dataset_dir: str, episode_id: int) -> tuple[np.ndarray, np.ndarray]:
+    if is_lerobot_dataset_dir(dataset_dir):
+        qpos, action, _ = _load_lerobot_episode_arrays(os.path.realpath(str(dataset_dir)), int(episode_id))
+        return np.asarray(qpos, dtype=np.float32), np.asarray(action, dtype=np.float32)
+    path = os.path.join(dataset_dir, f"episode_{int(episode_id)}.hdf5")
+    with h5py.File(path, "r") as root:
+        return root["/observations/qpos"][()].astype(np.float32), root["/action"][()].astype(np.float32)
 
 
 def get_norm_stats(dataset_dir: str, num_episodes: int) -> dict[str, np.ndarray]:

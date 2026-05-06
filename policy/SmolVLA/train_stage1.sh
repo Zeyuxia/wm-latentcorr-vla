@@ -7,16 +7,17 @@ SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
 LOCAL_SRC_DIR="${SCRIPT_DIR}/src"
 
 source /data/miniconda3/etc/profile.d/conda.sh
-conda activate smolvla
+SMOLVLA_CONDA_ENV="${SMOLVLA_CONDA_ENV:-smolvla_cosmos}"
+conda activate "${SMOLVLA_CONDA_ENV}"
 cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
-DATASET_REPO_ID="${DATASET_REPO_ID:-robotwin_multitask_5_cam_high}"
+DATASET_REPO_ID="${DATASET_REPO_ID:-robotwin_multitask_5_cam_high_rgbfix}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/stage1/${DATASET_REPO_ID}}"
-TRAIN_TAG="${TRAIN_TAG:-stage1_no_object_contact_correction}"
-RUN_TAG="${RUN_TAG:-stage1_spatial_projector_no_aux_losses}"
+TRAIN_TAG="${TRAIN_TAG:-stage1_corr025_5task_rgbfix_qfilter_midbins_no_fbtrans_from070000}"
+RUN_TAG="${RUN_TAG:-stage1_spatial_projector_corr025_5task_rgbfix_qfilter_midbins_no_fbtrans}"
 
-PRETRAINED_PATH="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model"
+PRETRAINED_PATH="${PRETRAINED_PATH:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high_rgbfix/20260502_201333-rgbfix_from_smolvla_base_step70000/checkpoints/070000/pretrained_model}"
 RESUME_FROM="${RESUME_FROM:-}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29611}"
@@ -24,6 +25,9 @@ POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
 LOAD_VLM_WEIGHTS="${LOAD_VLM_WEIGHTS:-true}"
+SMOLVLA_LATENT_DATA_SOURCE="${SMOLVLA_LATENT_DATA_SOURCE:-smolvla_rgbfix}"
+SMOLVLA_LATENT_DATA_ROOT="${SMOLVLA_LATENT_DATA_ROOT:-${SCRIPT_DIR}/data}"
+SMOLVLA_LATENT_DATA_SUFFIX="${SMOLVLA_LATENT_DATA_SUFFIX:-_rgbfix}"
 
 MULTI_TASK_NAMES=(
   sim-open_laptop-demo_clean-50
@@ -33,6 +37,9 @@ MULTI_TASK_NAMES=(
   sim-handover_block-demo_clean-50
 )
 FAILURE_TASK_NAMES=(
+  sim-open_laptop-demo_clean-50
+  sim-pick_dual_bottles-demo_clean-50
+  sim-put_bottles_dustbin-demo_clean-50
   sim-place_burger_fries-demo_clean-50
   sim-handover_block-demo_clean-50
 )
@@ -83,7 +90,7 @@ COND_RAMP_STEPS=1000
 COND_MAX_WEIGHT="${COND_MAX_WEIGHT:-0.0}"
 COND_WARMUP_CURVE="cosine"
 FAILURE_MODE="${FAILURE_MODE:-train}"
-FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json}"
+FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/filtered_failure_tables_quality_y_no_front_back_translation_mid_phase_bins_from_20260427_235851/multitask_failure_manifest.json}"
 FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.25}"
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
@@ -130,6 +137,7 @@ DEBUG_WM_ALL_RANKS=true
 DEBUG_LOSS_BATCH_PROJECTION=true
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
+PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:The video decoding and encoding capabilities of torchvision are deprecated:UserWarning}"
 SMOLVLA_EVAC_PRINT_RUNTIME=false
 PYTHONPATH="/data/zhenyangfan/RoboTwin:${LOCAL_SRC_DIR}"
 
@@ -200,6 +208,7 @@ cat > "${OUTPUT_DIR}/run_meta.txt" <<EOF
 script=${SCRIPT_PATH}
 script_dir=${SCRIPT_DIR}
 train_mode=stage1
+smolvla_conda_env=${SMOLVLA_CONDA_ENV}
 dataset_repo_id=${DATASET_REPO_ID}
 pretrained_path=${PRETRAINED_PATH}
 resume_from=${RESUME_FROM}
@@ -226,6 +235,9 @@ train_tag=${TRAIN_TAG}
 output_dir=${OUTPUT_DIR}
 pythonnousersite=${PYTHONNOUSERSITE}
 pythonpath=${PYTHONPATH}
+smolvla_latent_data_source=${SMOLVLA_LATENT_DATA_SOURCE}
+smolvla_latent_data_root=${SMOLVLA_LATENT_DATA_ROOT}
+smolvla_latent_data_suffix=${SMOLVLA_LATENT_DATA_SUFFIX}
 instruction_type=${INSTRUCTION_TYPE}
 evac_ckpt=${EVAC_CKPT}
 evac_config=${EVAC_CONFIG}
@@ -359,8 +371,12 @@ echo "Run tag: ${RUN_TAG}"
 export CUDA_VISIBLE_DEVICES
 export PYTHONNOUSERSITE
 export PYTHONPATH
+export PYTHONWARNINGS
 export TOKENIZERS_PARALLELISM
 export SMOLVLA_EVAC_PRINT_RUNTIME
+export SMOLVLA_LATENT_DATA_SOURCE
+export SMOLVLA_LATENT_DATA_ROOT
+export SMOLVLA_LATENT_DATA_SUFFIX
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions

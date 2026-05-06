@@ -196,6 +196,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_action", type=float, default=1.0)
     parser.add_argument("--lambda_action_conditioned", type=float, default=0.5)
     parser.add_argument("--schedule_action_conditioned", type=str2bool, default=True)
+    parser.add_argument("--lambda_condition_token", type=float, default=1.0)
     parser.add_argument("--lambda_align", type=float, default=0.0)
     parser.add_argument("--beta_dynamics_max", type=float, default=1.0)
     parser.add_argument("--lambda_wm_action_current", type=float, default=0.0)
@@ -275,6 +276,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--failure_rotation_mag_bins", type=int, default=3)
     parser.add_argument("--failure_explore_k", type=int, default=4)
     parser.add_argument("--failure_sample_skip_head_ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--failure_future_latent_mode",
+        type=str,
+        default="rollout",
+        choices=["vae", "rollout"],
+        help="How to construct the future teacher latent for failure samples.",
+    )
     parser.add_argument("--use_wandb", type=str2bool, default=False)
     parser.add_argument("--wandb_project", type=str, default="RoboTwin_ACT_LatentCorr")
     parser.add_argument("--wandb_entity", type=str, default="")
@@ -351,10 +359,8 @@ def _prepare_failure_samples(
             corr_qpos_norm = corr_qpos_norm.detach().to(args.device)
             corr_action = corr_action.detach().to(args.device)
             corr_is_pad = corr_is_pad.detach().to(args.device).bool()
-            qpos_raw = _qpos_raw_from_norm(corr_qpos_norm, norm_stats)
             action_prefix = corr_action[: args.prefix_steps].clone()
             is_pad_prefix = corr_is_pad[: args.prefix_steps].clone()
-            action_prefix_raw = _action_raw_from_norm(action_prefix, norm_stats)
             action_future_prefix, is_pad_future_prefix = _slice_prefix(
                 corr_action,
                 corr_is_pad,
@@ -362,14 +368,19 @@ def _prepare_failure_samples(
                 args.prefix_steps,
             )
             t1 = time.perf_counter()
-            future_latent = teacher.rollout_latent_from_actions_batch(
-                curr_image=corr_image[0],
-                curr_qpos_raw=qpos_raw,
-                action_prefix_raw=action_prefix_raw,
-                raw_data=raw_cache[cache_key],
-                fk=correction_builder.fk,
-                ddim_steps=args.ddim_steps,
-            )[0]
+            if str(args.failure_future_latent_mode).strip().lower() == "rollout":
+                corr_qpos_raw = _qpos_raw_from_norm(corr_qpos_norm, norm_stats)
+                corr_action_prefix_raw = _action_raw_from_norm(action_prefix, norm_stats)
+                future_latent = teacher.rollout_latent_from_actions(
+                    curr_image=corr_image[0],
+                    curr_qpos_raw=corr_qpos_raw,
+                    action_prefix_raw=corr_action_prefix_raw,
+                    raw_data=raw_cache[cache_key],
+                    fk=correction_builder.fk,
+                    ddim_steps=int(args.ddim_steps),
+                )[0]
+            else:
+                future_latent = teacher.encode_image(corr_image)[0]
             t_rollout += time.perf_counter() - t1
             if not _finite_tensor(future_latent):
                 skipped += 1
@@ -439,12 +450,14 @@ def main() -> None:
         predictor_mlp_hidden=args.predictor_mlp_hidden,
         action_decoder_hidden=args.action_decoder_hidden,
         action_dim=args.action_dim,
+        state_dim=args.state_dim,
         prefix_steps=args.prefix_steps,
     )
     latent_loss_cfg = LatentLossConfig(
         lambda_action=args.lambda_action,
         lambda_action_conditioned=args.lambda_action_conditioned,
         schedule_action_conditioned=args.schedule_action_conditioned,
+        lambda_condition_token=args.lambda_condition_token,
         lambda_align=args.lambda_align,
         beta_dynamics_max=args.beta_dynamics_max,
         lambda_wm_action_current=args.lambda_wm_action_current,
@@ -631,7 +644,7 @@ def main() -> None:
             steps_per_epoch = len(normal_loader)
             start_time = time.time()
             pbar = tqdm(range(steps_per_epoch), desc=f"epoch {epoch}", disable=not is_main_process(rank), leave=True)
-            meter = {k: 0.0 for k in ["loss", "action", "action_cond", "align", "dyn", "wm_curr", "wm_future", "bridge", "lambda_cond", "beta", "failure_valid", "failure_skip", "t_builder", "t_rollout"]}
+            meter = {k: 0.0 for k in ["loss", "action", "action_cond", "cond_token", "align", "dyn", "wm_curr", "wm_future", "bridge", "lambda_cond", "beta", "failure_valid", "failure_skip", "t_builder", "t_rollout"]}
 
             for _ in pbar:
                 normal_batch = next(normal_iter)
@@ -708,6 +721,7 @@ def main() -> None:
                 meter["loss"] += float(out.loss.item())
                 meter["action"] += float(out.loss_action.item())
                 meter["action_cond"] += float(out.loss_action_conditioned.item())
+                meter["cond_token"] += float(out.loss_condition_token.item())
                 meter["align"] += float(out.loss_align.item())
                 meter["dyn"] += float(out.loss_dynamics.item())
                 meter["wm_curr"] += float(out.loss_wm_action_current.item())
@@ -725,6 +739,7 @@ def main() -> None:
                         loss=f"{out.loss.item():.4f}",
                         act=f"{out.loss_action.item():.4f}",
                         cond=f"{out.loss_action_conditioned.item():.4f}",
+                        ctoken=f"{out.loss_condition_token.item():.4f}",
                         dyn=f"{out.loss_dynamics.item():.4f}",
                         beta=f"{out.beta_dynamics:.3f}",
                         lcond=f"{out.lambda_action_conditioned_eff:.3f}",
@@ -739,6 +754,7 @@ def main() -> None:
                         "train_loss_step": out.loss.item(),
                         "train_action_step": out.loss_action.item(),
                         "train_action_conditioned_step": out.loss_action_conditioned.item(),
+                        "train_condition_token_step": out.loss_condition_token.item(),
                         "train_align_step": out.loss_align.item(),
                         "train_dynamics_step": out.loss_dynamics.item(),
                         "beta_dynamics": out.beta_dynamics,
@@ -763,7 +779,8 @@ def main() -> None:
             if is_main_process(rank):
                 print(
                     f"[epoch {epoch}] loss={meter['loss']/n:.4f} action={meter['action']/n:.4f} "
-                    f"cond={meter['action_cond']/n:.4f} align={meter['align']/n:.4f} dyn={meter['dyn']/n:.4f} "
+                    f"cond={meter['action_cond']/n:.4f} ctoken={meter['cond_token']/n:.4f} "
+                    f"align={meter['align']/n:.4f} dyn={meter['dyn']/n:.4f} "
                     f"beta={meter['beta']/n:.3f} lambda_cond={meter['lambda_cond']/n:.3f} "
                     f"failure_valid={meter['failure_valid']/n:.2f} failure_skip={meter['failure_skip']/n:.2f} "
                     f"time={epoch_time:.1f}s builder={meter['t_builder']/n:.2f}s rollout={meter['t_rollout']/n:.2f}s",
@@ -776,6 +793,7 @@ def main() -> None:
                     "epoch_loss": meter["loss"] / n,
                     "epoch_action": meter["action"] / n,
                     "epoch_action_conditioned": meter["action_cond"] / n,
+                    "epoch_condition_token": meter["cond_token"] / n,
                     "epoch_align": meter["align"] / n,
                     "epoch_dynamics": meter["dyn"] / n,
                     "epoch_beta_dynamics": meter["beta"] / n,

@@ -547,6 +547,42 @@ def _image_sharpness_score(image_t: torch.Tensor) -> float:
     return float((dx + dy).detach().cpu().item())
 
 
+def _image_gray_tensor(image_t: torch.Tensor) -> torch.Tensor:
+    img = torch.clamp(image_t.detach().float(), 0.0, 1.0)
+    if img.ndim != 3:
+        return torch.zeros(1, 1, device=img.device if isinstance(img, torch.Tensor) else "cpu")
+    if img.shape[0] >= 3:
+        return 0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]
+    return img.mean(dim=0)
+
+
+def _gradient_magnitude(image_t: torch.Tensor) -> torch.Tensor:
+    gray = _image_gray_tensor(image_t)
+    if gray.ndim != 2 or gray.shape[0] < 2 or gray.shape[1] < 2:
+        return torch.zeros_like(gray).reshape(-1)
+    dx = torch.zeros_like(gray)
+    dy = torch.zeros_like(gray)
+    dx[:, 1:] = gray[:, 1:] - gray[:, :-1]
+    dy[1:, :] = gray[1:, :] - gray[:-1, :]
+    return torch.sqrt(dx * dx + dy * dy + 1e-12).reshape(-1)
+
+
+def _centered_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = a.detach().float().reshape(-1)
+    b = b.detach().float().reshape(-1)
+    if a.device != b.device:
+        b = b.to(device=a.device)
+    n = int(min(a.numel(), b.numel()))
+    if n <= 1:
+        return 0.0
+    a = a[:n] - a[:n].mean()
+    b = b[:n] - b[:n].mean()
+    denom = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
+    if float(denom.detach().cpu().item()) <= 1e-12:
+        return 0.0
+    return float(torch.clamp(torch.dot(a, b) / denom, -1.0, 1.0).detach().cpu().item())
+
+
 def _crop_image_patch(image_t: torch.Tensor, bbox_xyxy: tuple[int, int, int, int] | None) -> torch.Tensor:
     if bbox_xyxy is None or image_t.ndim != 3:
         return image_t
@@ -564,19 +600,33 @@ def _evac_blur_filter_result(
     ref: torch.Tensor,
     cfg: dict,
     bbox_xyxy: tuple[int, int, int, int] | None = None,
+    error_mode: str | None = None,
 ) -> dict:
     pred_patch = _crop_image_patch(pred, bbox_xyxy)
     ref_patch = _crop_image_patch(ref, bbox_xyxy)
     pred_score = _image_sharpness_score(pred_patch)
     ref_score = _image_sharpness_score(ref_patch)
-    ratio = pred_score / max(ref_score, 1e-8)
-    min_ratio = float(cfg.get("evac_blur_filter_min_ratio", 0.25))
-    passed = bool(ratio >= min_ratio)
+    sharpness_ratio = pred_score / max(ref_score, 1e-8)
+    grad_cosine = _centered_cosine(_gradient_magnitude(pred_patch), _gradient_magnitude(ref_patch))
+    requested_metric = str(cfg.get("evac_blur_filter_metric", "sharpness_ratio")).strip().lower()
+    metric = requested_metric
+    if metric == "mode_aware":
+        mode_key = str(error_mode or "").strip().lower()
+        metric = "grad_cosine" if mode_key == "gripper_close" else "sharpness_ratio"
+    if metric not in {"sharpness_ratio", "grad_cosine"}:
+        metric = "grad_cosine"
+    score = grad_cosine if metric == "grad_cosine" else sharpness_ratio
+    min_ratio = float(cfg.get("evac_blur_filter_min_ratio", 0.75))
+    passed = bool(score >= min_ratio)
     return {
         "passed": passed,
+        "requested_metric": requested_metric,
+        "metric": metric,
+        "score": float(score),
         "pred_sharpness": float(pred_score),
         "ref_sharpness": float(ref_score),
-        "sharpness_ratio": float(ratio),
+        "sharpness_ratio": float(sharpness_ratio),
+        "grad_cosine": float(grad_cosine),
         "min_ratio": float(min_ratio),
         "region": "active_gripper_patch" if bbox_xyxy is not None else "full_image",
         "bbox_xyxy": None if bbox_xyxy is None else [int(v) for v in bbox_xyxy],
@@ -607,7 +657,8 @@ def _project_active_gripper_bbox(
     right_pos: np.ndarray,
     right_quat_wxyz: np.ndarray,
     image_hw: tuple[int, int],
-    pad_px: int = 24,
+    pad_px: int = 12,
+    axis_len_m: float = 0.04,
 ) -> tuple[int, int, int, int] | None:
     intrinsic = np.asarray(raw_data.get("intrinsic_cv"), dtype=np.float32).copy()
     ext_cv = np.asarray(raw_data.get("extrinsic_cv"), dtype=np.float32)
@@ -625,8 +676,9 @@ def _project_active_gripper_bbox(
         if str(active_arm) == "left_arm"
         else _pose_wxyz_to_matrix_np(right_pos, right_quat_wxyz)
     )
+    axis_len = float(np.clip(float(axis_len_m), 0.005, 0.20))
     end_effector_pts = np.asarray(
-        [[0.0, 0.0, 0.0, 1.0], [0.1, 0.0, 0.0, 1.0], [0.0, 0.1, 0.0, 1.0], [0.0, 0.0, 0.1, 1.0]],
+        [[0.0, 0.0, 0.0, 1.0], [axis_len, 0.0, 0.0, 1.0], [0.0, axis_len, 0.0, 1.0], [0.0, 0.0, axis_len, 1.0]],
         dtype=np.float32,
     ).T
     gripper_to_eef = np.asarray(
@@ -931,21 +983,31 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             pred = torch.clamp(pred_rs, 0.0, 1.0)
         evac_blur_filter = None
         if bool(cfg.get("evac_blur_filter_enable", False)):
-            active_arm_for_blur = "left_arm" if bool(active_info.get("left_arm", False)) else "right_arm"
-            blur_lp, blur_lq, blur_rp, blur_rq = fk_poses[-1]
-            blur_bbox = _project_active_gripper_bbox(
-                raw_data,
-                active_arm_for_blur,
-                blur_lp,
-                blur_lq,
-                blur_rp,
-                blur_rq,
-                image_hw=(int(pred.shape[-2]), int(pred.shape[-1])),
-                pad_px=int(cfg.get("evac_blur_filter_patch_pad_px", 24)),
+            blur_region = str(cfg.get("evac_blur_filter_region", "active_gripper_patch")).strip().lower()
+            blur_bbox = None
+            if blur_region == "active_gripper_patch":
+                active_arm_for_blur = "left_arm" if bool(active_info.get("left_arm", False)) else "right_arm"
+                blur_lp, blur_lq, blur_rp, blur_rq = fk_poses[-1]
+                blur_bbox = _project_active_gripper_bbox(
+                    raw_data,
+                    active_arm_for_blur,
+                    blur_lp,
+                    blur_lq,
+                    blur_rp,
+                    blur_rq,
+                    image_hw=(int(pred.shape[-2]), int(pred.shape[-1])),
+                    pad_px=int(cfg.get("evac_blur_filter_patch_pad_px", 12)),
+                    axis_len_m=float(cfg.get("evac_blur_filter_gripper_axis_m", 0.04)),
+                )
+            sampled_error_mode = dyn_state.get('error_mode') if isinstance(dyn_state, dict) else forced_error_mode_key
+            evac_blur_filter = _evac_blur_filter_result(
+                pred,
+                curr_image[0],
+                cfg,
+                bbox_xyxy=blur_bbox,
+                error_mode=sampled_error_mode,
             )
-            evac_blur_filter = _evac_blur_filter_result(pred, curr_image[0], cfg, bbox_xyxy=blur_bbox)
             if not bool(evac_blur_filter.get("passed", False)):
-                sampled_error_mode = dyn_state.get('error_mode') if isinstance(dyn_state, dict) else None
                 blur_rollout_record = {
                     "step": int(step),
                     "t_star": int(t_star),
@@ -1606,10 +1668,20 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
     force_generate_correction = False
     if correction_force_generate:
         force_generate_correction = True
+    if (
+        not force_generate_correction
+        and bool(cfg.get("correction_generate_on_unrecoverable", False))
+        and recover_eval_last.get("recoverable") is False
+    ):
+        force_generate_correction = True
     if debug_dir is not None:
         _dbg_rollout.append({
             'step': int(max_steps_eff),
-            'reason': 'correction_force_generate',
+            'reason': (
+                'correction_force_generate'
+                if correction_force_generate
+                else 'correction_generate_on_unrecoverable'
+            ),
             'max_rollout_steps': int(max_steps),
         })
     perturb_action_prefix_raw = (
@@ -2604,6 +2676,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "correction_generated": bool(force_generate_correction),
         "closed_loop_fallback_used": bool(force_generate_correction),
         "correction_branch": correction_branch,
+        "sampled_phase_key": phase_key_fixed,
         "sampled_error_mode": sampled_error_mode,
         "forced_error_mode": forced_error_mode_key,
         "sampled_phase_bin_id": phase_bin_fixed,
@@ -2631,7 +2704,18 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "world_model_compare_sim": compare_sim_artifact,
         "evac_correction_video": evac_corr_video,
         "debug_dir": debug_dir,
+        "source_start_ts": int(start_ts),
+        "start_idx": int(start_ts),
+        "deviation_idx": int(start_ts),
         "error_action_prefix_raw": error_action_prefix_raw,
+        "corr_action_chunk_raw": np.asarray(corr, dtype=np.float32).copy(),
+        "corr_qpos_raw": np.asarray(curr_qpos_raw, dtype=np.float32).copy(),
+        "corr_image_chw_float": curr_image[0].detach().cpu().numpy().astype(np.float32),
+        # Exported correction episodes splice the clean original tail at the
+        # sampled GT time.  recover_eval gt_ref_idx is only a nearest-match
+        # diagnostic for judging base-policy recovery, and using it here can
+        # jump far ahead in the episode.
+        "attach_idx": int(start_ts),
         "perturb_action_prefix_raw": perturb_action_prefix_raw,
         "perturb_action_prefix_len": (
             0 if perturb_action_prefix_raw is None else int(perturb_action_prefix_raw.shape[0])

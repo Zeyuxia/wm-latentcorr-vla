@@ -29,6 +29,11 @@ if str(SMOLVLA_SRC_DIR) not in sys.path:
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from policy.ACT.constants import SIM_TASK_CONFIGS
 from policy.SmolVLA.latentcorr.act_aligned_correction import ACTAlignedCorrectionBuilder, build_act_aligned_cfg_from_args
+from policy.SmolVLA.latentcorr.correction_episode_io import (
+    export_correction_raw_episode,
+    export_correction_state_action_sample,
+    init_export_episode_id,
+)
 from policy.SmolVLA.latentcorr.evac_interface import EvacLatentTeacher
 from policy.SmolVLA.latentcorr.correction_policy_adapter import SampleBoundSmolVLAAdapter
 from policy.SmolVLA.latentcorr.failure_utils import active_arm_pattern_id_to_key, error_mode_id_to_key, phase_id_to_key
@@ -94,7 +99,15 @@ def get_explore_completed_sample_count(dataset, k_per_unit: int) -> int:
     current_trials = get_current_explore_trial_count(dataset)
     if hasattr(dataset, "_explore_unit_target_trials"):
         target_trials = list(getattr(dataset, "_explore_unit_target_trials", []))
-        return int(sum(int(x) for x in target_trials[:completed_units])) + int(current_trials)
+        if target_trials:
+            num_units = int(len(target_trials))
+            full_loops = int(completed_units) // num_units
+            rem_units = int(completed_units) % num_units
+            return (
+                int(full_loops) * int(sum(int(x) for x in target_trials))
+                + int(sum(int(x) for x in target_trials[:rem_units]))
+                + int(current_trials)
+            )
     return int(completed_units) * int(k_per_unit) + int(current_trials)
 
 
@@ -210,6 +223,38 @@ def write_failure_live_files(task_output_dir: Path, args, epoch: int, rank: int,
     os.replace(meta_tmp, meta_path)
 
 
+def write_corr_export_live_files(task_output_dir: Path, args, epoch: int, rank: int, export_records: list[dict]) -> None:
+    task_output_dir.mkdir(parents=True, exist_ok=True)
+    records_path = task_output_dir / f"correction_export_live_rank{int(rank):02d}.json"
+    tmp_path = records_path.with_name(records_path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(export_records, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, records_path)
+    shard_suffix = (
+        f"{args.corr_export_task_config}_state_action_shards"
+        if str(args.corr_export_format) == "state_action"
+        else f"{args.corr_export_task_config}_shards"
+    )
+    meta = {
+        "version": 1,
+        "mode": "corr_export_meta_live",
+        "epoch": int(epoch),
+        "rank": int(rank),
+        "world_size": int(args.world_size),
+        "corr_export_root": str(args.corr_export_root),
+        "corr_export_task_config": str(args.corr_export_task_config),
+        "corr_export_format": str(args.corr_export_format),
+        "corr_export_shard_suffix": str(shard_suffix),
+        "corr_export_max_loops": int(args.corr_export_max_loops),
+        "failure_explore_k": int(args.failure_explore_k),
+    }
+    meta_path = task_output_dir / f"correction_export_meta_rank{int(rank):02d}.json"
+    meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+    with open(meta_tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    os.replace(meta_tmp, meta_path)
+
+
 def sanitize_path_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     token = token.strip("._-")
@@ -308,8 +353,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--act_aligned_perturb_rot_max_deg", type=float, required=True)
     parser.add_argument("--act_aligned_perturb_gripper_close_min", type=float, required=True)
     parser.add_argument("--evac_blur_filter_enable", type=str2bool, default=False)
-    parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.25)
-    parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=24)
+    parser.add_argument("--evac_blur_filter_metric", type=str, choices=["sharpness_ratio", "grad_cosine", "mode_aware"], default="sharpness_ratio")
+    parser.add_argument("--evac_blur_filter_min_ratio", type=float, default=0.75)
+    parser.add_argument("--evac_blur_filter_region", type=str, choices=["full_image", "active_gripper_patch"], default="active_gripper_patch")
+    parser.add_argument("--evac_blur_filter_patch_pad_px", type=int, default=12)
+    parser.add_argument("--evac_blur_filter_gripper_axis_m", type=float, default=0.04)
     parser.add_argument("--evac_use_dual_cache", type=str2bool, default=False)
     parser.add_argument("--evac_dc_v_bounds", nargs="*", type=int, default=[])
     parser.add_argument("--evac_dc_budget", type=float, default=-1.0)
@@ -320,6 +368,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
     parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
     parser.add_argument("--world_model_backend", type=str, choices=["evac", "cosmos"], default="evac")
+    parser.add_argument("--world_model_quality_record", type=str, default="")
+    parser.add_argument("--world_model_quality_backend", type=str, choices=["evac", "cosmos"], default="")
     parser.add_argument("--cosmos_execution_mode", type=str, choices=["worker", "direct"], default="direct")
     parser.add_argument("--cosmos_root", type=str, default="/data/zhenyangfan/cosmos-predict2.5")
     parser.add_argument("--cosmos_python_bin", type=str, default="/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")
@@ -358,6 +408,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--world_model_compare_sim_autorun", type=str2bool, default=False)
     parser.add_argument("--world_model_compare_sim_timeout_s", type=float, default=600.0)
     parser.add_argument("--world_model_compare_cosmos_autorun", type=str2bool, default=False)
+    parser.add_argument("--corr_export_dataset", type=str2bool, default=False)
+    parser.add_argument("--corr_export_root", type=str, default="/data/zhenyangfan/RoboTwin/data")
+    parser.add_argument("--corr_export_task_config", type=str, default="demo_clean_corr_export")
+    parser.add_argument("--corr_export_format", type=str, choices=["raw_episode", "state_action"], default="raw_episode")
+    parser.add_argument("--corr_export_max_loops", type=int, default=1)
+    parser.add_argument("--corr_export_debug_video", type=str2bool, default=True)
+    parser.add_argument("--corr_export_fps", type=int, default=30)
     parser.add_argument(
         "--debug_max_samples_per_rank",
         type=int,
@@ -370,6 +427,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    if not str(args.world_model_quality_backend).strip():
+        args.world_model_quality_backend = str(args.world_model_backend).strip().lower()
     accelerator = build_accelerator()
     if args.rank is None:
         args.rank = int(accelerator.process_index)
@@ -403,6 +462,15 @@ def main() -> None:
         )
     device_obj = torch.device(args.device)
     if torch.cuda.is_available() and device_obj.type == "cuda":
+        if device_obj.index is None:
+            local_rank = int(
+                os.environ.get(
+                    "LOCAL_RANK",
+                    getattr(accelerator.state, "local_process_index", accelerator.local_process_index),
+                )
+            )
+            device_obj = torch.device("cuda", local_rank)
+            args.device = str(device_obj)
         torch.cuda.set_device(device_obj)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -482,6 +550,8 @@ def main() -> None:
         explore_error_modes=list(args.explore_error_modes),
         explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
         explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
+        world_model_quality_record=str(args.world_model_quality_record),
+        world_model_quality_backend=str(args.world_model_quality_backend),
     )
     init_sample = init_dataset[0]
     init_task_only, init_task_config = parse_task_parts(init_spec.task_name)
@@ -538,6 +608,7 @@ def main() -> None:
     world_size = int(max(1, int(args.world_size)))
     failure_explore_k_global = int(max(1, int(args.failure_explore_k)))
     failure_explore_k_local = int(max(1, (failure_explore_k_global + world_size - 1) // world_size))
+    corr_export_max_loops = int(max(1, int(args.corr_export_max_loops)))
     debug_max_samples_per_rank = int(max(0, int(args.debug_max_samples_per_rank)))
 
     task_run_stats: dict[str, dict] = {}
@@ -569,6 +640,8 @@ def main() -> None:
             explore_error_modes=list(args.explore_error_modes),
             explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
             explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
+            world_model_quality_record=str(args.world_model_quality_record),
+            world_model_quality_backend=str(args.world_model_quality_backend),
         )
         full_episode_ids = [int(ep) for ep in dataset.episode_ids]
         global_units = int(get_explore_num_units(dataset))
@@ -585,6 +658,8 @@ def main() -> None:
         task_only, _ = parse_task_parts(spec.task_name)
         task_order.append(task_only)
         task_samples = int(get_explore_total_target_samples(dataset, int(failure_explore_k_local)))
+        if bool(args.corr_export_dataset):
+            task_samples *= int(corr_export_max_loops)
         total_rank_samples += task_samples
         task_run_stats[task_only] = {
             "num_explore_units_local": int(total_units),
@@ -611,6 +686,18 @@ def main() -> None:
         "multi_task_names": list(args.multi_task_names),
         "rank": int(args.rank),
         "world_size": int(args.world_size),
+        "corr_export_dataset": bool(args.corr_export_dataset),
+        "corr_export_root": str(args.corr_export_root),
+        "corr_export_task_config": str(args.corr_export_task_config),
+        "corr_export_format": str(args.corr_export_format),
+        "corr_export_shard_suffix": (
+            f"{args.corr_export_task_config}_state_action_shards"
+            if str(args.corr_export_format) == "state_action"
+            else f"{args.corr_export_task_config}_shards"
+        ),
+        "corr_export_max_loops": int(corr_export_max_loops),
+        "world_model_quality_record": str(args.world_model_quality_record),
+        "world_model_quality_backend": str(args.world_model_quality_backend),
         "total_samples_local": int(total_rank_samples),
         "task_outputs": {},
     }
@@ -648,6 +735,8 @@ def main() -> None:
             explore_error_modes=list(args.explore_error_modes),
             explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
             explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
+            world_model_quality_record=str(args.world_model_quality_record),
+            world_model_quality_backend=str(args.world_model_quality_backend),
         )
         dataloader = DataLoader(
             dataset,
@@ -679,6 +768,7 @@ def main() -> None:
                 "task_name": spec.task_name,
                 "task_output_dir": str(task_output_dir),
                 "num_failure_trials": 0,
+                "num_correction_exports": 0,
                 "num_explore_units_local": 0,
                 "num_explore_units_global": int(task_run_stats[task_only]["num_explore_units_global"]),
                 "num_episode_ids_local": int(task_run_stats[task_only]["num_episode_ids_local"]),
@@ -700,10 +790,25 @@ def main() -> None:
                 "dataloader": dataloader,
                 "dataloader_iter": iter(dataloader),
                 "failure_trials": failure_trials,
+                "export_records": [],
+                "export_episode_id_next": int(
+                    init_export_episode_id(
+                        Path(args.corr_export_root)
+                        / task_only
+                        / (
+                            f"{args.corr_export_task_config}_state_action_shards"
+                            if str(args.corr_export_format) == "state_action"
+                            else f"{args.corr_export_task_config}_shards"
+                        )
+                        / f"rank{int(args.rank):02d}"
+                        / ("correction_data" if str(args.corr_export_format) == "state_action" else "data")
+                    )
+                ),
                 "epoch": int(epoch),
                 "processed_samples": int(processed_samples),
                 "local_task_done": bool(local_task_done),
-                "total_units": int(total_units),
+                "base_total_units": int(total_units),
+                "total_units": int(total_units) * int(corr_export_max_loops),
                 "task_total_samples": int(task_total_samples),
             }
         )
@@ -749,6 +854,7 @@ def main() -> None:
             dataset = ctx["dataset"]
             norm_stats = ctx["norm_stats"]
             failure_trials = ctx["failure_trials"]
+            export_records = ctx["export_records"]
             ctx["processed_samples"] = int(ctx["processed_samples"]) + 1
             processed_samples = int(ctx["processed_samples"])
             episode_id = int(batch["episode_id"][0].item())
@@ -877,6 +983,80 @@ def main() -> None:
                             "evac_blur_filter": corr_meta.get("evac_blur_filter"),
                         }
                     )
+                if (
+                    bool(args.corr_export_dataset)
+                    and isinstance(correction, dict)
+                    and correction.get("corr_image") is not None
+                    and correction.get("corr_qpos_norm") is not None
+                    and correction.get("corr_action_chunk_norm") is not None
+                    and bool(corr_meta.get("correction_generated", False))
+                    and recoverable_raw is False
+                ):
+                    corr_action_raw = corr_meta.get("corr_action_chunk_raw")
+                    if corr_action_raw is None:
+                        action_mean = torch.as_tensor(norm_stats["action_mean"], dtype=torch.float32)
+                        action_std = torch.as_tensor(norm_stats["action_std"], dtype=torch.float32)
+                        corr_action_raw = (
+                            correction["corr_action_chunk_norm"].detach().cpu() * action_std.view(1, -1)
+                            + action_mean.view(1, -1)
+                        ).numpy().astype(np.float32)
+                    corr_qpos_raw = corr_meta.get("corr_qpos_raw")
+                    if corr_qpos_raw is None:
+                        qpos_mean = torch.as_tensor(norm_stats["qpos_mean"], dtype=torch.float32)
+                        qpos_std = torch.as_tensor(norm_stats["qpos_std"], dtype=torch.float32)
+                        corr_qpos_raw = (
+                            correction["corr_qpos_norm"].detach().cpu() * qpos_std + qpos_mean
+                        ).numpy().astype(np.float32)
+                    attach_idx = corr_meta.get("attach_idx")
+                    if attach_idx is None:
+                        attach_idx = int(start_ts)
+                    if str(args.corr_export_format) == "state_action":
+                        export_record = export_correction_state_action_sample(
+                            export_root=Path(args.corr_export_root),
+                            task_name=task_only,
+                            task_config=str(args.corr_export_task_config),
+                            rank=int(args.rank),
+                            sample_id=int(ctx["export_episode_id_next"]),
+                            source_raw_data_dir=Path(spec.raw_data_dir),
+                            source_episode_id=int(episode_id),
+                            start_ts=int(start_ts),
+                            corr_action_raw=np.asarray(corr_action_raw, dtype=np.float32),
+                            corr_qpos_raw=np.asarray(corr_qpos_raw, dtype=np.float32),
+                            corr_image=correction["corr_image"][0].detach().cpu(),
+                            corr_meta=corr_meta,
+                            corr_action_norm=correction["corr_action_chunk_norm"].detach().cpu().numpy(),
+                            corr_qpos_norm=correction["corr_qpos_norm"].detach().cpu().numpy(),
+                        )
+                    else:
+                        export_record = export_correction_raw_episode(
+                            export_root=Path(args.corr_export_root),
+                            task_name=task_only,
+                            task_config=str(args.corr_export_task_config),
+                            rank=int(args.rank),
+                            episode_id=int(ctx["export_episode_id_next"]),
+                            source_raw_data_dir=Path(spec.raw_data_dir),
+                            source_episode_id=int(episode_id),
+                            start_ts=int(start_ts),
+                            attach_idx=int(attach_idx),
+                            corr_action_raw=np.asarray(corr_action_raw, dtype=np.float32),
+                            corr_qpos_raw=np.asarray(corr_qpos_raw, dtype=np.float32),
+                            corr_image=correction["corr_image"][0].detach().cpu(),
+                            corr_meta=corr_meta,
+                            fk=correction_builder.fk,
+                            fps=int(args.corr_export_fps),
+                            write_debug_video=bool(args.corr_export_debug_video),
+                            debug_video_dir=(
+                                None
+                                if sample_debug_dir is None
+                                else Path(sample_debug_dir) / "correction_export_debug_video"
+                            ),
+                        )
+                    export_record["loop_id"] = int(get_explore_completed_unit_count(dataset)) // max(
+                        1, int(ctx["base_total_units"])
+                    )
+                    export_record["explore_unit_idx"] = int(batch["sampled_explore_unit_idx"][0].item())
+                    export_records.append(export_record)
+                    ctx["export_episode_id_next"] = int(ctx["export_episode_id_next"]) + 1
 
             dataset.record_explore_trial(
                 int(batch["sampled_explore_unit_idx"][0].item()),
@@ -910,6 +1090,14 @@ def main() -> None:
                     f"task={task_only} {format_rank_progress(explore_progress)}"
                 )
             write_failure_live_files(task_output_dir, args, int(ctx["epoch"]), int(args.rank), failure_trials)
+            if bool(args.corr_export_dataset):
+                write_corr_export_live_files(
+                    task_output_dir,
+                    args,
+                    int(ctx["epoch"]),
+                    int(args.rank),
+                    export_records,
+                )
 
         all_task_done = bool(all(bool(item["local_task_done"]) for item in task_contexts))
 
@@ -917,10 +1105,23 @@ def main() -> None:
         task_only = str(ctx["task_only"])
         spec = ctx["spec"]
         failure_trials = ctx["failure_trials"]
+        export_records = ctx["export_records"]
+        corr_export_shard_suffix = (
+            f"{args.corr_export_task_config}_state_action_shards"
+            if str(args.corr_export_format) == "state_action"
+            else f"{args.corr_export_task_config}_shards"
+        )
         explore_manifest["task_outputs"][task_only] = {
             "task_name": spec.task_name,
             "task_output_dir": str(ctx["task_output_dir"]),
             "num_failure_trials": len(failure_trials),
+            "num_correction_exports": len(export_records),
+            "correction_export_shard_dir": str(
+                Path(args.corr_export_root)
+                / task_only
+                / corr_export_shard_suffix
+                / f"rank{int(args.rank):02d}"
+            ),
             "num_explore_units_local": int(ctx["total_units"]),
             "num_explore_units_global": int(task_run_stats[task_only]["num_explore_units_global"]),
             "num_episode_ids_local": int(task_run_stats[task_only]["num_episode_ids_local"]),

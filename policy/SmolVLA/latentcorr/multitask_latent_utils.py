@@ -8,7 +8,14 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from policy.SmolVLA.latentcorr.latent_dataset_utils import act_processed_images_to_rgb, resolve_raw_data_dir
+from policy.SmolVLA.latentcorr.latent_dataset_utils import (
+    act_processed_images_to_rgb,
+    get_episode_length,
+    is_lerobot_dataset_dir,
+    load_episode_qpos_action_arrays,
+    load_lerobot_episode_window,
+    resolve_raw_data_dir,
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +28,14 @@ class MultiTaskSpec:
 
 
 def _iter_episode_paths(dataset_dir: str, num_episodes: int):
+    if is_lerobot_dataset_dir(dataset_dir):
+        for episode_id in range(num_episodes):
+            try:
+                get_episode_length(dataset_dir, int(episode_id))
+            except FileNotFoundError:
+                continue
+            yield episode_id, dataset_dir
+        return
     for episode_id in range(num_episodes):
         path = os.path.join(dataset_dir, f"episode_{episode_id}.hdf5")
         if os.path.exists(path):
@@ -31,10 +46,15 @@ def get_multitask_norm_stats(task_specs: list[MultiTaskSpec]) -> dict[str, np.nd
     all_qpos = []
     all_action = []
     for spec in task_specs:
-        for _, path in _iter_episode_paths(spec.dataset_dir, spec.num_episodes):
-            with h5py.File(path, "r") as root:
-                all_qpos.append(torch.from_numpy(root["/observations/qpos"][()]))
-                all_action.append(torch.from_numpy(root["/action"][()]))
+        for episode_id, path in _iter_episode_paths(spec.dataset_dir, spec.num_episodes):
+            if is_lerobot_dataset_dir(spec.dataset_dir):
+                qpos, action = load_episode_qpos_action_arrays(spec.dataset_dir, int(episode_id))
+                all_qpos.append(torch.from_numpy(qpos))
+                all_action.append(torch.from_numpy(action))
+            else:
+                with h5py.File(path, "r") as root:
+                    all_qpos.append(torch.from_numpy(root["/observations/qpos"][()]))
+                    all_action.append(torch.from_numpy(root["/action"][()]))
     if not all_qpos:
         raise ValueError("No episodes found in any multitask dataset_dir")
 
@@ -84,9 +104,13 @@ class MultiTaskLatentWarmupDataset(Dataset):
         self.samples: list[tuple[int, int]] = []
         for task_idx, spec in enumerate(task_specs):
             for episode_id, path in _iter_episode_paths(spec.dataset_dir, spec.num_episodes):
-                with h5py.File(path, "r") as root:
-                    if int(root["/action"].shape[0]) >= self.future_offset + 1:
+                if is_lerobot_dataset_dir(spec.dataset_dir):
+                    if int(get_episode_length(spec.dataset_dir, int(episode_id))) >= self.future_offset + 1:
                         self.samples.append((task_idx, episode_id))
+                else:
+                    with h5py.File(path, "r") as root:
+                        if int(root["/action"].shape[0]) >= self.future_offset + 1:
+                            self.samples.append((task_idx, episode_id))
         if not self.samples:
             raise ValueError("No valid multitask samples found")
 
@@ -108,6 +132,27 @@ class MultiTaskLatentWarmupDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         task_idx, episode_id = self.samples[index]
         spec = self.task_specs[task_idx]
+        if is_lerobot_dataset_dir(spec.dataset_dir):
+            episode_len = get_episode_length(spec.dataset_dir, int(episode_id))
+            max_start = int(episode_len) - self.future_offset - 1
+            if max_start < 0:
+                raise ValueError(f"{spec.task_name} episode_{episode_id} too short: {episode_len}")
+            start_ts = int(np.random.randint(0, max_start + 1))
+            sample = load_lerobot_episode_window(
+                dataset_dir=spec.dataset_dir,
+                episode_id=int(episode_id),
+                camera_names=list(spec.camera_names),
+                norm_stats=self.stats,
+                act_chunk_size=self.act_chunk_size,
+                prefix_steps=self.prefix_steps,
+                future_offset=self.future_offset,
+                start_ts=start_ts,
+            )
+            sample["task_idx"] = torch.tensor(task_idx)
+            sample["task_name"] = spec.task_name
+            sample["raw_data_dir"] = "" if spec.raw_data_dir is None else spec.raw_data_dir
+            return sample
+
         path = os.path.join(spec.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(path, "r") as root:
             actions = root["/action"][()]

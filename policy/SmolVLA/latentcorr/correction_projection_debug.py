@@ -28,8 +28,15 @@ def _write_bgr_image(path, image_bgr):
 
 def _tensor_chw_to_bgr_u8(image):
     arr = image.detach().cpu().permute(1, 2, 0).numpy()
-    rgb = np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
-    return rgb[:, :, ::-1].copy()
+    image_u8 = np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+    color_order = str(os.environ.get("SMOLVLA_DEBUG_TENSOR_COLOR_ORDER", "rgb")).strip().lower()
+    if color_order == "rgb":
+        return image_u8[:, :, ::-1].copy()
+    if color_order != "bgr":
+        raise ValueError(
+            f"Unsupported SMOLVLA_DEBUG_TENSOR_COLOR_ORDER={color_order!r}; expected 'bgr' or 'rgb'"
+        )
+    return np.ascontiguousarray(image_u8)
 
 
 def _import_ddpm3d_module():
@@ -375,10 +382,12 @@ def save_recover_eval_compare_image(
             with h5py.File(episode_path, "r") as gt_file:
                 encoded = bytes(gt_file["observation/head_camera/rgb"][gt_idx])
             gt_img = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
-            if gt_img is not None and gt_img.size > 0:
-                gt_img = gt_img[:, :, ::-1].copy()
         if gt_img is None or gt_img.size == 0:
             return None
+        # RoboTwin raw JPEGs were historically encoded by OpenCV from simulator
+        # RGB arrays, so cv2.imdecode returns RGB-semantic values.  Convert only
+        # at the OpenCV visualization boundary; model inputs stay RGB-semantic.
+        gt_img = cv2.cvtColor(gt_img, cv2.COLOR_RGB2BGR)
 
         pred_img = _tensor_chw_to_bgr_u8(recover_pred_img)
         if pred_img.shape[:2] != gt_img.shape[:2]:
@@ -496,19 +505,26 @@ def save_perturb_compare_image(
         blur = rollout_record.get("evac_blur_filter")
         if isinstance(blur, dict):
             passed = blur.get("passed")
-            ratio = blur.get("sharpness_ratio")
+            requested_metric = blur.get("requested_metric")
+            metric = blur.get("metric", "sharpness_ratio")
+            score = blur.get("score", blur.get("sharpness_ratio"))
+            sharp_ratio = blur.get("sharpness_ratio")
+            grad_cos = blur.get("grad_cosine")
             min_ratio = blur.get("min_ratio")
             pred_s = blur.get("pred_sharpness")
             ref_s = blur.get("ref_sharpness")
             region = blur.get("region")
             bbox = blur.get("bbox_xyxy")
-            ratio_s = "None" if ratio is None else f"{float(ratio):.3f}"
+            score_s = "None" if score is None else f"{float(score):.3f}"
+            sharp_ratio_s = "None" if sharp_ratio is None else f"{float(sharp_ratio):.3f}"
+            grad_cos_s = "None" if grad_cos is None else f"{float(grad_cos):.3f}"
             min_ratio_s = "None" if min_ratio is None else f"{float(min_ratio):.3f}"
             pred_s_s = "None" if pred_s is None else f"{float(pred_s):.5f}"
             ref_s_s = "None" if ref_s is None else f"{float(ref_s):.5f}"
             lines.extend(
                 [
-                    f"evac_blur_filter passed={passed} region={region} ratio={ratio_s} min_ratio={min_ratio_s}",
+                    f"evac_blur_filter passed={passed} metric={metric} requested={requested_metric} score={score_s} min={min_ratio_s}",
+                    f"region={region} sharp_ratio={sharp_ratio_s} grad_cosine={grad_cos_s}",
                     f"blur_bbox_xyxy={bbox}",
                     f"sharpness pred={pred_s_s} ref={ref_s_s}",
                 ]

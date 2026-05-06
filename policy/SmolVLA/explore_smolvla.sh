@@ -10,7 +10,7 @@ SMOLVLA_CONDA_ENV=${SMOLVLA_CONDA_ENV:-smolvla_cosmos}
 conda activate "${SMOLVLA_CONDA_ENV}"
 cd /data/zhenyangfan/RoboTwin
 
-RUN_TAG="explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14"
+RUN_TAG="explore_stage1_spatial_projector_cosmos_chunk12"
 OUTPUT_DIR=/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore
 SMOLVLA_PRETRAINED_PATH=/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high/20260419_141110-rgb_seen_random/checkpoints/055000/pretrained_model
 STAGE1_CKPT=
@@ -21,18 +21,23 @@ MULTI_TASK_NAMES=(
   sim-place_burger_fries-demo_clean-50
   sim-handover_block-demo_clean-50
 )
+if [ -n "${MULTI_TASK_NAMES_OVERRIDE:-}" ]; then
+  read -r -a MULTI_TASK_NAMES <<< "${MULTI_TASK_NAMES_OVERRIDE}"
+fi
 SMOLVLA_LATENT_DATA_SOURCE=${SMOLVLA_LATENT_DATA_SOURCE:-smolvla_rgbfix}
 SMOLVLA_LATENT_DATA_ROOT=${SMOLVLA_LATENT_DATA_ROOT:-${SCRIPT_DIR}/data}
 SMOLVLA_LATENT_DATA_SUFFIX=${SMOLVLA_LATENT_DATA_SUFFIX:-_rgbfix}
 INSTRUCTION_TYPE=seen
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
-WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-evac}
+WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-cosmos}
+WORLD_MODEL_QUALITY_RECORD=${WORLD_MODEL_QUALITY_RECORD:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/world_model_quality_record.md}
+WORLD_MODEL_QUALITY_BACKEND=${WORLD_MODEL_QUALITY_BACKEND:-${WORLD_MODEL_BACKEND}}
 COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE:-direct}
 COSMOS_ROOT=${COSMOS_ROOT:-${SCRIPT_DIR}/cosmos-predict2.5}
 COSMOS_TARGET_ROOT=${COSMOS_TARGET_ROOT:-/data/zhenyangfan/cosmos-predict2.5}
 COSMOS_PYTHON_BIN=${COSMOS_PYTHON_BIN:-${COSMOS_TARGET_ROOT}/.venv/bin/python}
-COSMOS_CHECKPOINT_PATH=${COSMOS_CHECKPOINT_PATH:-${COSMOS_TARGET_ROOT}/outputs/cosmos_predict2_action_conditioned/cosmos_predict_v2p5/2b_robotwin_dualarm_action_conditioned_fullft_lr1e4_actioncond_fullft_gripperfix_4gpu_bsz8/checkpoints/iter_000010000_pt/model_ema_bf16.pt}
+COSMOS_CHECKPOINT_PATH=${COSMOS_CHECKPOINT_PATH:-${COSMOS_TARGET_ROOT}/outputs/cosmos_predict2_action_conditioned/cosmos_predict_v2p5/2b_robotwin_dualarm_action_conditioned_fullft_lr1e4_actioncond_fullft_gripperfix_4gpu_bsz8_openlaptop3x_from_iter10000_nooptim_20260502_171242/checkpoints/iter_000010000_pt/model_ema_bf16.pt}
 COSMOS_EXPERIMENT=${COSMOS_EXPERIMENT:-robotwin_dualarm_actioncond_2b_256_320}
 COSMOS_CONFIG_FILE=${COSMOS_CONFIG_FILE:-cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py}
 COSMOS_CUDA_VISIBLE_DEVICES=${COSMOS_CUDA_VISIBLE_DEVICES:-}
@@ -65,6 +70,13 @@ WORLD_MODEL_COMPARE_SIM=${WORLD_MODEL_COMPARE_SIM:-true}
 WORLD_MODEL_COMPARE_SIM_AUTORUN=${WORLD_MODEL_COMPARE_SIM_AUTORUN:-false}
 WORLD_MODEL_COMPARE_SIM_TIMEOUT_S=${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S:-600}
 WORLD_MODEL_COMPARE_COSMOS_AUTORUN=${WORLD_MODEL_COMPARE_COSMOS_AUTORUN:-false}
+CORR_EXPORT_DATASET=${CORR_EXPORT_DATASET:-true}
+CORR_EXPORT_ROOT=${CORR_EXPORT_ROOT:-/data/zhenyangfan/RoboTwin/data}
+CORR_EXPORT_TASK_CONFIG=${CORR_EXPORT_TASK_CONFIG:-demo_clean_corr_export}
+CORR_EXPORT_FORMAT=${CORR_EXPORT_FORMAT:-raw_episode}
+CORR_EXPORT_MAX_LOOPS=${CORR_EXPORT_MAX_LOOPS:-1}
+CORR_EXPORT_DEBUG_VIDEO=${CORR_EXPORT_DEBUG_VIDEO:-true}
+CORR_EXPORT_FPS=${CORR_EXPORT_FPS:-30}
 EXPLORE_DEBUG_MAX_SAMPLES=${EXPLORE_DEBUG_MAX_SAMPLES:-0}
 URDF_PATH=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 CUROBO_LEFT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -72,7 +84,7 @@ CUROBO_RIGHT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curo
 DEVICE=${DEVICE:-cuda}
 GPU_IDS=${GPU_IDS:-4,5,6,7}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-29501}
-SEED=0
+SEED=${SEED:-100}
 NUM_WORKERS=0
 FUTURE_OFFSET=16
 PREFIX_STEPS=16
@@ -83,35 +95,41 @@ PREDICTOR_HIDDEN_DIM=512
 ACT_CHUNK_SIZE=50
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
-FAILURE_PHASE_BINS=4
-FAILURE_TRANSLATION_DIR_BINS=6
-FAILURE_TRANSLATION_MAG_BINS=1
-FAILURE_ROTATION_DIR_BINS=6
-FAILURE_ROTATION_MAG_BINS=1
+FAILURE_PHASE_BINS=${FAILURE_PHASE_BINS:-4}
+FAILURE_TRANSLATION_DIR_BINS=${FAILURE_TRANSLATION_DIR_BINS:-6}
+FAILURE_TRANSLATION_MAG_BINS=${FAILURE_TRANSLATION_MAG_BINS:-1}
+FAILURE_ROTATION_DIR_BINS=${FAILURE_ROTATION_DIR_BINS:-6}
+FAILURE_ROTATION_MAG_BINS=${FAILURE_ROTATION_MAG_BINS:-1}
 FAILURE_EXPLORE_K=${FAILURE_EXPLORE_K:-4}
 EXPLORE_PHASE_KEYS=(
+  transport
   pregrasp
   approach
-  transport
   place
 )
+if [ -n "${EXPLORE_PHASE_KEYS_OVERRIDE:-}" ]; then
+  read -r -a EXPLORE_PHASE_KEYS <<< "${EXPLORE_PHASE_KEYS_OVERRIDE}"
+fi
 EXPLORE_ERROR_MODES=(
-  translation
-  rotation
   gripper_close
+  rotation
+  translation
 )
-EXPLORE_DISABLE_PHASE_BIN_SKIP=false
-EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT=true
-ACT_ALIGNED_ROLLOUT_EXEC_STEPS=12
+if [ -n "${EXPLORE_ERROR_MODES_OVERRIDE:-}" ]; then
+  read -r -a EXPLORE_ERROR_MODES <<< "${EXPLORE_ERROR_MODES_OVERRIDE}"
+fi
+EXPLORE_DISABLE_PHASE_BIN_SKIP=${EXPLORE_DISABLE_PHASE_BIN_SKIP:-false}
+EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT=${EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT:-false}
+ACT_ALIGNED_ROLLOUT_EXEC_STEPS=${ACT_ALIGNED_ROLLOUT_EXEC_STEPS:-12}
 PLANNER_ORIENT_WEIGHT=0.0573
 PLANNER_GRIPPER_PENALTY=1.0
 PLANNER_NEAREST_WINDOW_RADIUS=12
 PLANNER_ACTIVE_JOINT_DELTA_THRESH=0.01
 PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
-RECOVER_EVAL_SAVE_VIDEO=false
+RECOVER_EVAL_SAVE_VIDEO=${RECOVER_EVAL_SAVE_VIDEO:-true}
 SAVE_PERTURB_ROLLOUT_VIDEO=true
 SAVE_CORRECTION_DEBUG=true
-RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.3
+RECOVER_EVAL_GRIPPER_OPEN_THRESH=${RECOVER_EVAL_GRIPPER_OPEN_THRESH:-0.4}
 RECOVER_EVAL_POS_THRESH_M=0.04
 RECOVER_EVAL_ROT_THRESH_DEG=8.0
 RECOVER_EVAL_NEAREST_WINDOW_RADIUS=16
@@ -120,9 +138,12 @@ ACT_ALIGNED_ENABLE_PERTURB=true
 ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN=0.05
 ACT_ALIGNED_PERTURB_ROT_MAX_DEG=15.0
 ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN=0.10
-EVAC_BLUR_FILTER_ENABLE=true
-EVAC_BLUR_FILTER_MIN_RATIO=0.50
-EVAC_BLUR_FILTER_PATCH_PAD_PX=24
+EVAC_BLUR_FILTER_ENABLE=${EVAC_BLUR_FILTER_ENABLE:-false}
+EVAC_BLUR_FILTER_METRIC=${EVAC_BLUR_FILTER_METRIC:-sharpness_ratio}
+EVAC_BLUR_FILTER_MIN_RATIO=${EVAC_BLUR_FILTER_MIN_RATIO:-0.75}
+EVAC_BLUR_FILTER_REGION=${EVAC_BLUR_FILTER_REGION:-active_gripper_patch}
+EVAC_BLUR_FILTER_PATCH_PAD_PX=${EVAC_BLUR_FILTER_PATCH_PAD_PX:-12}
+EVAC_BLUR_FILTER_GRIPPER_AXIS_M=${EVAC_BLUR_FILTER_GRIPPER_AXIS_M:-0.04}
 EVAC_USE_DUAL_CACHE=true
 # bounds=(4 8 12 14): refresh v every few steps, then run full after step 14.
 EVAC_DC_V_BOUNDS=(4 8 12 14)
@@ -136,6 +157,8 @@ EVAC_DC_V_BLUR_STRENGTH=0.15
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 SMOLVLA_EVAC_PRINT_RUNTIME=false
+TORCHVISION_VIDEO_WARNING_FILTER="ignore:The video decoding and encoding capabilities of torchvision are deprecated:UserWarning:torchvision.io._video_deprecation_warning"
+PYTHONWARNINGS="${PYTHONWARNINGS:+${PYTHONWARNINGS},}${TORCHVISION_VIDEO_WARNING_FILTER}"
 PYTHONPATH="/data/zhenyangfan/RoboTwin:${LOCAL_SRC_DIR}"
 HF_HOME=${HF_HOME:-${SCRIPT_DIR}/.hf_home}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/datasets}
@@ -224,6 +247,7 @@ export PYTHONNOUSERSITE
 export PYTHONPATH
 export TOKENIZERS_PARALLELISM
 export SMOLVLA_EVAC_PRINT_RUNTIME
+export PYTHONWARNINGS
 export SMOLVLA_LATENT_DATA_SOURCE
 export SMOLVLA_LATENT_DATA_ROOT
 export SMOLVLA_LATENT_DATA_SUFFIX
@@ -297,8 +321,11 @@ CMD=(
     --act_aligned_perturb_rot_max_deg "${ACT_ALIGNED_PERTURB_ROT_MAX_DEG}" \
     --act_aligned_perturb_gripper_close_min "${ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN}" \
     --evac_blur_filter_enable "${EVAC_BLUR_FILTER_ENABLE}" \
+    --evac_blur_filter_metric "${EVAC_BLUR_FILTER_METRIC}" \
     --evac_blur_filter_min_ratio "${EVAC_BLUR_FILTER_MIN_RATIO}" \
+    --evac_blur_filter_region "${EVAC_BLUR_FILTER_REGION}" \
     --evac_blur_filter_patch_pad_px "${EVAC_BLUR_FILTER_PATCH_PAD_PX}" \
+    --evac_blur_filter_gripper_axis_m "${EVAC_BLUR_FILTER_GRIPPER_AXIS_M}" \
     --evac_use_dual_cache "${EVAC_USE_DUAL_CACHE}" \
     --evac_dc_v_bounds "${EVAC_DC_V_BOUNDS[@]}" \
     --evac_dc_budget "${EVAC_DC_BUDGET}" \
@@ -309,6 +336,8 @@ CMD=(
     --evac_dc_v_blur_kernel "${EVAC_DC_V_BLUR_KERNEL}" \
     --evac_dc_v_blur_strength "${EVAC_DC_V_BLUR_STRENGTH}" \
     --world_model_backend "${WORLD_MODEL_BACKEND}" \
+    --world_model_quality_record "${WORLD_MODEL_QUALITY_RECORD}" \
+    --world_model_quality_backend "${WORLD_MODEL_QUALITY_BACKEND}" \
     --cosmos_execution_mode "${COSMOS_EXECUTION_MODE}" \
     --cosmos_root "${COSMOS_ROOT}" \
     --cosmos_python_bin "${COSMOS_PYTHON_BIN}" \
@@ -343,6 +372,13 @@ CMD=(
     --world_model_compare_sim_autorun "${WORLD_MODEL_COMPARE_SIM_AUTORUN}" \
     --world_model_compare_sim_timeout_s "${WORLD_MODEL_COMPARE_SIM_TIMEOUT_S}" \
     --world_model_compare_cosmos_autorun "${WORLD_MODEL_COMPARE_COSMOS_AUTORUN}" \
+    --corr_export_dataset "${CORR_EXPORT_DATASET}" \
+    --corr_export_root "${CORR_EXPORT_ROOT}" \
+    --corr_export_task_config "${CORR_EXPORT_TASK_CONFIG}" \
+    --corr_export_format "${CORR_EXPORT_FORMAT}" \
+    --corr_export_max_loops "${CORR_EXPORT_MAX_LOOPS}" \
+    --corr_export_debug_video "${CORR_EXPORT_DEBUG_VIDEO}" \
+    --corr_export_fps "${CORR_EXPORT_FPS}" \
     --debug_max_samples_per_rank "${EXPLORE_DEBUG_MAX_SAMPLES}"
 )
 
@@ -358,7 +394,16 @@ echo "Latent dataset source: ${SMOLVLA_LATENT_DATA_SOURCE}"
 echo "Latent dataset root: ${SMOLVLA_LATENT_DATA_ROOT}"
 echo "Latent dataset suffix: ${SMOLVLA_LATENT_DATA_SUFFIX}"
 echo "World model backend: ${WORLD_MODEL_BACKEND}"
+echo "World model quality record: ${WORLD_MODEL_QUALITY_RECORD:-<disabled>}"
+echo "World model quality backend: ${WORLD_MODEL_QUALITY_BACKEND}"
 echo "World model compare mode: ${WORLD_MODEL_COMPARE_MODE}"
+echo "Correction export dataset: ${CORR_EXPORT_DATASET}"
+if [ "${CORR_EXPORT_DATASET}" = "true" ]; then
+  echo "Correction export root: ${CORR_EXPORT_ROOT}"
+  echo "Correction export task config: ${CORR_EXPORT_TASK_CONFIG}"
+  echo "Correction export format: ${CORR_EXPORT_FORMAT}"
+  echo "Correction export max loops: ${CORR_EXPORT_MAX_LOOPS}"
+fi
 if [ "${WORLD_MODEL_COMPARE_MODE}" = "true" ]; then
   echo "World model compare backends: ${WORLD_MODEL_COMPARE_BACKENDS[*]}"
   echo "World model compare sim: ${WORLD_MODEL_COMPARE_SIM} autorun=${WORLD_MODEL_COMPARE_SIM_AUTORUN}"

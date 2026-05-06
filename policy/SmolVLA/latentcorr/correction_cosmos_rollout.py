@@ -51,7 +51,7 @@ class CosmosRolloutClient:
         startup_timeout_s: float = 600.0,
         request_timeout_s: float = 900.0,
     ):
-        execution_mode = str(execution_mode or "worker").strip().lower()
+        execution_mode = str(execution_mode or "direct").strip().lower()
         if execution_mode not in {"worker", "direct"}:
             raise ValueError(f"Unsupported Cosmos execution_mode={execution_mode!r}; expected 'worker' or 'direct'.")
         self.cosmos_root = str(Path(cosmos_root).resolve())

@@ -47,10 +47,14 @@ def _infer_meta(src_dir: str) -> dict[str, int]:
 
 
 def _build_entries(trials: list[dict], fail_thresh: float) -> list[dict]:
-    stats: dict[tuple[str, int, int, str, int, int], dict[str, int]] = {}
+    stats: dict[tuple[str, str, str, int, int, str, int, int], dict[str, int]] = {}
     for trial in trials:
         try:
+            task_name = str(trial.get("task_name", "")).strip()
+            active_arm_pattern = str(trial.get("active_arm_pattern", "")).strip().lower()
             key = (
+                task_name,
+                active_arm_pattern,
                 str(trial["phase_key"]),
                 int(trial["phase_instance_idx"]),
                 int(trial["phase_bin_id"]),
@@ -68,29 +72,51 @@ def _build_entries(trials: list[dict], fail_thresh: float) -> list[dict]:
 
     entries = []
     for key, count in sorted(stats.items()):
-        phase_key, phase_instance_idx, phase_bin_id, error_mode, dir_bin_id, mag_bin_id = key
+        task_name, active_arm_pattern, phase_key, phase_instance_idx, phase_bin_id, error_mode, dir_bin_id, mag_bin_id = key
         n_trials = int(count["n"])
         n_recover = int(count["n_recover"])
         recover_rate = float(n_recover) / float(max(1, n_trials))
         if recover_rate > float(fail_thresh):
             continue
-        entries.append(
-            {
-                "phase_key": str(phase_key),
-                "phase_instance_idx": int(phase_instance_idx),
-                "phase_bin_id": int(phase_bin_id),
-                "error_mode": str(error_mode),
-                "active_arm_pattern": None,
-                "dir_bin_id": int(dir_bin_id),
-                "mag_bin_id": int(mag_bin_id),
-                "n_trials": int(n_trials),
-                "n_recover": int(n_recover),
-                "recover_rate": float(recover_rate),
-                "fail_rate": float(1.0 - recover_rate),
-                "weight": float(max(1e-6, 1.0 - recover_rate)),
-            }
-        )
+        entry = {
+            "phase_key": str(phase_key),
+            "phase_instance_idx": int(phase_instance_idx),
+            "phase_bin_id": int(phase_bin_id),
+            "error_mode": str(error_mode),
+            "active_arm_pattern": (active_arm_pattern or None),
+            "dir_bin_id": int(dir_bin_id),
+            "mag_bin_id": int(mag_bin_id),
+            "n_trials": int(n_trials),
+            "n_recover": int(n_recover),
+            "recover_rate": float(recover_rate),
+            "fail_rate": float(1.0 - recover_rate),
+            "weight": float(max(1e-6, 1.0 - recover_rate)),
+        }
+        if task_name != "":
+            entry["task_name"] = task_name
+        entries.append(entry)
     return entries
+
+
+def _drop_unscoped_entries_if_multitask(entries: list[dict]) -> list[dict]:
+    task_names = sorted(
+        {
+            str(entry.get("task_name", "")).strip()
+            for entry in entries
+            if str(entry.get("task_name", "")).strip() != ""
+        }
+    )
+    if len(task_names) <= 1:
+        return entries
+    filtered = [entry for entry in entries if str(entry.get("task_name", "")).strip() != ""]
+    dropped = int(len(entries) - len(filtered))
+    if dropped > 0:
+        print(
+            f"[merge_failure_tables] dropped {dropped} unscoped entries with empty task_name "
+            f"because multitask labels are available: {task_names}",
+            flush=True,
+        )
+    return filtered
 
 
 def merge_failure_dir(
@@ -116,14 +142,23 @@ def merge_failure_dir(
 
     meta = _infer_meta(src_dir)
     entries = _build_entries(trials, float(failure_fail_recover_rate_thresh))
+    entries = _drop_unscoped_entries_if_multitask(entries)
     mode = "explore_merged_live" if epoch is None else "explore_merged_epoch"
 
     merged_trials_path = os.path.join(dst_dir, "failure_trials_merged.json")
     with open(merged_trials_path, "w", encoding="utf-8") as f:
         json.dump(trials, f, indent=2, ensure_ascii=False)
 
+    task_names = sorted(
+        {
+            str(entry.get("task_name", "")).strip()
+            for entry in entries
+            if str(entry.get("task_name", "")).strip() != ""
+        }
+    )
+
     table = {
-        "version": 4,
+        "version": 5,
         "mode": mode,
         "epoch": (None if epoch is None else int(epoch)),
         "failure_phase_bins": int(meta["failure_phase_bins"]),
@@ -133,6 +168,7 @@ def merge_failure_dir(
         "failure_rotation_mag_bins": int(meta["failure_rotation_mag_bins"]),
         "failure_explore_k": int(meta["failure_explore_k"]),
         "failure_fail_recover_rate_thresh": float(failure_fail_recover_rate_thresh),
+        "task_names": task_names,
         "entries": entries,
     }
 

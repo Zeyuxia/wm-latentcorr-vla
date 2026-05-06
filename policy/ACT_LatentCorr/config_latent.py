@@ -15,6 +15,7 @@ class LatentLossConfig:
     lambda_action: float = 1.0
     lambda_action_conditioned: float = 0.0
     schedule_action_conditioned: bool = False
+    lambda_condition_token: float = 1.0
     lambda_align: float = 0.1
     beta_dynamics_max: float = 1.0
     lambda_wm_action_current: float = 0.0
@@ -35,4 +36,5 @@ class LatentModelConfig:
     predictor_mlp_hidden: int = 512
     action_decoder_hidden: int = 512
     action_dim: int = 14
+    state_dim: int = 14
     prefix_steps: int = 16
