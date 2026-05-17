@@ -111,8 +111,13 @@ def main(usr_args):
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     # Let CLI overrides win over task yaml for eval-time switches such as video logging.
+    # argparse gives CLI values as strings, and bool("false") is True, so parse explicitly.
     if "eval_video_log" in usr_args and usr_args["eval_video_log"] is not None:
-        args["eval_video_log"] = bool(usr_args["eval_video_log"])
+        value = usr_args["eval_video_log"]
+        if isinstance(value, str):
+            args["eval_video_log"] = value.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            args["eval_video_log"] = bool(value)
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -224,6 +229,7 @@ def main(usr_args):
                                                    seed_list=seed_list,
                                                    video_size=video_size,
                                                    instruction_type=instruction_type,
+                                                   expert_check=bool(usr_args.get("expert_check", True)),
                                                    initial_success_count=initial_success_count,
                                                    initial_test_count=initial_test_count)
     suc_nums.append(suc_num)
@@ -251,12 +257,12 @@ def eval_policy(task_name,
                 seed_list=None,
                 video_size=None,
                 instruction_type=None,
+                expert_check=True,
                 initial_success_count=0,
                 initial_test_count=0):
     print(colorize(f"Task Name: {args['task_name']}", "34"))
     print(colorize(f"Policy Name: {args['policy_name']}", "34"))
-
-    expert_check = True
+    print(colorize(f"Expert Check: {expert_check}", "34"))
     TASK_ENV.suc = int(initial_success_count)
     TASK_ENV.test_num = int(initial_test_count)
 
@@ -285,6 +291,7 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        episode_info = None
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
@@ -332,11 +339,20 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
+        if episode_info is not None and isinstance(episode_info, dict):
+            episode_meta = episode_info.get("info", {})
+        elif hasattr(TASK_ENV, "info") and isinstance(TASK_ENV.info, dict):
+            episode_meta = TASK_ENV.info.get("info", {})
+        else:
+            episode_meta = {}
+        episode_info_list = [episode_meta]
         random.seed(now_seed)
         np.random.seed(now_seed)
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instruction_candidates = []
+        if results:
+            instruction_candidates = results[0].get(instruction_type, []) or []
+        instruction = np.random.choice(instruction_candidates) if instruction_candidates else None
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:

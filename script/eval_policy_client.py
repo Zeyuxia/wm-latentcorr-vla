@@ -388,6 +388,7 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        episode_info = None
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
@@ -423,11 +424,20 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
+        if episode_info is not None and isinstance(episode_info, dict):
+            episode_meta = episode_info.get("info", {})
+        elif hasattr(TASK_ENV, "info") and isinstance(TASK_ENV.info, dict):
+            episode_meta = TASK_ENV.info.get("info", {})
+        else:
+            episode_meta = {}
+        episode_info_list = [episode_meta]
         random.seed(now_seed)
         np.random.seed(now_seed)
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instruction_candidates = []
+        if results:
+            instruction_candidates = results[0].get(instruction_type, []) or []
+        instruction = np.random.choice(instruction_candidates) if instruction_candidates else None
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
