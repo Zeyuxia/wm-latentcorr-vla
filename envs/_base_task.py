@@ -75,6 +75,7 @@ class Base_Task(gym.Env):
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
+        self.disable_planner = bool(kwags.get("disable_planner", False))
 
         # Keep TOPP/MPLib optional. Policy eval and saved-qpos replay only need
         # the Curobo planner unless a caller explicitly asks for TOPP.
@@ -96,7 +97,7 @@ class Base_Task(gym.Env):
         self.plan_success = True
         self.step_lim = None
         self.fix_gripper = False
-        self.setup_scene()
+        self.setup_scene(**kwags)
 
         self.left_js = None
         self.right_js = None
@@ -223,7 +224,11 @@ class Base_Task(gym.Env):
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        ray_tracing_denoiser = kwargs.get("ray_tracing_denoiser", "oidn")
+        if ray_tracing_denoiser is not None:
+            denoiser_name = str(ray_tracing_denoiser).strip().lower()
+            if denoiser_name not in {"", "none", "off", "false", "0"}:
+                sapien.render.set_ray_tracing_denoiser(denoiser_name)
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -396,9 +401,11 @@ class Base_Task(gym.Env):
         """
         kwags = dict(kwags)
         kwags.pop("need_topp", None)
+        kwags.pop("disable_planner", None)
         if not hasattr(self, "robot"):
             self.robot = Robot(self.scene, self.need_topp, **kwags)
-            self.robot.set_planner(self.scene)
+            if not self.disable_planner:
+                self.robot.set_planner(self.scene)
             self.robot.init_joints()
         else:
             self.robot.reset(self.scene, self.need_topp, **kwags)

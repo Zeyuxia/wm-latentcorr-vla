@@ -1,7 +1,6 @@
 import sapien.core as sapien
 import numpy as np
 import pdb
-from .planner import MplibPlanner
 import numpy as np
 import toppra as ta
 import math
@@ -12,8 +11,19 @@ from copy import deepcopy
 import sapien.core as sapien
 import envs._GLOBAL_CONFIGS as CONFIGS
 from envs.utils import transforms
-from .planner import CuroboPlanner
 import torch.multiprocessing as mp
+
+
+def _get_curobo_planner_cls():
+    from .planner import CuroboPlanner
+
+    return CuroboPlanner
+
+
+def _get_mplib_planner_cls():
+    from .planner import MplibPlanner
+
+    return MplibPlanner
 
 
 class Robot:
@@ -132,6 +142,7 @@ class Robot:
                 self.right_conn.send({"cmd": "reset"})
                 _ = self.right_conn.recv()
         else:
+            CuroboPlanner = _get_curobo_planner_cls()
             if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
                 self.set_planner(scene=scene)
 
@@ -255,6 +266,8 @@ class Robot:
         print("right ee: ", self.right_ee.get_name())
 
     def set_planner(self, scene=None):
+        CuroboPlanner = _get_curobo_planner_cls()
+        MplibPlanner = _get_mplib_planner_cls()
         abs_left_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.left_curobo_yml_path)
         abs_right_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.right_curobo_yml_path)
 
@@ -661,7 +674,7 @@ class Robot:
 
 def planner_process_worker(conn, args):
     import os
-    from .planner import CuroboPlanner  # 或者绝对路径导入
+    CuroboPlanner = _get_curobo_planner_cls()
 
     planner = CuroboPlanner(args["origin_pose"], args["joints_name"], args["all_joints"], yml_path=args["yml_path"])
 

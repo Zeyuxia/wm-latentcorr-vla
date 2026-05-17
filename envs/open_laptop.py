@@ -8,6 +8,17 @@ class open_laptop(Base_Task):
 
     def setup_demo(self, is_test=False, **kwags):
         super()._init_task_env_(**kwags)
+        self._refresh_episode_meta()
+
+    def _refresh_episode_meta(self):
+        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
+        arm_tag = ArmTag("left" if face_prod > 0 else "right")
+        self.arm_tag = arm_tag
+        self.info["info"] = {
+            "{A}": f"{self.model_name}/base{self.model_id}",
+            "{a}": str(arm_tag),
+        }
+        return arm_tag
 
     def load_actors(self):
         self.model_name = "015_laptop"
@@ -30,9 +41,7 @@ class open_laptop(Base_Task):
         self.add_prohibit_area(self.laptop, padding=0.1)
 
     def play_once(self):
-        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
-        arm_tag = ArmTag("left" if face_prod > 0 else "right")
-        self.arm_tag = arm_tag
+        arm_tag = self._refresh_episode_meta()
 
         # Grasp the laptop
         self.move(self.grasp_actor(self.laptop, arm_tag=arm_tag, pre_grasp_dis=0.08, contact_point_id=0))
@@ -52,10 +61,7 @@ class open_laptop(Base_Task):
             if self.check_success(target=0.5):
                 break
 
-        self.info["info"] = {
-            "{A}": f"{self.model_name}/base{self.model_id}",
-            "{a}": str(arm_tag),
-        }
+        self._refresh_episode_meta()
         return self.info
 
     def check_success(self, target=0.4):

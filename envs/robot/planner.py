@@ -59,6 +59,7 @@ try:
             all_joints,
             yml_path=None,
             device=None,
+            do_warmup=True,
         ):
             super().__init__()
             ta.setup_logging("CRITICAL")  # hide logging
@@ -107,7 +108,8 @@ try:
             )
 
             self.motion_gen = MotionGen(motion_gen_config)
-            self.motion_gen.warmup()
+            if bool(do_warmup):
+                self.motion_gen.warmup()
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
@@ -117,7 +119,8 @@ try:
                 num_graph_seeds=1,
             )
             self.motion_gen_batch = MotionGen(motion_gen_config)
-            self.motion_gen_batch.warmup(batch=CONFIGS.ROTATE_NUM)
+            if bool(do_warmup):
+                self.motion_gen_batch.warmup(batch=CONFIGS.ROTATE_NUM)
 
         def plan_path(
             self,
