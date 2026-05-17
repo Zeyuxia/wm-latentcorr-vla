@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 import signal
+import traceback
 
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ def _init_act_correction_modules(
     curobo_left_yml: str,
     curobo_right_yml: str,
     device: torch.device,
+    planner_warmup: bool = False,
 ) -> dict[str, Any]:
     import sapien
     from omegaconf import OmegaConf
@@ -73,8 +75,22 @@ def _init_act_correction_modules(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=device)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=device)
+    planner_left = CuroboPlanner(
+        root_pose,
+        left_joints,
+        fk.jnames,
+        yml_path=curobo_left_yml,
+        device=device,
+        do_warmup=planner_warmup,
+    )
+    planner_right = CuroboPlanner(
+        root_pose,
+        right_joints,
+        fk.jnames,
+        yml_path=curobo_right_yml,
+        device=device,
+        do_warmup=planner_warmup,
+    )
     return {
         "evac_model": evac_model,
         "evac_config": evac_cfg,
@@ -90,6 +106,7 @@ def _init_act_correction_modules_without_loading_evac(
     urdf_path: str,
     curobo_left_yml: str,
     curobo_right_yml: str,
+    planner_warmup: bool = False,
 ) -> dict[str, Any]:
     import sapien
     from policy.ACT.util.fk_sapien import SapienFK
@@ -111,8 +128,23 @@ def _init_act_correction_modules_without_loading_evac(
     root_pose = sapien.Pose([0, -0.65, 0], [0.707, 0, 0, 0.707])
     left_joints = [f"fl_joint{i}" for i in range(1, 7)]
     right_joints = [f"fr_joint{i}" for i in range(1, 7)]
-    planner_left = CuroboPlanner(root_pose, left_joints, fk.jnames, yml_path=curobo_left_yml, device=next(shared_evac_model.parameters()).device)
-    planner_right = CuroboPlanner(root_pose, right_joints, fk.jnames, yml_path=curobo_right_yml, device=next(shared_evac_model.parameters()).device)
+    planner_device = next(shared_evac_model.parameters()).device
+    planner_left = CuroboPlanner(
+        root_pose,
+        left_joints,
+        fk.jnames,
+        yml_path=curobo_left_yml,
+        device=planner_device,
+        do_warmup=planner_warmup,
+    )
+    planner_right = CuroboPlanner(
+        root_pose,
+        right_joints,
+        fk.jnames,
+        yml_path=curobo_right_yml,
+        device=planner_device,
+        do_warmup=planner_warmup,
+    )
     return {
         "evac_model": shared_evac_model,
         "evac_config": shared_evac_config,
@@ -332,6 +364,7 @@ class ACTAlignedCorrectionBuilder:
         evac_config: str | None = None,
         shared_evac_model=None,
         shared_evac_config=None,
+        planner_warmup: bool = False,
     ):
         self.cfg = cfg
         self.device = torch.device(device)
@@ -343,6 +376,7 @@ class ACTAlignedCorrectionBuilder:
                 urdf_path=urdf_path,
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
+                planner_warmup=planner_warmup,
             )
         else:
             if evac_ckpt is None or evac_config is None:
@@ -354,6 +388,7 @@ class ACTAlignedCorrectionBuilder:
                 curobo_left_yml=curobo_left_yml,
                 curobo_right_yml=curobo_right_yml,
                 device=self.device,
+                planner_warmup=planner_warmup,
             )
         self.fk = self.modules["fk"]
         self._last_skip_meta: dict[str, Any] | None = None
@@ -417,6 +452,7 @@ class ACTAlignedCorrectionBuilder:
         runtime_cfg = self.cfg.to_runtime_dict()
         if failure_mode_override is not None:
             runtime_cfg["failure_mode"] = str(failure_mode_override).strip().lower()
+        runtime_failure_mode = str(runtime_cfg.get("failure_mode", "")).strip().lower()
         precomputed_action_chunk_raw = None
         if precomputed_action_chunk_norm is not None:
             chunk_norm = precomputed_action_chunk_norm.detach().to(dtype=torch.float32, device="cpu")
@@ -436,33 +472,35 @@ class ACTAlignedCorrectionBuilder:
             precomputed_action_chunk_raw = precomputed_action_chunk_raw.numpy()
             precomputed_action_chunk_raw[..., 6] = np.clip(precomputed_action_chunk_raw[..., 6], 0.0, 1.0)
             precomputed_action_chunk_raw[..., 13] = np.clip(precomputed_action_chunk_raw[..., 13], 0.0, 1.0)
+        use_timeout_guard = bool(float(self.cfg.sample_timeout_sec) > 0.0) and runtime_failure_mode == "explore"
         try:
-            with _sample_timeout_guard(float(self.cfg.sample_timeout_sec)):
-                corr = correction_step(
-                    adapter,
-                    image_t,
-                    qpos_t,
-                    raw_data,
-                    norm_stats,
-                    self.modules,
-                    runtime_cfg,
-                    self.device,
-                    debug_dir=debug_dir,
-                    start_ts=int(start_ts),
-                    sampled_phase_id=sampled_phase_id,
-                    pregrasp_seg_start=pregrasp_seg_start,
-                    pregrasp_seg_end=pregrasp_seg_end,
-                    sampled_phase_bin_id=sampled_phase_bin_id,
-                    sampled_phase_instance_id=sampled_phase_instance_id,
-                    forced_error_mode_id=forced_error_mode_id,
-                    sampled_active_arm_pattern_id=sampled_active_arm_pattern_id,
-                    forced_dir_bin_id=forced_dir_bin_id,
-                    forced_mag_bin_id=forced_mag_bin_id,
-                    sampled_mode_prob=sampled_mode_prob,
-                    sampled_entry_prob_within_mode=sampled_entry_prob_within_mode,
-                    sampled_unit_prob=sampled_unit_prob,
-                    precomputed_action_chunk_raw=precomputed_action_chunk_raw,
-                )
+            with torch.enable_grad():
+                with _sample_timeout_guard(float(self.cfg.sample_timeout_sec)) if use_timeout_guard else nullcontext():
+                    corr = correction_step(
+                        adapter,
+                        image_t,
+                        qpos_t,
+                        raw_data,
+                        norm_stats,
+                        self.modules,
+                        runtime_cfg,
+                        self.device,
+                        debug_dir=debug_dir,
+                        start_ts=int(start_ts),
+                        sampled_phase_id=sampled_phase_id,
+                        pregrasp_seg_start=pregrasp_seg_start,
+                        pregrasp_seg_end=pregrasp_seg_end,
+                        sampled_phase_bin_id=sampled_phase_bin_id,
+                        sampled_phase_instance_id=sampled_phase_instance_id,
+                        forced_error_mode_id=forced_error_mode_id,
+                        sampled_active_arm_pattern_id=sampled_active_arm_pattern_id,
+                        forced_dir_bin_id=forced_dir_bin_id,
+                        forced_mag_bin_id=forced_mag_bin_id,
+                        sampled_mode_prob=sampled_mode_prob,
+                        sampled_entry_prob_within_mode=sampled_entry_prob_within_mode,
+                        sampled_unit_prob=sampled_unit_prob,
+                        precomputed_action_chunk_raw=precomputed_action_chunk_raw,
+                    )
         except _CorrectionBuildTimeout as exc:
             self._last_skip_meta = {
                 "correction_generated": False,
@@ -477,6 +515,7 @@ class ACTAlignedCorrectionBuilder:
                 "correction_branch": "error",
                 "skip_reason": "builder_exception",
                 "skip_error": repr(exc),
+                "skip_traceback": traceback.format_exc(),
             }
             return None
         if corr is None:
@@ -488,7 +527,6 @@ class ACTAlignedCorrectionBuilder:
             return None
 
         corr_image, corr_qpos_norm, corr_action_norm, corr_is_pad, corr_meta = corr
-        runtime_failure_mode = str(runtime_cfg.get("failure_mode", "")).strip().lower()
         if corr_image is None or corr_qpos_norm is None or corr_action_norm is None or corr_is_pad is None:
             if runtime_failure_mode == "explore" and isinstance(corr_meta, dict):
                 return {

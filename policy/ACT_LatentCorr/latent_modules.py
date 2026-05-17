@@ -164,6 +164,67 @@ class ActionConditionedPredictor(nn.Module):
         return z
 
 
+class ObservationConditionedFuturePredictor(nn.Module):
+    """
+    Predict future WM-aligned latent directly from current projected latent/state.
+
+    This is the deployable future-latent path used by the new workflow.
+    It does not depend on future actions at inference time.
+    """
+
+    def __init__(self, channels: int, state_dim: int, hidden_dim: int, num_blocks: int = 3):
+        super().__init__()
+        self.state_proj = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, channels * 2),
+        )
+        self.blocks = nn.ModuleList([AdaLNResBlock(channels) for _ in range(num_blocks)])
+
+    def forward(self, z_t: torch.Tensor, qpos_t: torch.Tensor) -> torch.Tensor:
+        if z_t.ndim != 4:
+            raise ValueError(f"z_t must be (B, C, H, W), got {z_t.shape}")
+        if qpos_t.ndim != 2:
+            raise ValueError(f"qpos_t must be (B, A), got {qpos_t.shape}")
+        gb = self.state_proj(qpos_t)
+        gamma, beta = torch.chunk(gb, 2, dim=1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
+        z = z_t
+        for blk in self.blocks:
+            z = blk(z, gamma, beta)
+        return z
+
+
+class LatentToTokenAdapter(nn.Module):
+    """
+    Map a WM-aligned latent map into ACT hidden-token space.
+    """
+
+    def __init__(self, latent_channels: int, token_dim: int, hidden_dim: int, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = int(latent_channels)
+        depth = max(1, int(num_layers))
+        for layer_idx in range(depth - 1):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, token_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z_t: torch.Tensor) -> torch.Tensor:
+        if z_t.ndim != 4:
+            raise ValueError(f"z_t must be (B, C, H, W), got {z_t.shape}")
+        pooled = F.adaptive_avg_pool2d(z_t, output_size=1).flatten(1)
+        return self.net(pooled)
+
+
 class FutureTokenPredictor(nn.Module):
     """
     Predict the deployable future condition token directly from current observation features.

@@ -35,6 +35,13 @@ def _safe_float_or_nan(value) -> float:
         return float("nan")
 
 
+def _failure_group_key(item: dict) -> tuple[str, str]:
+    return (
+        str(item.get("phase_key", "na")).strip().lower(),
+        str(item.get("error_mode", "na")).strip().lower(),
+    )
+
+
 class FailureAwareStage2Dataset(Dataset):
     def __init__(
         self,
@@ -57,6 +64,7 @@ class FailureAwareStage2Dataset(Dataset):
         failure_rotation_mag_bins: int = 3,
         failure_explore_k: int = 1,
         task_name: str = "",
+        rebalance_failure_groups: bool = False,
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -78,6 +86,7 @@ class FailureAwareStage2Dataset(Dataset):
         self._task_name = str(task_name).strip()
         self.failure_phase_bins = int(max(1, failure_phase_bins))
         self.failure_explore_k = int(max(1, failure_explore_k))
+        self.rebalance_failure_groups = bool(rebalance_failure_groups)
         self.failure_skip_approach_bins = 0
         if self.failure_mode == "explore":
             skip_bins = int(np.floor(float(self.sample_skip_head_ratio or 0.0) * float(self.failure_phase_bins)))
@@ -94,6 +103,8 @@ class FailureAwareStage2Dataset(Dataset):
         self._failure_entries: list[dict] = []
         self._failure_entries_by_mode: dict[str, list[dict]] = {}
         self._failure_mode_probs: dict[str, float] | None = None
+        self._failure_entries_by_mode_and_group: dict[str, dict[tuple[str, str], list[dict]]] = {}
+        self._failure_group_probs_by_mode: dict[str, dict[tuple[str, str], float]] = {}
         self._explore_units: list[dict] = []
         self._explore_curr_unit_idx = 0
         self._explore_k_local = int(self.failure_explore_k)
@@ -269,6 +280,12 @@ class FailureAwareStage2Dataset(Dataset):
             if not mode_entries:
                 continue
             by_mode[mode] = mode_entries
+            if self.rebalance_failure_groups:
+                group_map: dict[tuple[str, str], list[dict]] = {}
+                for item in mode_entries:
+                    key = _failure_group_key(item)
+                    group_map.setdefault(key, []).append(item)
+                self._failure_entries_by_mode_and_group[mode] = group_map
             n_trials_sum = 0.0
             n_recover_sum = 0.0
             fail_rate_fallback = []
@@ -295,6 +312,63 @@ class FailureAwareStage2Dataset(Dataset):
                 probs = np.ones(len(mode_scores), dtype=np.float64)
             probs = probs / np.sum(probs)
             self._failure_mode_probs = {str(mode_scores[i][0]): float(probs[i]) for i in range(len(mode_scores))}
+        if self.rebalance_failure_groups:
+            self._refresh_failure_group_probs()
+
+    def _refresh_failure_group_probs(self) -> None:
+        self._failure_group_probs_by_mode = {}
+        if not self.rebalance_failure_groups:
+            return
+        for mode, group_map in self._failure_entries_by_mode_and_group.items():
+            if not group_map:
+                continue
+            group_keys = list(group_map.keys())
+            group_probs = np.ones(len(group_keys), dtype=np.float64)
+            group_probs = group_probs / np.sum(group_probs)
+            self._failure_group_probs_by_mode[mode] = {
+                group_keys[idx]: float(group_probs[idx]) for idx in range(len(group_keys))
+            }
+
+    def _remove_failure_unit_from_train_pool(self, unit: dict) -> None:
+        if self.failure_mode != "train":
+            return
+
+        key_fields = (
+            "phase_key",
+            "phase_instance_idx",
+            "phase_bin_id",
+            "error_mode",
+            "active_arm_pattern",
+            "dir_bin_id",
+            "mag_bin_id",
+        )
+
+        def _same_unit(item: dict) -> bool:
+            return all(item.get(k) == unit.get(k) for k in key_fields)
+
+        self._failure_entries = [x for x in self._failure_entries if not _same_unit(x)]
+        mode = str(unit.get("error_mode", ""))
+
+        if mode in self._failure_entries_by_mode:
+            kept_mode_entries = [x for x in self._failure_entries_by_mode[mode] if not _same_unit(x)]
+            if kept_mode_entries:
+                self._failure_entries_by_mode[mode] = kept_mode_entries
+            else:
+                self._failure_entries_by_mode.pop(mode, None)
+                if self._failure_mode_probs is not None:
+                    self._failure_mode_probs.pop(mode, None)
+
+        if self.rebalance_failure_groups and mode in self._failure_entries_by_mode_and_group:
+            kept_group_map: dict[tuple[str, str], list[dict]] = {}
+            for group_key, group_entries in self._failure_entries_by_mode_and_group[mode].items():
+                kept_group_entries = [x for x in group_entries if not _same_unit(x)]
+                if kept_group_entries:
+                    kept_group_map[group_key] = kept_group_entries
+            if kept_group_map:
+                self._failure_entries_by_mode_and_group[mode] = kept_group_map
+            else:
+                self._failure_entries_by_mode_and_group.pop(mode, None)
+            self._refresh_failure_group_probs()
 
     def _collect_local_explore_phase_units(self) -> list[dict]:
         unit_keys = set()
@@ -518,7 +592,25 @@ class FailureAwareStage2Dataset(Dataset):
         mode_idx = int(np.random.choice(len(mode_keys), p=mode_probs_arr))
         picked_mode = str(mode_keys[mode_idx])
         picked_mode_prob = float(mode_probs_arr[mode_idx])
-        entries = list(self._failure_entries_by_mode[picked_mode])
+        group_prob_within_mode = 1.0
+        entries = []
+        if self.rebalance_failure_groups:
+            group_prob_map = self._failure_group_probs_by_mode.get(picked_mode, {})
+            if group_prob_map:
+                group_keys = list(group_prob_map.keys())
+                group_probs_arr = np.asarray(
+                    [float(group_prob_map[key]) for key in group_keys],
+                    dtype=np.float64,
+                )
+                if (not np.all(np.isfinite(group_probs_arr))) or float(np.sum(group_probs_arr)) <= 1e-12:
+                    group_probs_arr = np.ones(len(group_keys), dtype=np.float64)
+                group_probs_arr = group_probs_arr / np.sum(group_probs_arr)
+                group_idx = int(np.random.choice(len(group_keys), p=group_probs_arr))
+                picked_group = group_keys[group_idx]
+                group_prob_within_mode = float(group_probs_arr[group_idx])
+                entries = list(self._failure_entries_by_mode_and_group[picked_mode][picked_group])
+        if not entries:
+            entries = list(self._failure_entries_by_mode[picked_mode])
         weights = np.asarray([float(x.get("weight", 1.0)) for x in entries], dtype=np.float64)
         if (not np.all(np.isfinite(weights))) or float(np.sum(weights)) <= 1e-12:
             weights = np.ones(len(entries), dtype=np.float64)
@@ -526,8 +618,10 @@ class FailureAwareStage2Dataset(Dataset):
         idx_local = int(np.random.choice(len(entries), p=weights))
         picked = dict(entries[idx_local])
         picked["sampled_mode_prob"] = picked_mode_prob
-        picked["sampled_entry_prob_within_mode"] = float(weights[idx_local])
-        picked["sampled_unit_prob"] = float(picked_mode_prob * float(weights[idx_local]))
+        picked["sampled_entry_prob_within_mode"] = float(group_prob_within_mode * float(weights[idx_local]))
+        picked["sampled_unit_prob"] = float(
+            picked_mode_prob * float(group_prob_within_mode) * float(weights[idx_local])
+        )
         idx_global = int(self._failure_entries.index(entries[idx_local]))
         return picked, idx_global
 
@@ -577,29 +671,7 @@ class FailureAwareStage2Dataset(Dataset):
                 "sampled_unit_prob": unit.get("sampled_unit_prob", None),
             }
         if self.failure_mode == "train":
-            key_fields = (
-                "phase_key",
-                "phase_instance_idx",
-                "phase_bin_id",
-                "error_mode",
-                "active_arm_pattern",
-                "dir_bin_id",
-                "mag_bin_id",
-            )
-            self._failure_entries = [
-                x for x in self._failure_entries
-                if not all(x.get(k) == unit.get(k) for k in key_fields)
-            ]
-            mode = str(unit.get("error_mode", ""))
-            if mode in self._failure_entries_by_mode:
-                self._failure_entries_by_mode[mode] = [
-                    x for x in self._failure_entries_by_mode[mode]
-                    if not all(x.get(k) == unit.get(k) for k in key_fields)
-                ]
-                if not self._failure_entries_by_mode[mode]:
-                    self._failure_entries_by_mode.pop(mode, None)
-                    if self._failure_mode_probs is not None:
-                        self._failure_mode_probs.pop(mode, None)
+            self._remove_failure_unit_from_train_pool(unit)
             if self._failure_entries:
                 print(
                     "[failure-dataset] dropped runtime invalid failure unit without local candidate: "
@@ -1046,6 +1118,35 @@ class MultiTaskFailureAwareStage2Dataset(Dataset):
         return sample
 
 
+class BalancedMultiTaskFailureAwareStage2Dataset(MultiTaskFailureAwareStage2Dataset):
+    """Task-balanced multitask wrapper for failure-table training.
+
+    Each logical epoch oversamples smaller task datasets so that every task
+    contributes the same number of samples as the largest task dataset.
+    """
+
+    def __init__(self, datasets: list[FailureAwareStage2Dataset], task_specs: list[MultiTaskSpec]):
+        super().__init__(datasets=datasets, task_specs=task_specs)
+        self._per_task_lengths = [max(1, len(ds)) for ds in self.datasets]
+        self._num_tasks = len(self.datasets)
+        self._max_task_len = max(self._per_task_lengths)
+        self._balanced_len = int(self._num_tasks * self._max_task_len)
+
+    def __len__(self) -> int:
+        return self._balanced_len
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        task_idx = int(index % self._num_tasks)
+        task_slot = int(index // self._num_tasks)
+        local_index = int(task_slot % self._per_task_lengths[task_idx])
+        return task_idx, local_index
+
+
 def build_failure_table_dataset(
     dataset_dir: str,
     num_episodes: int,
@@ -1064,6 +1165,7 @@ def build_failure_table_dataset(
     failure_rotation_dir_bins: int,
     failure_rotation_mag_bins: int,
     failure_explore_k: int = 1,
+    rebalance_failure_groups: bool = False,
 ) -> tuple[FailureAwareStage2Dataset, dict[str, np.ndarray]]:
     stats = get_norm_stats(dataset_dir, num_episodes)
     valid_ids = list_valid_episode_ids(dataset_dir, num_episodes, prefix_steps, future_offset)
@@ -1087,6 +1189,7 @@ def build_failure_table_dataset(
         failure_rotation_mag_bins=failure_rotation_mag_bins,
         failure_explore_k=failure_explore_k,
         task_name="",
+        rebalance_failure_groups=rebalance_failure_groups,
     )
     return dataset, stats
 
@@ -1107,6 +1210,8 @@ def build_multitask_failure_table_dataset(
     failure_rotation_dir_bins: int,
     failure_rotation_mag_bins: int,
     failure_explore_k: int = 1,
+    balance_tasks: bool = False,
+    rebalance_failure_groups: bool = False,
 ) -> tuple[MultiTaskFailureAwareStage2Dataset, dict[str, np.ndarray]]:
     stats = get_multitask_norm_stats(task_specs)
     if failure_mode == "train":
@@ -1149,6 +1254,8 @@ def build_multitask_failure_table_dataset(
                 failure_rotation_mag_bins=failure_rotation_mag_bins,
                 failure_explore_k=failure_explore_k,
                 task_name=str(spec.task_name),
+                rebalance_failure_groups=rebalance_failure_groups,
             )
         )
-    return MultiTaskFailureAwareStage2Dataset(datasets, task_specs), stats
+    wrapper_cls = BalancedMultiTaskFailureAwareStage2Dataset if balance_tasks else MultiTaskFailureAwareStage2Dataset
+    return wrapper_cls(datasets, task_specs), stats
