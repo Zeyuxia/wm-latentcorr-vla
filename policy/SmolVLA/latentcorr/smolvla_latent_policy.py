@@ -40,8 +40,19 @@ class SmolVLAStage1LossOutput:
     loss_action: torch.Tensor
     loss_action_conditioned: torch.Tensor
     loss_dynamics: torch.Tensor
+    loss_condition_token: torch.Tensor
     beta_condition: float
     beta_dynamics: float
+    beta_token: float
+
+
+@dataclass(frozen=True)
+class SmolVLAStage1LossWeights:
+    token_init: float = 0.1
+    token_late: float = 0.02
+    token_decay_start_ratio: float = 0.0
+    token_decay_end_ratio: float = 1.0
+    total_steps: int = 1
 
 
 @dataclass
@@ -159,16 +170,43 @@ class ActionConditionedPredictor(nn.Module):
         return z
 
 
+class LatentToTokenAdapter(nn.Module):
+    def __init__(self, latent_channels: int, token_dim: int, hidden_dim: int, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = int(latent_channels)
+        depth = max(1, int(num_layers))
+        for _ in range(depth - 1):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, int(hidden_dim)),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                ]
+            )
+            in_dim = int(hidden_dim)
+        layers.append(nn.Linear(in_dim, int(token_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, latent_map: torch.Tensor) -> torch.Tensor:
+        if latent_map.ndim != 4:
+            raise ValueError(f"latent_map must be (B, C, H, W), got {tuple(latent_map.shape)}")
+        pooled = F.adaptive_avg_pool2d(latent_map, output_size=1).flatten(1)
+        return self.net(pooled)
+
+
 class SmolVLALatentPolicy(nn.Module):
     def __init__(
         self,
         base_policy: SmolVLAPolicy,
         bridge_cfg: SmolVLALatentBridgeConfig,
         warmup_cfg: DynamicsWarmupConfig | Stage1WarmupConfig,
+        loss_weights: SmolVLAStage1LossWeights | None = None,
     ):
         super().__init__()
         self.base_policy = base_policy
         self.bridge_cfg = bridge_cfg
+        self.loss_weights = loss_weights or SmolVLAStage1LossWeights()
         if isinstance(warmup_cfg, Stage1WarmupConfig):
             self.beta_dynamics_scheduler = DynamicsWarmup(warmup_cfg.dynamics)
             self.beta_condition_scheduler = DynamicsWarmup(warmup_cfg.condition)
@@ -178,8 +216,31 @@ class SmolVLALatentPolicy(nn.Module):
         self.projector: LatentProjector | None = None
         self.wm_adapter: ResidualLatentAdapter | None = None
         self.predictor: ActionConditionedPredictor | None = None
+        self.token_adapter: LatentToTokenAdapter | None = None
         self.condition_proj: nn.Linear | None = None
         self._target_hw: tuple[int, int] | None = None
+
+    @staticmethod
+    def _linear_schedule(progress: float, start_ratio: float, end_ratio: float, start_value: float, end_value: float) -> float:
+        p = float(max(0.0, min(1.0, progress)))
+        if p <= float(start_ratio):
+            return float(start_value)
+        if p >= float(end_ratio) or float(end_ratio) <= float(start_ratio):
+            return float(end_value)
+        r = (p - float(start_ratio)) / (float(end_ratio) - float(start_ratio))
+        return float(start_value) * (1.0 - r) + float(end_value) * r
+
+    def _token_weight(self, global_step: int) -> float:
+        cfg = self.loss_weights
+        total_steps = max(1.0, float(cfg.total_steps))
+        progress = float(global_step) / total_steps
+        return self._linear_schedule(
+            progress,
+            float(cfg.token_decay_start_ratio),
+            float(cfg.token_decay_end_ratio),
+            float(cfg.token_init),
+            float(cfg.token_late),
+        )
 
     @property
     def device(self) -> torch.device:
@@ -246,8 +307,14 @@ class SmolVLALatentPolicy(nn.Module):
             hidden_dim=int(self.bridge_cfg.predictor_hidden_dim),
             num_blocks=3,
         ).to(self.device)
+        self.token_adapter = LatentToTokenAdapter(
+            latent_channels=latent_dim,
+            token_dim=hidden_size,
+            hidden_dim=int(self.bridge_cfg.adapter_hidden_dim),
+            num_layers=2,
+            dropout=0.1,
+        ).to(self.device)
         self.condition_proj = nn.Linear(latent_dim, hidden_size).to(self.device)
-        nn.init.zeros_(self.condition_proj.weight)
         nn.init.zeros_(self.condition_proj.bias)
 
     def extract_visual_latent_map(self, batch: dict, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -297,6 +364,23 @@ class SmolVLALatentPolicy(nn.Module):
         att_mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
         return token, mask, att_mask
 
+    def build_condition_token_raw(self, latent_map: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        token, _mask, _att_mask = self.build_condition_token(latent_map, scale=scale)
+        return token
+
+    def build_predicted_condition_token(self, latent_map: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.token_adapter is not None
+        latent_map = latent_map.to(dtype=next(self.token_adapter.parameters()).dtype)
+        token = self.token_adapter(latent_map) * float(scale)
+        token = token[:, None, :]
+        mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
+        att_mask = torch.ones(token.shape[:2], dtype=torch.bool, device=token.device)
+        return token, mask, att_mask
+
+    def build_predicted_condition_token_raw(self, latent_map: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        token, _mask, _att_mask = self.build_predicted_condition_token(latent_map, scale=scale)
+        return token
+
     def _action_loss(
         self,
         batch: dict,
@@ -320,6 +404,26 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_att_mask=external_prefix_att_mask,
         )
         return losses[:, :, : self.base_policy.config.max_action_dim].mean()
+
+    def _action_prefix_loss(
+        self,
+        batch: dict,
+        actions: torch.Tensor,
+        prefix_steps: int,
+    ) -> torch.Tensor:
+        images, img_masks, lang_tokens, lang_masks, state = self._policy_inputs_from_batch(batch)
+        action_batch = {ACTION: actions}
+        actions_padded = self.base_policy.prepare_action(action_batch)
+        losses = self.base_policy.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions_padded,
+        )
+        steps = min(max(1, int(prefix_steps)), int(losses.shape[1]))
+        return losses[:, :steps, : self.base_policy.config.max_action_dim].mean()
 
     def _require_action_prefix(self, action_prefix: torch.Tensor) -> None:
         if action_prefix.ndim != 3:
@@ -357,11 +461,15 @@ class SmolVLALatentPolicy(nn.Module):
 
         beta_dynamics = self.beta_dynamics_scheduler.weight(global_step)
         beta_condition = self.beta_condition_scheduler.weight(global_step)
+        beta_token = self._token_weight(global_step)
         loss_action = self._action_loss(batch=batch, actions=batch[ACTION])
-        cond_token, cond_mask, cond_att_mask = self.build_condition_token(
-            predicted_latent.detach(),
+        cond_token, cond_mask, cond_att_mask = self.build_predicted_condition_token(
+            predicted_latent,
             scale=1.0,
         )
+        pred_token_raw = cond_token
+        teacher_token_raw = self.build_condition_token_raw(teacher_shared.detach(), scale=1.0)
+        loss_condition_token = F.mse_loss(pred_token_raw, teacher_token_raw.detach())
         loss_action_conditioned = self._action_loss(
             batch=batch,
             actions=batch[ACTION],
@@ -370,19 +478,28 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_att_mask=cond_att_mask,
         )
         loss_dynamics = F.mse_loss(predicted_latent, teacher_shared)
-        loss = loss_action + (beta_condition * loss_action_conditioned) + (beta_dynamics * loss_dynamics)
+        loss = (
+            loss_action
+            + (beta_condition * loss_action_conditioned)
+            + (beta_dynamics * loss_dynamics)
+            + (beta_token * loss_condition_token)
+        )
         return SmolVLAStage1LossOutput(
             loss=loss,
             loss_action=loss_action,
             loss_action_conditioned=loss_action_conditioned,
             loss_dynamics=loss_dynamics,
+            loss_condition_token=loss_condition_token,
             beta_condition=beta_condition,
             beta_dynamics=beta_dynamics,
+            beta_token=beta_token,
         )
 
     def forward(self, train_stage: str, **kwargs):
         if train_stage == "stage1":
             return self.compute_stage1_loss(**kwargs)
+        if train_stage == "action_prefix":
+            return self._action_prefix_loss(**kwargs)
         if train_stage == "stage2":
             return self.compute_stage2_loss(**kwargs)
         raise ValueError(f"Unsupported train_stage: {train_stage}")
@@ -413,8 +530,8 @@ class SmolVLALatentPolicy(nn.Module):
         target_hw = (rollout_shared.shape[-2], rollout_shared.shape[-1])
         predicted_latent = self.predict_next_latent(correction_batch, correction_action_prefix, target_hw=target_hw)
         beta_dynamics = self.beta_dynamics_scheduler.weight(global_step)
-        corr_token, corr_mask, corr_att_mask = self.build_condition_token(
-            predicted_latent.detach(),
+        corr_token, corr_mask, corr_att_mask = self.build_predicted_condition_token(
+            predicted_latent,
             scale=1.0,
         )
         loss_correct = self._action_loss(

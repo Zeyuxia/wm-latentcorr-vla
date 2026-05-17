@@ -429,7 +429,7 @@ def main() -> None:
         normal_raw_batch = _as_device_batch(normal_raw_batch, device)
         correction_raw_batch = _as_device_batch(correction_raw_batch, device)
 
-        clean_samples, clean_future_images, clean_action_prefix = build_stage1_samples_from_raw_batch(
+        clean_samples, clean_future_images, clean_action_prefix, _, _ = build_stage1_samples_from_raw_batch(
             raw_batch=normal_raw_batch,
             latent_model=model,
             preprocess=preprocess,

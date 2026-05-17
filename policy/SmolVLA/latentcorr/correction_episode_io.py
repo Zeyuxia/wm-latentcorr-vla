@@ -660,7 +660,7 @@ def export_correction_raw_episode(
     corr_actions = corr_action_raw[:prefix_len].astype(np.float32)
     corr_qpos_raw = np.asarray(corr_qpos_raw, dtype=np.float32).reshape(14,)
     corr_image_rgb = _image_chw_to_rgb_u8(corr_image)
-    corr_video_record = corr_meta.get("evac_correction_video")
+    corr_video_record = corr_meta.get("world_model_correction_video") or corr_meta.get("evac_correction_video")
     correction_video_frames: list[np.ndarray] = []
 
     with h5py.File(source_hdf5, "r") as src:

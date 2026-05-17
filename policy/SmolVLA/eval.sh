@@ -9,7 +9,8 @@ LOCAL_SRC_DIR="${SCRIPT_DIR}/src"
 CUROBO_SRC_DIR="/data/zhenyangfan/RoboTwin/envs/curobo/src"
 
 source /data/miniconda3/etc/profile.d/conda.sh
-conda activate smolvla
+EVAL_CONDA_ENV="${EVAL_CONDA_ENV:-smolvla}"
+conda activate "${EVAL_CONDA_ENV}"
 cd "${SCRIPT_DIR}"
 
 # Edit the values in this block directly before launching the script.
@@ -25,8 +26,14 @@ INSTRUCTION_TYPE="${INSTRUCTION_TYPE:-seen}"
 MODEL_PATH="${MODEL_PATH:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high/20260428_235223-stage1_spatial_projector_no_aux_losses/stage1_step_001500.pt}"
 # EVAL_TAG="stage1_spatial_projector_step_001250_base"
 EVAL_TAG="${EVAL_TAG:-evac_only_correction_ratio025_1500}"
+INFERENCE_MODE="${INFERENCE_MODE:-pred}"
 SEED_FILE="${SEED_FILE:-}"
+START_SEED="${START_SEED:-}"
+INITIAL_SUCCESS_COUNT="${INITIAL_SUCCESS_COUNT:-}"
+INITIAL_TEST_COUNT="${INITIAL_TEST_COUNT:-}"
+EXPERT_CHECK="${EXPERT_CHECK:-}"
 POLICY_CONDA_ENV="${POLICY_CONDA_ENV:-}"
+EVAL_VIDEO_LOG="${EVAL_VIDEO_LOG:-}"
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 
@@ -90,6 +97,7 @@ echo -e "${YELLOW}ckpt setting: ${CKPT_SETTING}${RESET}"
 echo -e "${YELLOW}model path: ${MODEL_PATH}${RESET}"
 echo -e "${YELLOW}instruction type: ${INSTRUCTION_TYPE}${RESET}"
 echo -e "${YELLOW}eval tag: ${EVAL_TAG}${RESET}"
+echo -e "${YELLOW}inference mode: ${INFERENCE_MODE}${RESET}"
 
 cd "${ROOT_DIR}"
 
@@ -105,10 +113,31 @@ cmd=(
   --model_path "${MODEL_PATH}"
   --policy_name "${POLICY_NAME}"
   --eval_tag "${EVAL_TAG}"
+  --inference_mode "${INFERENCE_MODE}"
 )
+
+if [[ -n "${EVAL_VIDEO_LOG}" ]]; then
+  cmd+=(--eval_video_log "${EVAL_VIDEO_LOG}")
+fi
 
 if [[ -n "${SEED_FILE}" ]]; then
   cmd+=(--seed_file "${SEED_FILE}")
+fi
+
+if [[ -n "${START_SEED}" ]]; then
+  cmd+=(--start_seed "${START_SEED}")
+fi
+
+if [[ -n "${INITIAL_SUCCESS_COUNT}" ]]; then
+  cmd+=(--initial_success_count "${INITIAL_SUCCESS_COUNT}")
+fi
+
+if [[ -n "${INITIAL_TEST_COUNT}" ]]; then
+  cmd+=(--initial_test_count "${INITIAL_TEST_COUNT}")
+fi
+
+if [[ -n "${EXPERT_CHECK}" ]]; then
+  cmd+=(--expert_check "${EXPERT_CHECK}")
 fi
 
 if [[ -n "${POLICY_CONDA_ENV}" ]]; then

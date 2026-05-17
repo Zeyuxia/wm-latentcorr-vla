@@ -63,9 +63,11 @@ def _normalize_quality_value(value) -> bool:
 
 def _parse_markdown_quality_record(path: str, backend: str) -> dict[tuple[str, str, str], bool]:
     source_path = Path(path).resolve()
+    backend = str(backend).strip().lower()
+    if backend == "sim":
+        return {}
     if not source_path.is_file():
         raise FileNotFoundError(f"world-model quality record not found: {source_path}")
-    backend = str(backend).strip().lower()
     quality_col = f"{backend}_quality"
     records: dict[tuple[str, str, str], bool] = {}
     header: list[str] | None = None
@@ -277,6 +279,7 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_unit_candidate_counts: list[int] = []
         self._explore_unit_target_trials: list[int] = []
         self._explore_total_target_samples = 0
+        self._explore_replay_trials: list[dict] | None = None
         self._init_failure_units()
 
     def _is_open_laptop_dataset(self) -> bool:
@@ -348,6 +351,8 @@ class FailureAwareStage2Dataset(Dataset):
         return int(max(0, self._explore_unit_target_trials[unit_idx]))
 
     def __len__(self) -> int:
+        if self._explore_replay_trials is not None:
+            return int(len(self._explore_replay_trials))
         return len(self.episode_ids)
 
     def _explore_cache_enabled(self) -> bool:
@@ -1179,6 +1184,9 @@ class FailureAwareStage2Dataset(Dataset):
     def record_explore_trial(self, unit_idx: int, episode_id: int, start_ts: int) -> None:
         if self.failure_mode != "explore" or not self._explore_units:
             return
+        if self._explore_replay_trials is not None:
+            self._advance_explore_unit()
+            return
         if int(unit_idx) != int(self._explore_curr_unit_idx):
             return
         target_trials = int(self._get_explore_unit_target_trials(unit_idx))
@@ -1203,6 +1211,7 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_completed_unit_count = 0
 
     def set_explore_units(self, units: list[dict] | None) -> None:
+        self._explore_replay_trials = None
         self._explore_units = [dict(item) for item in list(units or [])]
         self._explore_unit_candidate_counts = []
         self._rebuild_explore_unit_targets()
@@ -1216,7 +1225,25 @@ class FailureAwareStage2Dataset(Dataset):
 
     def set_explore_local_k(self, k_local: int) -> None:
         self._explore_k_local = int(max(1, int(k_local)))
+        if self._explore_replay_trials is not None:
+            self._set_explore_unit_candidate_counts([1 for _ in self._explore_replay_trials])
+            self._explore_trial_count_local = 0
+            self._explore_seen_samples = set()
+            self._explore_completed_unit_count = 0
+            return
         self._rebuild_explore_unit_targets()
+        self._explore_trial_count_local = 0
+        self._explore_seen_samples = set()
+        self._explore_completed_unit_count = 0
+
+    def set_explore_replay_trials(self, trials: list[dict] | None) -> None:
+        replay_trials = [dict(item) for item in list(trials or [])]
+        self._explore_replay_trials = replay_trials
+        self._explore_units = [dict(item) for item in replay_trials]
+        self._explore_unit_candidate_counts = [1 for _ in replay_trials]
+        self._explore_unit_target_trials = [1 for _ in replay_trials]
+        self._explore_total_target_samples = int(len(replay_trials))
+        self._explore_curr_unit_idx = 0
         self._explore_trial_count_local = 0
         self._explore_seen_samples = set()
         self._explore_completed_unit_count = 0
@@ -1238,10 +1265,45 @@ class FailureAwareStage2Dataset(Dataset):
         self._explore_unit_candidate_counts = []
         self._explore_unit_target_trials = []
         self._explore_total_target_samples = 0
+        self._explore_replay_trials = None
         self._init_failure_units()
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
-        if self.failure_mode in {"train", "explore"}:
+        if self._explore_replay_trials is not None:
+            if not self._explore_replay_trials:
+                raise RuntimeError(f"Replay trial source is empty for dataset={self.dataset_dir}")
+            sampled = dict(self._explore_replay_trials[int(index)])
+            episode_id = int(sampled["episode_id"])
+            start_ts = int(sampled["start_ts"])
+            sampled_phase_key = str(sampled.get("phase_key", sampled.get("sampled_phase_key", "approach")))
+            sampled_phase_instance_id = int(
+                sampled.get("phase_instance_idx", sampled.get("sampled_phase_instance_idx", -1))
+            )
+            sampled_phase_bin_id = int(sampled.get("phase_bin_id", sampled.get("sampled_phase_bin_id", -1)))
+            forced_error_mode_id = error_mode_key_to_id(
+                str(sampled.get("error_mode", sampled.get("sampled_error_mode", "translation")))
+            )
+            sampled_active_arm_pattern_id = active_arm_pattern_key_to_id(
+                str(sampled.get("active_arm_pattern", sampled.get("sampled_active_arm_pattern", "left_arm")))
+            )
+            original_active_arm_pattern_id = active_arm_pattern_key_to_id(
+                str(
+                    sampled.get(
+                        "original_active_arm_pattern",
+                        sampled.get(
+                            "sampled_original_active_arm_pattern",
+                            sampled.get("active_arm_pattern", sampled.get("sampled_active_arm_pattern", "left_arm")),
+                        ),
+                    )
+                )
+            )
+            forced_dir_bin_id = int(sampled.get("dir_bin_id", sampled.get("forced_dir_bin_id", -1)))
+            forced_mag_bin_id = int(sampled.get("mag_bin_id", sampled.get("forced_mag_bin_id", -1)))
+            sampled_explore_unit_idx = int(sampled.get("explore_unit_idx", sampled.get("sampled_explore_unit_idx", -1)))
+            sampled_mode_prob = _safe_float_or_nan(sampled.get("sampled_mode_prob", np.nan))
+            sampled_entry_prob_within_mode = _safe_float_or_nan(sampled.get("sampled_entry_prob_within_mode", np.nan))
+            sampled_unit_prob = _safe_float_or_nan(sampled.get("sampled_unit_prob", np.nan))
+        elif self.failure_mode in {"train", "explore"}:
             sampled = self._sample_start_ts_from_failure_unit(index)
             assert sampled is not None
             episode_id = int(sampled["episode_id"])

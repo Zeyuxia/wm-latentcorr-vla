@@ -89,6 +89,7 @@ def build_smolvla_batch(
     task_config: str,
     episode_id: int,
     instruction_type: str,
+    instruction_override: str | None = None,
 ) -> dict[str, Any]:
     if image_t.ndim != 4:
         raise ValueError(f"image_t must be (num_cam, C, H, W), got {tuple(image_t.shape)}")
@@ -103,12 +104,18 @@ def build_smolvla_batch(
     if len(visual_keys) != 1:
         raise ValueError(f"Expected exactly one visual feature key, got {visual_keys}")
 
-    instruction = load_episode_instruction(
-        task_name=task_name,
-        task_config=task_config,
-        episode_id=episode_id,
-        instruction_type=instruction_type,
+    instruction = (
+        str(instruction_override).strip()
+        if instruction_override is not None
+        else load_episode_instruction(
+            task_name=task_name,
+            task_config=task_config,
+            episode_id=episode_id,
+            instruction_type=instruction_type,
+        )
     )
+    if not instruction:
+        raise ValueError("Instruction is empty")
     obs = {
         visual_keys[0]: (image_t[0].permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8"),
         OBS_STATE: qpos_raw.detach().cpu().numpy().astype("float32"),
@@ -123,13 +130,33 @@ def build_smolvla_batch(
     return preprocess(prepared)
 
 
-def make_smolvla_processors(policy, pretrained_path: str):
+def make_smolvla_processors(
+    policy,
+    pretrained_path: str,
+    dataset_stats: dict[str, Any] | None = None,
+):
     if not pretrained_path:
         raise ValueError("pretrained_path must be provided for SmolVLA processor construction")
+    preprocessor_overrides = {
+        "device_processor": {"device": str(next(policy.parameters()).device)},
+    }
+    postprocessor_overrides = {}
+    if dataset_stats is not None:
+        preprocessor_overrides["normalizer_processor"] = {
+            "stats": dataset_stats,
+            "features": {**policy.config.input_features, **policy.config.output_features},
+            "norm_map": policy.config.normalization_mapping,
+        }
+        postprocessor_overrides["unnormalizer_processor"] = {
+            "stats": dataset_stats,
+            "features": policy.config.output_features,
+            "norm_map": policy.config.normalization_mapping,
+        }
     return make_pre_post_processors(
         policy.config,
         pretrained_path,
-        preprocessor_overrides={"device_processor": {"device": str(next(policy.parameters()).device)}},
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
     )
 
 

@@ -26,6 +26,13 @@ from policy.SmolVLA.latentcorr.correction_evac_rollout import (
     quat_geodesic_deg_wxyz,
 )
 from policy.SmolVLA.latentcorr.correction_cosmos_rollout import cosmos_inference
+
+def sim_inference(*args, **kwargs):
+    # Keep simulator imports lazy. Offline stage1 training imports this module
+    # for ACT-aligned helpers, but should not load RoboTwin envs/assets.
+    from policy.SmolVLA.latentcorr.correction_sim_rollout import sim_inference as _sim_inference
+
+    return _sim_inference(*args, **kwargs)
 from policy.SmolVLA.latentcorr.correction_utils import resample_trajectory
 from policy.SmolVLA.latentcorr.correction_projection_debug import (
     _tensor_chw_to_bgr_u8,
@@ -56,13 +63,18 @@ def _debug_relpath(path):
 
 def _world_model_backend(cfg: dict) -> str:
     backend = str(cfg.get("world_model_backend", "evac")).strip().lower()
-    if backend not in {"evac", "cosmos"}:
-        raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac' or 'cosmos'.")
+    if backend not in {"evac", "cosmos", "sim"}:
+        raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac', 'cosmos', or 'sim'.")
     return backend
 
 
 def _world_model_runtime_meta_filename(backend: str) -> str:
-    return "cosmos_runtime_meta.json" if str(backend).strip().lower() == "cosmos" else "evac_runtime_meta.json"
+    backend = str(backend).strip().lower()
+    if backend == "cosmos":
+        return "cosmos_runtime_meta.json"
+    if backend == "sim":
+        return "sim_runtime_meta.json"
+    return "evac_runtime_meta.json"
 
 
 def _world_model_inference(
@@ -75,10 +87,29 @@ def _world_model_inference(
     device,
     save_dir: str | None = None,
     backend_override: str | None = None,
+    sim_prefix_action_raw: np.ndarray | None = None,
+    sim_action_chunk_raw: np.ndarray | None = None,
+    start_ts: int | None = None,
 ) -> torch.Tensor:
     backend = _world_model_backend(cfg) if backend_override is None else str(backend_override).strip().lower()
-    if backend not in {"evac", "cosmos"}:
+    if backend not in {"evac", "cosmos", "sim"}:
         raise ValueError(f"Unsupported world-model backend override={backend!r}.")
+    if backend == "sim":
+        if start_ts is None:
+            raise ValueError("sim backend requires start_ts for simulator replay")
+        if sim_action_chunk_raw is None:
+            raise ValueError("sim backend requires sim_action_chunk_raw for simulator replay")
+        return sim_inference(
+            curr_image,
+            raw_data,
+            device,
+            start_ts=int(start_ts),
+            prefix_action_raw=sim_prefix_action_raw,
+            action_chunk_raw=sim_action_chunk_raw,
+            save_dir=save_dir,
+            use_subprocess=bool(cfg.get("sim_use_subprocess", True)),
+            timeout_s=float(cfg.get("sim_timeout_s", 180.0)),
+        )
     if backend == "cosmos":
         client = modules.get("cosmos_client")
         if client is None:
@@ -463,6 +494,8 @@ def _write_compare_sim_artifact(
         str(int(cfg.get("world_model_compare_sim_fps", 10))),
         "--hold-frames",
         str(int(cfg.get("world_model_compare_sim_hold_frames", 4))),
+        "--ray-tracing-denoiser",
+        "none",
     ]
     command_path = os.path.join(sim_dir, "run_sim_replay.sh")
     with open(command_path, "w", encoding="utf-8") as f:
@@ -927,6 +960,11 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             forced_dir_bin_id=forced_dir_bin_fixed,
             forced_mag_bin_id=forced_mag_bin_fixed,
         )
+        sim_prefix_action_raw = (
+            np.concatenate(perturb_action_prefix_chunks, axis=0).astype(np.float32)
+            if len(perturb_action_prefix_chunks) > 0
+            else None
+        )
         perturb_action_prefix_chunks.append(np.asarray(act_raw, dtype=np.float32).copy())
 
         fk_poses = [(lp.copy(), lq.copy(), rp.copy(), rq.copy())]  # current state
@@ -939,16 +977,80 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                              fr['right'][0].copy(), fr['right'][1].copy()))
             grip_list.append((ar[6], ar[13]))
 
-        pred = _world_model_inference(
-            modules,
-            cfg,
-            curr_image[0],
-            fk_poses,
-            grip_list,
-            raw_data,
-            device,
-            save_dir=world_model_debug_dir,
-        )
+        try:
+            pred = _world_model_inference(
+                modules,
+                cfg,
+                curr_image[0],
+                fk_poses,
+                grip_list,
+                raw_data,
+                device,
+                save_dir=world_model_debug_dir,
+                sim_prefix_action_raw=sim_prefix_action_raw,
+                sim_action_chunk_raw=act_raw,
+                start_ts=int(start_ts),
+            )
+        except Exception as exc:
+            if bool(cfg.get('fail_fast_on_error', False)):
+                raise
+            sampled_error_mode = dyn_state.get('error_mode') if isinstance(dyn_state, dict) else forced_error_mode_key
+            rollout_record = {
+                "step": int(step),
+                "t_star": int(t_star),
+                "min_dist": float(min_dist),
+                "progress": float(progress),
+                "phase_key": phase_key,
+                "action_perturbed": bool(perturbed),
+                "perturb_mode": pert_mode,
+                "sampled_error_mode": sampled_error_mode,
+                "world_model_backend": world_model_backend,
+                "world_model_error": repr(exc),
+            }
+            corr_meta = {
+                "correction_generated": False,
+                "closed_loop_fallback_used": False,
+                "correction_branch": "world_model_error",
+                "skip_reason": "sim_world_model_error" if world_model_backend == "sim" else "world_model_error",
+                "skip_error": repr(exc),
+                "invalid_trial": True,
+                "invalid_reason": "sim_world_model_error" if world_model_backend == "sim" else "world_model_error",
+                "sampled_error_mode": sampled_error_mode,
+                "forced_error_mode": forced_error_mode_key,
+                "sampled_phase_key": phase_key_fixed,
+                "sampled_phase_bin_id": phase_bin_fixed,
+                "sampled_phase_instance_idx": phase_instance_fixed,
+                "sampled_active_arm_pattern": sampled_active_arm_pattern_key,
+                "forced_dir_bin_id": forced_dir_bin_fixed,
+                "forced_mag_bin_id": forced_mag_bin_fixed,
+                "nearest_mode": str(sampled_error_mode or ""),
+                "rollout_exec_steps": int(rollout_exec_steps),
+                "t_star": int(t_star),
+                "min_dist": float(min_dist),
+                "recover_eval_enable": bool(recover_eval_enable),
+                "recover_eval_last": {"recoverable": None, "mode": sampled_error_mode, "error": repr(exc)},
+                "world_model_backend": world_model_backend,
+                "world_model_rollout_videos": world_model_rollout_videos,
+                "world_model_compare": world_model_compare_records,
+                "world_model_compare_sim": compare_sim_artifact,
+                "debug_dir": debug_dir,
+                "error_action_prefix_raw": np.asarray(act_raw, dtype=np.float32).copy(),
+            }
+            if debug_dir is not None:
+                _dbg_corr = os.path.join(debug_dir, 'correction')
+                os.makedirs(_dbg_corr, exist_ok=True)
+                try:
+                    with open(os.path.join(_dbg_corr, 'skipped.json'), 'w', encoding='utf-8') as _f:
+                        json.dump({
+                            'reason': corr_meta["skip_reason"],
+                            'sampled_unit': sampled_unit,
+                            'error': repr(exc),
+                            'world_model_backend': world_model_backend,
+                            'rollout': _dbg_rollout + [rollout_record],
+                        }, _f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            return (None, None, None, None, corr_meta)
         if world_model_debug_dir is not None:
             _main_video_record = _world_model_video_record(
                 backend=world_model_backend,
@@ -1285,6 +1387,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                             raw_data,
                             device,
                             save_dir=world_model_recover_eval_dir,
+                            sim_prefix_action_raw=perturb_action_prefix_raw,
+                            sim_action_chunk_raw=act_eval_vis_raw,
+                            start_ts=int(start_ts),
                         )
                         _vpath_recover = os.path.join(world_model_recover_eval_dir, 'outputs.mp4')
                         _mpath_recover = os.path.join(world_model_recover_eval_dir, world_model_meta_filename)
@@ -2185,6 +2290,9 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
                     raw_data,
                     device,
                     save_dir=world_model_corr_dir,
+                    sim_prefix_action_raw=perturb_action_prefix_raw,
+                    sim_action_chunk_raw=corr,
+                    start_ts=int(start_ts),
                 )
                 _vpath_corr = os.path.join(world_model_corr_dir, 'outputs.mp4')
                 _mpath_corr = os.path.join(world_model_corr_dir, world_model_meta_filename)
@@ -2652,6 +2760,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
             'world_model_backend': world_model_backend,
             'world_model_compare': world_model_compare_records,
             'world_model_compare_sim': compare_sim_artifact,
+            'world_model_correction_video': evac_corr_video,
             'evac_correction_video': evac_corr_video,
         }
         with open(os.path.join(_dbg_corr, 'closed_loop_info.json'), 'w') as _f:
@@ -2702,6 +2811,7 @@ def correction_step(policy_unwrapped, image_data_s, qpos_data_s, raw_data,
         "world_model_rollout_videos": world_model_rollout_videos,
         "world_model_compare": world_model_compare_records,
         "world_model_compare_sim": compare_sim_artifact,
+        "world_model_correction_video": evac_corr_video,
         "evac_correction_video": evac_corr_video,
         "debug_dir": debug_dir,
         "source_start_ts": int(start_ts),

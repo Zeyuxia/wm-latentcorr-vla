@@ -21,6 +21,7 @@ PRETRAINED_PATH="${PRETRAINED_PATH:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/ou
 RESUME_FROM="${RESUME_FROM:-}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29611}"
+NUM_PROCESSES="${NUM_PROCESSES:-4}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
@@ -56,8 +57,8 @@ CUROBO_RIGHT_YML="/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/cur
 SEED="${SEED:-0}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-MAX_STEPS="${MAX_STEPS:-1500}"
-SAVE_FREQ="${SAVE_FREQ:-250}"
+MAX_STEPS="${MAX_STEPS:-20000}"
+SAVE_FREQ="${SAVE_FREQ:-1000}"
 OPTIMIZER_LR="5e-5"
 WEIGHT_DECAY="1e-10"
 SCHEDULER_DECAY_STEPS="${SCHEDULER_DECAY_STEPS:-50000}"
@@ -75,6 +76,8 @@ if [ -z "${SCHEDULER_WARMUP_STEPS:-}" ]; then
 fi
 SCHEDULER_DECAY_LR="1e-5"
 FUTURE_OFFSET=16
+STAGE1_LATENT_TARGET="${STAGE1_LATENT_TARGET:-future_image}"
+STAGE1_ROLLOUT_DDIM_STEPS="${STAGE1_ROLLOUT_DDIM_STEPS:-27}"
 ACT_CHUNK_SIZE=50
 PREFIX_STEPS=16
 ACTION_DIM=14
@@ -83,14 +86,27 @@ ADAPTER_HIDDEN_DIM=512
 PREDICTOR_HIDDEN_DIM=512
 DYN_ZERO_STEPS=0
 DYN_RAMP_STEPS=1000
-DYN_MAX_WEIGHT="${DYN_MAX_WEIGHT:-0.0}"
+DYN_MAX_WEIGHT="${DYN_MAX_WEIGHT:-1.0}"
 DYN_WARMUP_CURVE="cosine"
 COND_ZERO_STEPS=0
 COND_RAMP_STEPS=1000
-COND_MAX_WEIGHT="${COND_MAX_WEIGHT:-0.0}"
+COND_MAX_WEIGHT="${COND_MAX_WEIGHT:-0.5}"
 COND_WARMUP_CURVE="cosine"
+TOKEN_LOSS_WEIGHT_INIT="${TOKEN_LOSS_WEIGHT_INIT:-0.1}"
+TOKEN_LOSS_WEIGHT_LATE="${TOKEN_LOSS_WEIGHT_LATE:-0.02}"
+TOKEN_LOSS_DECAY_START_RATIO="${TOKEN_LOSS_DECAY_START_RATIO:-0.0}"
+TOKEN_LOSS_DECAY_END_RATIO="${TOKEN_LOSS_DECAY_END_RATIO:-1.0}"
 FAILURE_MODE="${FAILURE_MODE:-train}"
-FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/filtered_failure_tables_quality_y_no_front_back_translation_mid_phase_bins_from_20260427_235851/multitask_failure_manifest.json}"
+STAGE1_CORR_SOURCE="${STAGE1_CORR_SOURCE:-online}"
+OFFLINE_CORR_DATA_ROOT="${OFFLINE_CORR_DATA_ROOT:-/data/zhenyangfan/RoboTwin/data}"
+OFFLINE_CORR_TASK_CONFIG="${OFFLINE_CORR_TASK_CONFIG:-demo_clean_corr_export_evac_exec16}"
+OFFLINE_CORR_MAX_SAMPLES_PER_TASK="${OFFLINE_CORR_MAX_SAMPLES_PER_TASK:-0}"
+OFFLINE_CORR_BALANCE_TASKS="${OFFLINE_CORR_BALANCE_TASKS:-true}"
+STAGE1_CORR_OUTLIER_FILTER="${STAGE1_CORR_OUTLIER_FILTER:-true}"
+STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS="${STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS:-0.3}"
+STAGE1_CORR_PREFIX_LOSS_WEIGHT="${STAGE1_CORR_PREFIX_LOSS_WEIGHT:-0.0}"
+STAGE1_CORR_PREFIX_LOSS_STEPS="${STAGE1_CORR_PREFIX_LOSS_STEPS:-0}"
+FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json}"
 FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.25}"
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
@@ -108,9 +124,9 @@ PLANNER_NEAREST_WINDOW_RADIUS=12
 PLANNER_ACTIVE_JOINT_DELTA_THRESH=0.01
 PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
 RECOVER_EVAL_SAVE_VIDEO=false
-SAVE_PERTURB_ROLLOUT_VIDEO=true
-SAVE_CORRECTION_DEBUG=false
-SAVE_CORRECTION_DATA="${SAVE_CORRECTION_DATA:-true}"
+SAVE_PERTURB_ROLLOUT_VIDEO="${SAVE_PERTURB_ROLLOUT_VIDEO:-false}"
+SAVE_CORRECTION_DEBUG="${SAVE_CORRECTION_DEBUG:-false}"
+SAVE_CORRECTION_DATA="${SAVE_CORRECTION_DATA:-false}"
 RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.3
 RECOVER_EVAL_POS_THRESH_M=0.04
 RECOVER_EVAL_ROT_THRESH_DEG=8.0
@@ -132,9 +148,12 @@ EVAC_DC_HF_METRIC=false
 EVAC_DC_V_BLUR_ON_REUSE=false
 EVAC_DC_V_BLUR_KERNEL=3
 EVAC_DC_V_BLUR_STRENGTH=0.15
-DEBUG_WM_CORRECTION=true
-DEBUG_WM_ALL_RANKS=true
-DEBUG_LOSS_BATCH_PROJECTION=true
+DEBUG_WM_CORRECTION="${DEBUG_WM_CORRECTION:-false}"
+DEBUG_WM_ALL_RANKS="${DEBUG_WM_ALL_RANKS:-false}"
+DEBUG_LOSS_BATCH_PROJECTION="${DEBUG_LOSS_BATCH_PROJECTION:-false}"
+DEBUG_LOSS_BATCH_PROJECTION_FREQ="${DEBUG_LOSS_BATCH_PROJECTION_FREQ:-1}"
+DEBUG_GRAD_COSINE="${DEBUG_GRAD_COSINE:-false}"
+DEBUG_GRAD_COSINE_FREQ="${DEBUG_GRAD_COSINE_FREQ:-100}"
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:The video decoding and encoding capabilities of torchvision are deprecated:UserWarning}"
@@ -215,6 +234,7 @@ resume_from=${RESUME_FROM}
 policy_device=${POLICY_DEVICE}
 cuda_visible_devices=${CUDA_VISIBLE_DEVICES}
 main_process_port=${MAIN_PROCESS_PORT}
+num_processes=${NUM_PROCESSES}
 freeze_vision_encoder=${FREEZE_VISION_ENCODER}
 train_expert_only=${TRAIN_EXPERT_ONLY}
 load_vlm_weights=${LOAD_VLM_WEIGHTS}
@@ -230,6 +250,14 @@ train_sh_reference_warmup_steps=${TRAIN_SH_REFERENCE_WARMUP_STEPS}
 train_sh_reference_steps=${TRAIN_SH_REFERENCE_STEPS}
 scheduler_decay_steps=${SCHEDULER_DECAY_STEPS}
 scheduler_decay_lr=${SCHEDULER_DECAY_LR}
+stage1_latent_target=${STAGE1_LATENT_TARGET}
+stage1_rollout_ddim_steps=${STAGE1_ROLLOUT_DDIM_STEPS}
+dyn_max_weight=${DYN_MAX_WEIGHT}
+cond_max_weight=${COND_MAX_WEIGHT}
+token_loss_weight_init=${TOKEN_LOSS_WEIGHT_INIT}
+token_loss_weight_late=${TOKEN_LOSS_WEIGHT_LATE}
+token_loss_decay_start_ratio=${TOKEN_LOSS_DECAY_START_RATIO}
+token_loss_decay_end_ratio=${TOKEN_LOSS_DECAY_END_RATIO}
 run_tag=${RUN_TAG}
 train_tag=${TRAIN_TAG}
 output_dir=${OUTPUT_DIR}
@@ -256,7 +284,20 @@ evac_blur_filter_patch_pad_px=${EVAC_BLUR_FILTER_PATCH_PAD_PX}
 save_perturb_rollout_video=${SAVE_PERTURB_ROLLOUT_VIDEO}
 save_correction_debug=${SAVE_CORRECTION_DEBUG}
 save_correction_data=${SAVE_CORRECTION_DATA}
+debug_loss_batch_projection=${DEBUG_LOSS_BATCH_PROJECTION}
+debug_loss_batch_projection_freq=${DEBUG_LOSS_BATCH_PROJECTION_FREQ}
+debug_grad_cosine=${DEBUG_GRAD_COSINE}
+debug_grad_cosine_freq=${DEBUG_GRAD_COSINE_FREQ}
 failure_mode=${FAILURE_MODE}
+stage1_corr_source=${STAGE1_CORR_SOURCE}
+offline_corr_data_root=${OFFLINE_CORR_DATA_ROOT}
+offline_corr_task_config=${OFFLINE_CORR_TASK_CONFIG}
+offline_corr_max_samples_per_task=${OFFLINE_CORR_MAX_SAMPLES_PER_TASK}
+offline_corr_balance_tasks=${OFFLINE_CORR_BALANCE_TASKS}
+stage1_corr_outlier_filter=${STAGE1_CORR_OUTLIER_FILTER}
+stage1_corr_outlier_max_action_loss=${STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS}
+stage1_corr_prefix_loss_weight=${STAGE1_CORR_PREFIX_LOSS_WEIGHT}
+stage1_corr_prefix_loss_steps=${STAGE1_CORR_PREFIX_LOSS_STEPS}
 failure_task_names=${FAILURE_TASK_NAMES[*]}
 failure_table_paths_json=${FAILURE_TABLE_PATHS_JSON}
 failure_corr_batch_ratio=${FAILURE_CORR_BATCH_RATIO}
@@ -267,8 +308,12 @@ EOF
 CMD=(
   accelerate
   launch
-  --multi_gpu
-  --num_processes=4
+)
+if [ "${NUM_PROCESSES}" -gt 1 ]; then
+  CMD+=(--multi_gpu)
+fi
+CMD+=(
+  --num_processes="${NUM_PROCESSES}"
   --main_process_port="${MAIN_PROCESS_PORT}"
   "${SCRIPT_DIR}/latentcorr/train_smolvla.py"
   stage1
@@ -294,6 +339,8 @@ CMD=(
   --scheduler_decay_steps "${SCHEDULER_DECAY_STEPS}"
   --scheduler_decay_lr "${SCHEDULER_DECAY_LR}"
   --future_offset "${FUTURE_OFFSET}"
+  --stage1_latent_target "${STAGE1_LATENT_TARGET}"
+  --stage1_rollout_ddim_steps "${STAGE1_ROLLOUT_DDIM_STEPS}"
   --act_chunk_size "${ACT_CHUNK_SIZE}"
   --prefix_steps "${PREFIX_STEPS}"
   --action_dim "${ACTION_DIM}"
@@ -308,10 +355,23 @@ CMD=(
   --cond_ramp_steps "${COND_RAMP_STEPS}"
   --cond_max_weight "${COND_MAX_WEIGHT}"
   --cond_warmup_curve "${COND_WARMUP_CURVE}"
+  --token_loss_weight_init "${TOKEN_LOSS_WEIGHT_INIT}"
+  --token_loss_weight_late "${TOKEN_LOSS_WEIGHT_LATE}"
+  --token_loss_decay_start_ratio "${TOKEN_LOSS_DECAY_START_RATIO}"
+  --token_loss_decay_end_ratio "${TOKEN_LOSS_DECAY_END_RATIO}"
   --failure_mode "${FAILURE_MODE}"
+  --stage1_corr_source "${STAGE1_CORR_SOURCE}"
   --failure_table_paths_json "${FAILURE_TABLE_PATHS_JSON}"
   --failure_task_names "${FAILURE_TASK_NAMES[@]}"
   --failure_corr_batch_ratio "${FAILURE_CORR_BATCH_RATIO}"
+  --offline_corr_data_root "${OFFLINE_CORR_DATA_ROOT}"
+  --offline_corr_task_config "${OFFLINE_CORR_TASK_CONFIG}"
+  --offline_corr_max_samples_per_task "${OFFLINE_CORR_MAX_SAMPLES_PER_TASK}"
+  --offline_corr_balance_tasks "${OFFLINE_CORR_BALANCE_TASKS}"
+  --stage1_corr_outlier_filter "${STAGE1_CORR_OUTLIER_FILTER}"
+  --stage1_corr_outlier_max_action_loss "${STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS}"
+  --stage1_corr_prefix_loss_weight "${STAGE1_CORR_PREFIX_LOSS_WEIGHT}"
+  --stage1_corr_prefix_loss_steps "${STAGE1_CORR_PREFIX_LOSS_STEPS}"
   --failure_phase_bins "${FAILURE_PHASE_BINS}"
   --failure_translation_dir_bins "${FAILURE_TRANSLATION_DIR_BINS}"
   --failure_translation_mag_bins "${FAILURE_TRANSLATION_MAG_BINS}"
@@ -358,6 +418,9 @@ CMD=(
   --debug_wm_correction "${DEBUG_WM_CORRECTION}"
   --debug_wm_all_ranks "${DEBUG_WM_ALL_RANKS}"
   --debug_loss_batch_projection "${DEBUG_LOSS_BATCH_PROJECTION}"
+  --debug_loss_batch_projection_freq "${DEBUG_LOSS_BATCH_PROJECTION_FREQ}"
+  --debug_grad_cosine "${DEBUG_GRAD_COSINE}"
+  --debug_grad_cosine_freq "${DEBUG_GRAD_COSINE_FREQ}"
 )
 
 printf '%q ' "${CMD[@]}" > "${OUTPUT_DIR}/launch_command.sh"
@@ -367,6 +430,28 @@ echo "Training mode: stage1"
 echo "Training output dir: ${OUTPUT_DIR}"
 echo "Train tag: ${TRAIN_TAG}"
 echo "Run tag: ${RUN_TAG}"
+echo "Debug loss batch projection: ${DEBUG_LOSS_BATCH_PROJECTION} freq=${DEBUG_LOSS_BATCH_PROJECTION_FREQ}"
+echo "Debug grad cosine: ${DEBUG_GRAD_COSINE} freq=${DEBUG_GRAD_COSINE_FREQ}"
+echo "Failure mode: ${FAILURE_MODE}"
+echo "Stage1 latent target: ${STAGE1_LATENT_TARGET} rollout_ddim_steps=${STAGE1_ROLLOUT_DDIM_STEPS}"
+if [ "${FAILURE_MODE}" = "train" ]; then
+  echo "Stage1 correction source: ${STAGE1_CORR_SOURCE}"
+  if [ "${STAGE1_CORR_SOURCE}" = "offline_export_mixed_dataset" ]; then
+    echo "Stage1 mixed dataset mode: clean and offline correction samples share one shuffled DataLoader; batch_size stays ${BATCH_SIZE}."
+    echo "Failure correction batch ratio is ignored in mixed dataset mode."
+  fi
+elif [ "${FAILURE_MODE}" = "off" ]; then
+  echo "Stage1 correction source: disabled"
+fi
+if [ "${FAILURE_MODE}" = "train" ] && [[ "${STAGE1_CORR_SOURCE}" == offline_export* ]]; then
+  echo "Offline correction data root: ${OFFLINE_CORR_DATA_ROOT}"
+  echo "Offline correction task config: ${OFFLINE_CORR_TASK_CONFIG}"
+  echo "Offline correction balance tasks: ${OFFLINE_CORR_BALANCE_TASKS}"
+fi
+if [ "${FAILURE_MODE}" = "train" ]; then
+  echo "Stage1 correction outlier filter: ${STAGE1_CORR_OUTLIER_FILTER} max_action_loss=${STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS}"
+  echo "Stage1 correction prefix loss: weight=${STAGE1_CORR_PREFIX_LOSS_WEIGHT} steps=${STAGE1_CORR_PREFIX_LOSS_STEPS}"
+fi
 
 export CUDA_VISIBLE_DEVICES
 export PYTHONNOUSERSITE

@@ -247,12 +247,77 @@ def write_corr_export_live_files(task_output_dir: Path, args, epoch: int, rank: 
         "corr_export_shard_suffix": str(shard_suffix),
         "corr_export_max_loops": int(args.corr_export_max_loops),
         "failure_explore_k": int(args.failure_explore_k),
+        "explore_trial_source_dir": str(getattr(args, "explore_trial_source_dir", "")).strip(),
     }
     meta_path = task_output_dir / f"correction_export_meta_rank{int(rank):02d}.json"
     meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
     with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
     os.replace(meta_tmp, meta_path)
+
+
+def _load_json_list(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected JSON list in resume live file: {path}")
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def load_resume_live_records(resume_root: Path, task_only: str, rank: int) -> tuple[list[dict], list[dict]]:
+    task_dir = Path(resume_root) / "failure_explore" / str(task_only)
+    failure_trials = _load_json_list(task_dir / f"failure_trials_live_rank{int(rank):02d}.json")
+    export_records = _load_json_list(task_dir / f"correction_export_live_rank{int(rank):02d}.json")
+    return failure_trials, export_records
+
+
+def load_trial_source_records(source_root: Path, task_only: str, rank: int) -> list[dict]:
+    task_dir = Path(source_root) / "failure_explore" / str(task_only)
+    source_path = task_dir / f"failure_trials_live_rank{int(rank):02d}.json"
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Trial source file not found: {source_path}")
+    records = _load_json_list(source_path)
+    valid_records = []
+    for idx, record in enumerate(records):
+        if "episode_id" not in record or "start_ts" not in record:
+            raise ValueError(f"Trial source record #{idx} missing episode_id/start_ts in {source_path}")
+        valid_records.append(dict(record))
+    return valid_records
+
+
+def apply_explore_resume_progress(dataset, completed_samples: int) -> tuple[int, int]:
+    """Advance explore unit counters using live trial count from a previous run."""
+    completed_samples = int(max(0, int(completed_samples)))
+    target_trials = list(getattr(dataset, "_explore_unit_target_trials", []))
+    num_units = int(len(target_trials))
+    if num_units <= 0 or completed_samples <= 0:
+        return 0, 0
+
+    completed_units = 0
+    remaining = int(completed_samples)
+    guard = 0
+    max_guard = max(1, num_units * max(1, completed_samples + 1))
+    while remaining > 0 and guard < max_guard:
+        unit_idx = int(completed_units) % num_units
+        target = int(max(0, int(target_trials[unit_idx])))
+        if target <= 0:
+            completed_units += 1
+            guard += 1
+            continue
+        if remaining >= target:
+            remaining -= target
+            completed_units += 1
+            guard += 1
+            continue
+        break
+
+    dataset._explore_completed_unit_count = int(completed_units)
+    dataset._explore_curr_unit_idx = int(completed_units % num_units)
+    dataset._explore_trial_count_local = int(max(0, remaining))
+    dataset._explore_seen_samples = set()
+    return int(completed_units), int(max(0, remaining))
 
 
 def sanitize_path_token(value: str) -> str:
@@ -367,9 +432,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--evac_dc_v_blur_on_reuse", type=str2bool, default=False)
     parser.add_argument("--evac_dc_v_blur_kernel", type=int, default=3)
     parser.add_argument("--evac_dc_v_blur_strength", type=float, default=0.15)
-    parser.add_argument("--world_model_backend", type=str, choices=["evac", "cosmos"], default="evac")
+    parser.add_argument("--world_model_backend", type=str, choices=["evac", "cosmos", "sim"], default="evac")
+    parser.add_argument("--sim_use_subprocess", type=str2bool, default=True)
+    parser.add_argument("--sim_timeout_s", type=float, default=180.0)
     parser.add_argument("--world_model_quality_record", type=str, default="")
-    parser.add_argument("--world_model_quality_backend", type=str, choices=["evac", "cosmos"], default="")
+    parser.add_argument("--world_model_quality_backend", type=str, choices=["evac", "cosmos", "sim"], default="")
     parser.add_argument("--cosmos_execution_mode", type=str, choices=["worker", "direct"], default="direct")
     parser.add_argument("--cosmos_root", type=str, default="/data/zhenyangfan/cosmos-predict2.5")
     parser.add_argument("--cosmos_python_bin", type=str, default="/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")
@@ -415,6 +482,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--corr_export_max_loops", type=int, default=1)
     parser.add_argument("--corr_export_debug_video", type=str2bool, default=True)
     parser.add_argument("--corr_export_fps", type=int, default=30)
+    parser.add_argument("--explore_trial_source_dir", type=str, default="")
+    parser.add_argument("--resume_from_live_dir", type=str, default="")
+    parser.add_argument(
+        "--explore_disable_distributed_progress_sync",
+        type=str2bool,
+        default=None,
+        help="Disable NCCL all_gather progress sync. Defaults to true for sim backend.",
+    )
     parser.add_argument(
         "--debug_max_samples_per_rank",
         type=int,
@@ -428,7 +503,16 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
     if not str(args.world_model_quality_backend).strip():
-        args.world_model_quality_backend = str(args.world_model_backend).strip().lower()
+        backend = str(args.world_model_backend).strip().lower()
+        # Keep trial filtering aligned with the original EVAC-filtered runs by
+        # default.  The rollout backend can still be switched to sim/cosmos
+        # independently.
+        args.world_model_quality_backend = "evac" if backend == "sim" else backend
+    if args.explore_disable_distributed_progress_sync is None:
+        args.explore_disable_distributed_progress_sync = bool(
+            str(args.world_model_backend).strip().lower() == "sim"
+        )
+    trial_source_dir = str(getattr(args, "explore_trial_source_dir", "")).strip()
     accelerator = build_accelerator()
     if args.rank is None:
         args.rank = int(accelerator.process_index)
@@ -585,7 +669,7 @@ def main() -> None:
     model.eval()
     shared_evac_model = teacher.model
     shared_evac_config = teacher.cfg
-    if str(args.world_model_backend).strip().lower() == "cosmos" and not need_evac_backend:
+    if str(args.world_model_backend).strip().lower() in {"cosmos", "sim"} and not need_evac_backend:
         del teacher
         shared_evac_model = None
         shared_evac_config = None
@@ -615,6 +699,7 @@ def main() -> None:
     task_order: list[str] = []
     total_rank_samples = 0
     for spec in task_specs:
+        task_only, _ = parse_task_parts(spec.task_name)
         dataset, _ = build_failure_table_dataset(
             dataset_dir=spec.dataset_dir,
             num_episodes=int(spec.num_episodes),
@@ -652,13 +737,21 @@ def main() -> None:
             rank=int(args.rank),
             task_name=spec.task_name,
         )
+        task_only, _ = parse_task_parts(spec.task_name)
         dataset.set_episode_ids(local_episode_ids)
         dataset.set_explore_local_k(int(failure_explore_k_local))
+        trial_source_records: list[dict] = []
+        if trial_source_dir:
+            trial_source_records = load_trial_source_records(Path(trial_source_dir), task_only, int(args.rank))
+            dataset.set_explore_replay_trials(trial_source_records)
+            dataset.set_explore_local_k(1)
         total_units = get_explore_num_units(dataset)
-        task_only, _ = parse_task_parts(spec.task_name)
         task_order.append(task_only)
         task_samples = int(get_explore_total_target_samples(dataset, int(failure_explore_k_local)))
-        if bool(args.corr_export_dataset):
+        if trial_source_dir:
+            total_units = int(len(trial_source_records))
+            task_samples = int(len(trial_source_records))
+        if bool(args.corr_export_dataset) and not trial_source_records:
             task_samples *= int(corr_export_max_loops)
         total_rank_samples += task_samples
         task_run_stats[task_only] = {
@@ -670,7 +763,12 @@ def main() -> None:
             "total_samples_global": int(global_target_samples),
         }
 
-    rank_totals = sync_rank_sample_totals(int(total_rank_samples), device_obj)
+    disable_progress_sync = bool(getattr(args, "explore_disable_distributed_progress_sync", False))
+    rank_totals = (
+        [int(total_rank_samples)]
+        if disable_progress_sync
+        else sync_rank_sample_totals(int(total_rank_samples), device_obj)
+    )
     overall_progress = None
     if accelerator.is_main_process:
         overall_progress = tqdm(
@@ -696,6 +794,7 @@ def main() -> None:
             else f"{args.corr_export_task_config}_shards"
         ),
         "corr_export_max_loops": int(corr_export_max_loops),
+        "explore_trial_source_dir": trial_source_dir,
         "world_model_quality_record": str(args.world_model_quality_record),
         "world_model_quality_backend": str(args.world_model_quality_backend),
         "total_samples_local": int(total_rank_samples),
@@ -755,12 +854,38 @@ def main() -> None:
         )
         dataset.set_episode_ids(local_episode_ids)
         dataset.set_explore_local_k(int(failure_explore_k_local))
+        trial_source_records: list[dict] = []
+        if trial_source_dir:
+            trial_source_records = load_trial_source_records(Path(trial_source_dir), task_only, int(args.rank))
+            dataset.set_explore_replay_trials(trial_source_records)
+            dataset.set_explore_local_k(1)
         total_units = int(task_run_stats[task_only]["num_explore_units_local"])
         task_total_samples = int(task_run_stats[task_only]["total_samples_local"])
+        if trial_source_dir:
+            total_units = int(len(trial_source_records))
         failure_trials: list[dict] = []
+        export_records: list[dict] = []
         epoch = 0
         processed_samples = 0
         local_task_done = bool(total_units <= 0)
+        if str(args.resume_from_live_dir).strip():
+            loaded_failure_trials, loaded_export_records = load_resume_live_records(
+                Path(args.resume_from_live_dir),
+                task_only,
+                int(args.rank),
+            )
+            if loaded_failure_trials:
+                failure_trials = loaded_failure_trials
+                export_records = loaded_export_records
+                processed_samples = int(len(failure_trials))
+                completed_units, partial_trials = apply_explore_resume_progress(dataset, processed_samples)
+                if int(partial_trials) > 0:
+                    # Avoid reusing the same unit with an empty seen set. This resume path is intended
+                    # for the common k_global == world_size case, but stays conservative otherwise.
+                    dataset._advance_explore_unit()
+                    completed_units = int(get_explore_completed_unit_count(dataset))
+                if completed_units >= int(total_units) * int(corr_export_max_loops):
+                    local_task_done = True
 
         if total_units == 0:
             write_failure_live_files(task_output_dir, args, epoch, int(args.rank), failure_trials)
@@ -790,7 +915,7 @@ def main() -> None:
                 "dataloader": dataloader,
                 "dataloader_iter": iter(dataloader),
                 "failure_trials": failure_trials,
-                "export_records": [],
+                "export_records": export_records,
                 "export_episode_id_next": int(
                     init_export_episode_id(
                         Path(args.corr_export_root)
@@ -808,8 +933,13 @@ def main() -> None:
                 "processed_samples": int(processed_samples),
                 "local_task_done": bool(local_task_done),
                 "base_total_units": int(total_units),
-                "total_units": int(total_units) * int(corr_export_max_loops),
+                "total_units": (
+                    int(total_units)
+                    if bool(trial_source_records)
+                    else int(total_units) * int(corr_export_max_loops)
+                ),
                 "task_total_samples": int(task_total_samples),
+                "trial_source_replay": bool(trial_source_records),
             }
         )
 
@@ -1072,16 +1202,30 @@ def main() -> None:
                     stop_ctx["local_task_done"] = True
                 overall_current_samples_local, overall_completed_units_local = _compute_local_task_progress()
             local_all_done = bool(all(bool(item["local_task_done"]) for item in task_contexts))
-            explore_progress = sync_all_explore_status(
-                local_current_samples=int(overall_current_samples_local),
-                local_total_samples=int(total_rank_samples),
-                local_done=bool(local_all_done),
-                local_completed_units=int(overall_completed_units_local),
-                local_total_units=int(total_units_all),
-                local_unit_idx=int(get_current_explore_unit_idx(dataset)),
-                local_trial_count=int(get_current_explore_trial_count(dataset)),
-                device=device_obj,
-            )
+            if disable_progress_sync:
+                explore_progress = [
+                    {
+                        "rank": int(args.rank),
+                        "current_samples": int(overall_current_samples_local),
+                        "total_samples": int(total_rank_samples),
+                        "done": bool(local_all_done),
+                        "completed_units": int(overall_completed_units_local),
+                        "total_units": int(total_units_all),
+                        "unit_idx": int(get_current_explore_unit_idx(dataset)),
+                        "trial_count": int(get_current_explore_trial_count(dataset)),
+                    }
+                ]
+            else:
+                explore_progress = sync_all_explore_status(
+                    local_current_samples=int(overall_current_samples_local),
+                    local_total_samples=int(total_rank_samples),
+                    local_done=bool(local_all_done),
+                    local_completed_units=int(overall_completed_units_local),
+                    local_total_units=int(total_units_all),
+                    local_unit_idx=int(get_current_explore_unit_idx(dataset)),
+                    local_trial_count=int(get_current_explore_trial_count(dataset)),
+                    device=device_obj,
+                )
             if overall_progress is not None:
                 target_done = int(sum(int(item["current_samples"]) for item in explore_progress))
                 if target_done > int(overall_progress.n):

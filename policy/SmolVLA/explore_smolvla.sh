@@ -31,8 +31,13 @@ INSTRUCTION_TYPE=seen
 EVAC_CKPT=/data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
 EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
 WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-cosmos}
+SIM_USE_SUBPROCESS=${SIM_USE_SUBPROCESS:-true}
+SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-180}
 WORLD_MODEL_QUALITY_RECORD=${WORLD_MODEL_QUALITY_RECORD:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/world_model_quality_record.md}
-WORLD_MODEL_QUALITY_BACKEND=${WORLD_MODEL_QUALITY_BACKEND:-${WORLD_MODEL_BACKEND}}
+# Keep trial filtering independent from the rollout backend.
+# Default to EVAC so sim replays can reproduce the original EVAC-filtered trial
+# schedule unless explicitly overridden.
+WORLD_MODEL_QUALITY_BACKEND=${WORLD_MODEL_QUALITY_BACKEND:-evac}
 COSMOS_EXECUTION_MODE=${COSMOS_EXECUTION_MODE:-direct}
 COSMOS_ROOT=${COSMOS_ROOT:-${SCRIPT_DIR}/cosmos-predict2.5}
 COSMOS_TARGET_ROOT=${COSMOS_TARGET_ROOT:-/data/zhenyangfan/cosmos-predict2.5}
@@ -77,6 +82,9 @@ CORR_EXPORT_FORMAT=${CORR_EXPORT_FORMAT:-raw_episode}
 CORR_EXPORT_MAX_LOOPS=${CORR_EXPORT_MAX_LOOPS:-1}
 CORR_EXPORT_DEBUG_VIDEO=${CORR_EXPORT_DEBUG_VIDEO:-true}
 CORR_EXPORT_FPS=${CORR_EXPORT_FPS:-30}
+EXPLORE_TRIAL_SOURCE_DIR=${EXPLORE_TRIAL_SOURCE_DIR:-}
+EXPLORE_RESUME_FROM_LIVE_DIR=${EXPLORE_RESUME_FROM_LIVE_DIR:-}
+EXPLORE_DISABLE_DISTRIBUTED_PROGRESS_SYNC=${EXPLORE_DISABLE_DISTRIBUTED_PROGRESS_SYNC:-}
 EXPLORE_DEBUG_MAX_SAMPLES=${EXPLORE_DEBUG_MAX_SAMPLES:-0}
 URDF_PATH=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
 CUROBO_LEFT_YML=/data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/curobo_left.yml
@@ -127,8 +135,8 @@ PLANNER_NEAREST_WINDOW_RADIUS=12
 PLANNER_ACTIVE_JOINT_DELTA_THRESH=0.01
 PLANNER_ACTIVE_GRIPPER_DELTA_THRESH=0.05
 RECOVER_EVAL_SAVE_VIDEO=${RECOVER_EVAL_SAVE_VIDEO:-true}
-SAVE_PERTURB_ROLLOUT_VIDEO=true
-SAVE_CORRECTION_DEBUG=true
+SAVE_PERTURB_ROLLOUT_VIDEO=${SAVE_PERTURB_ROLLOUT_VIDEO:-true}
+SAVE_CORRECTION_DEBUG=${SAVE_CORRECTION_DEBUG:-true}
 RECOVER_EVAL_GRIPPER_OPEN_THRESH=${RECOVER_EVAL_GRIPPER_OPEN_THRESH:-0.4}
 RECOVER_EVAL_POS_THRESH_M=0.04
 RECOVER_EVAL_ROT_THRESH_DEG=8.0
@@ -144,16 +152,16 @@ EVAC_BLUR_FILTER_MIN_RATIO=${EVAC_BLUR_FILTER_MIN_RATIO:-0.75}
 EVAC_BLUR_FILTER_REGION=${EVAC_BLUR_FILTER_REGION:-active_gripper_patch}
 EVAC_BLUR_FILTER_PATCH_PAD_PX=${EVAC_BLUR_FILTER_PATCH_PAD_PX:-12}
 EVAC_BLUR_FILTER_GRIPPER_AXIS_M=${EVAC_BLUR_FILTER_GRIPPER_AXIS_M:-0.04}
-EVAC_USE_DUAL_CACHE=true
+EVAC_USE_DUAL_CACHE=${EVAC_USE_DUAL_CACHE:-true}
 # bounds=(4 8 12 14): refresh v every few steps, then run full after step 14.
-EVAC_DC_V_BOUNDS=(4 8 12 14)
-EVAC_DC_BUDGET=-1
-EVAC_DC_ENC_START=999
-EVAC_DC_REPLAY_STEP_NOISE=false
-EVAC_DC_HF_METRIC=false
-EVAC_DC_V_BLUR_ON_REUSE=false
-EVAC_DC_V_BLUR_KERNEL=3
-EVAC_DC_V_BLUR_STRENGTH=0.15
+EVAC_DC_V_BOUNDS=(${EVAC_DC_V_BOUNDS:-4 8 12 14})
+EVAC_DC_BUDGET=${EVAC_DC_BUDGET:--1}
+EVAC_DC_ENC_START=${EVAC_DC_ENC_START:-999}
+EVAC_DC_REPLAY_STEP_NOISE=${EVAC_DC_REPLAY_STEP_NOISE:-false}
+EVAC_DC_HF_METRIC=${EVAC_DC_HF_METRIC:-false}
+EVAC_DC_V_BLUR_ON_REUSE=${EVAC_DC_V_BLUR_ON_REUSE:-false}
+EVAC_DC_V_BLUR_KERNEL=${EVAC_DC_V_BLUR_KERNEL:-3}
+EVAC_DC_V_BLUR_STRENGTH=${EVAC_DC_V_BLUR_STRENGTH:-0.15}
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 SMOLVLA_EVAC_PRINT_RUNTIME=false
@@ -177,7 +185,11 @@ BASE_NAME="${TIMESTAMP}"
 if [ -n "${RUN_TAG}" ]; then
   BASE_NAME="${BASE_NAME}-${RUN_TAG}"
 fi
-OUTPUT_DIR="${OUTPUT_DIR}/${BASE_NAME}"
+if [ -n "${EXPLORE_OUTPUT_DIR_EXACT:-}" ]; then
+  OUTPUT_DIR="${EXPLORE_OUTPUT_DIR_EXACT}"
+else
+  OUTPUT_DIR="${OUTPUT_DIR}/${BASE_NAME}"
+fi
 
 if [ -f "${SMOLVLA_PRETRAINED_PATH}" ]; then
   STAGE1_CKPT="${SMOLVLA_PRETRAINED_PATH}"
@@ -236,8 +248,8 @@ if [ "${WORLD_MODEL_BACKEND}" = "cosmos" ] || [ "${WORLD_MODEL_COMPARE_COSMOS_AU
     echo "Cosmos checkpoint path is missing: ${COSMOS_CHECKPOINT_PATH}" >&2
     exit 1
   fi
-elif [ "${WORLD_MODEL_BACKEND}" != "evac" ]; then
-  echo "Unsupported WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND}; expected evac or cosmos" >&2
+elif [ "${WORLD_MODEL_BACKEND}" != "evac" ] && [ "${WORLD_MODEL_BACKEND}" != "sim" ]; then
+  echo "Unsupported WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND}; expected evac, sim, or cosmos" >&2
   exit 1
 fi
 mkdir -p "${OUTPUT_DIR}"
@@ -336,6 +348,8 @@ CMD=(
     --evac_dc_v_blur_kernel "${EVAC_DC_V_BLUR_KERNEL}" \
     --evac_dc_v_blur_strength "${EVAC_DC_V_BLUR_STRENGTH}" \
     --world_model_backend "${WORLD_MODEL_BACKEND}" \
+    --sim_use_subprocess "${SIM_USE_SUBPROCESS}" \
+    --sim_timeout_s "${SIM_TIMEOUT_S}" \
     --world_model_quality_record "${WORLD_MODEL_QUALITY_RECORD}" \
     --world_model_quality_backend "${WORLD_MODEL_QUALITY_BACKEND}" \
     --cosmos_execution_mode "${COSMOS_EXECUTION_MODE}" \
@@ -379,11 +393,16 @@ CMD=(
     --corr_export_max_loops "${CORR_EXPORT_MAX_LOOPS}" \
     --corr_export_debug_video "${CORR_EXPORT_DEBUG_VIDEO}" \
     --corr_export_fps "${CORR_EXPORT_FPS}" \
+    --explore_trial_source_dir "${EXPLORE_TRIAL_SOURCE_DIR}" \
+    --resume_from_live_dir "${EXPLORE_RESUME_FROM_LIVE_DIR}" \
     --debug_max_samples_per_rank "${EXPLORE_DEBUG_MAX_SAMPLES}"
 )
 
 if [ -n "${STAGE1_CKPT}" ]; then
   CMD+=(--stage1_ckpt "${STAGE1_CKPT}")
+fi
+if [ -n "${EXPLORE_DISABLE_DISTRIBUTED_PROGRESS_SYNC}" ]; then
+  CMD+=(--explore_disable_distributed_progress_sync "${EXPLORE_DISABLE_DISTRIBUTED_PROGRESS_SYNC}")
 fi
 
 echo "Output dir: ${OUTPUT_DIR}"
@@ -403,6 +422,12 @@ if [ "${CORR_EXPORT_DATASET}" = "true" ]; then
   echo "Correction export task config: ${CORR_EXPORT_TASK_CONFIG}"
   echo "Correction export format: ${CORR_EXPORT_FORMAT}"
   echo "Correction export max loops: ${CORR_EXPORT_MAX_LOOPS}"
+fi
+if [ -n "${EXPLORE_RESUME_FROM_LIVE_DIR}" ]; then
+  echo "Explore resume from live dir: ${EXPLORE_RESUME_FROM_LIVE_DIR}"
+fi
+if [ -n "${EXPLORE_TRIAL_SOURCE_DIR}" ]; then
+  echo "Explore trial source dir: ${EXPLORE_TRIAL_SOURCE_DIR}"
 fi
 if [ "${WORLD_MODEL_COMPARE_MODE}" = "true" ]; then
   echo "World model compare backends: ${WORLD_MODEL_COMPARE_BACKENDS[*]}"

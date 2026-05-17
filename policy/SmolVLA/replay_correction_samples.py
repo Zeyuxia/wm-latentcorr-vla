@@ -97,7 +97,12 @@ def get_embodiment_config(robot_file: str) -> dict[str, Any]:
         return yaml.load(file.read(), Loader=yaml.FullLoader)
 
 
-def load_task_args(task_name: str, task_config: str, save_path: Path | None = None) -> dict[str, Any]:
+def load_task_args(
+    task_name: str,
+    task_config: str,
+    save_path: Path | None = None,
+    ray_tracing_denoiser: str | None = None,
+) -> dict[str, Any]:
     config_path = REPO_ROOT / "task_config" / f"{task_config}.yml"
     with config_path.open("r", encoding="utf-8") as file:
         args = yaml.load(file.read(), Loader=yaml.FullLoader)
@@ -113,6 +118,8 @@ def load_task_args(task_name: str, task_config: str, save_path: Path | None = No
     args["need_topp"] = False
     if save_path is not None:
         args["save_path"] = str(save_path)
+    if ray_tracing_denoiser is not None:
+        args["ray_tracing_denoiser"] = ray_tracing_denoiser
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -430,6 +437,7 @@ def replay_record(
     hold_frames: int,
     include_perturb_state: bool,
     perturb_bridge_steps: int,
+    ray_tracing_denoiser: str | None = None,
 ) -> ReplayResult:
     task = str(record["task"])
     episode_id = int(record["episode_id"])
@@ -481,7 +489,12 @@ def replay_record(
     video_path, metrics_path = replay_output_paths(record, output_dir, include_perturb_state)
 
     env_save_path = sample_dir / "env_cache"
-    task_args = load_task_args(task, task_config, save_path=env_save_path)
+    task_args = load_task_args(
+        task,
+        task_config,
+        save_path=env_save_path,
+        ray_tracing_denoiser=ray_tracing_denoiser,
+    )
     task_env = class_decorator(task)
     task_env.setup_demo(now_ep_num=episode_id, seed=scene_seed, is_test=True, **task_args)
     # We only want to replay actions, not terminate early or call task-specific success state.
@@ -518,8 +531,8 @@ def replay_record(
                         annotate_frame(
                             frame,
                             [
-                                f"PREFIX {task} ep={episode_id} seed={scene_seed}",
-                                f"raw step {idx + 1}/{len(prefix_actions)} -> start_ts={start_ts}",
+                                f"ORIGINAL PREFIX {task} ep={episode_id} seed={scene_seed}",
+                                f"raw step {idx + 1}/{len(prefix_actions)} -> attach/start_ts={start_ts}",
                             ],
                         )
                     )
@@ -539,7 +552,7 @@ def replay_record(
                     start_frame,
                     [
                         f"CLEAN START {task} ep={episode_id} seed={scene_seed}",
-                        f"start_ts={start_ts} start_linf_to_raw={start_linf_to_raw:.4f}",
+                        f"attach/start_ts={start_ts} start_linf_to_raw={start_linf_to_raw:.4f}",
                     ],
                 )
             )
@@ -566,7 +579,7 @@ def replay_record(
                     annotate_frame(
                         frame,
                         [
-                            f"SIM PERTURB {task} ep={episode_id} seed={scene_seed}",
+                            f"PERTURB / ERROR ROLLOUT {task} ep={episode_id} seed={scene_seed}",
                             f"step {idx + 1}/{len(perturb_actions)} mode={record.get('sampled_error_mode')}",
                             f"track_linf={perturb_tracking_linf[-1]:.4f} "
                             f"start_linf={perturb_start_linf_to_clean}",
@@ -586,7 +599,7 @@ def replay_record(
                     annotate_frame(
                         pert_frame,
                         [
-                            f"PERTURBED INPUT STATE {task} ep={episode_id}",
+                            f"ERROR END / CORRECTION START {task} ep={episode_id}",
                             f"linf_from_clean={perturb_linf_from_raw_start:.4f} "
                             f"linf_to_corr_qpos={perturb_linf_to_corr_qpos:.4f}",
                             f"recovery_prefix_len={error_prefix_len}",
@@ -626,7 +639,7 @@ def replay_record(
                     annotate_frame(
                         pert_frame,
                         [
-                            f"PERTURBED INPUT STATE {task} ep={episode_id}",
+                            f"ERROR END / CORRECTION START {task} ep={episode_id}",
                             f"linf_from_clean={perturb_linf_from_raw_start:.4f} "
                             f"linf_to_corr_qpos={perturb_linf_to_corr_qpos:.4f}",
                             f"recovery_prefix_len={error_prefix_len}",
@@ -649,15 +662,15 @@ def replay_record(
             cmd_trace.append(action.astype(float).tolist())
             tracking_linf.append(float(np.max(np.abs(err))))
             tracking_l2.append(float(np.linalg.norm(err)))
+            if idx < error_prefix_len:
+                stage_label = "CORRECTION PREFIX"
+            else:
+                stage_label = "ORIGINAL GT TAIL"
             writer.write(
                 annotate_frame(
                     frame,
                     [
-                        (
-                            f"RECOVERY PREFIX {task} ep={episode_id} seed={scene_seed}"
-                            if idx < error_prefix_len
-                            else f"GT SUFFIX {task} ep={episode_id} seed={scene_seed}"
-                        ),
+                        f"{stage_label} {task} ep={episode_id} seed={scene_seed}",
                         f"step {idx + 1}/{len(corr_actions)} mode={record.get('sampled_error_mode')} "
                         f"phase={record.get('sampled_phase_key')} bin={record.get('sampled_phase_bin_id')}",
                         f"track_linf={tracking_linf[-1]:.4f} track_l2={tracking_l2[-1]:.4f}",
@@ -742,6 +755,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--hold-frames", type=int, default=8)
+    parser.add_argument(
+        "--ray-tracing-denoiser",
+        type=str,
+        default="none",
+        help="SAPIEN ray tracing denoiser to use for replay; use 'none' to disable it.",
+    )
     parser.add_argument("--record-prefix", action="store_true")
     parser.add_argument("--prefix-frame-stride", type=int, default=10)
     parser.add_argument(
@@ -821,6 +840,7 @@ def main() -> None:
             hold_frames=int(args.hold_frames),
             include_perturb_state=not bool(args.no_perturb_state),
             perturb_bridge_steps=int(args.perturb_bridge_steps),
+            ray_tracing_denoiser=str(args.ray_tracing_denoiser),
         )
         payload = {
             "record": {

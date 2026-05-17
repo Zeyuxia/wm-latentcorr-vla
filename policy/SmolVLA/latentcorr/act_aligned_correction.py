@@ -180,6 +180,8 @@ class ACTAlignedCorrectionConfig:
     evac_dc_v_blur_kernel: int = 3
     evac_dc_v_blur_strength: float = 0.15
     world_model_backend: str = "evac"
+    sim_use_subprocess: bool = True
+    sim_timeout_s: float = 180.0
     cosmos_root: str = "/data/zhenyangfan/cosmos-predict2.5"
     cosmos_python_bin: str = "/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python"
     cosmos_checkpoint_path: str = ""
@@ -305,6 +307,8 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
         evac_dc_v_blur_kernel=int(getattr(args, "evac_dc_v_blur_kernel", 3)),
         evac_dc_v_blur_strength=float(getattr(args, "evac_dc_v_blur_strength", 0.15)),
         world_model_backend=str(getattr(args, "world_model_backend", "evac")).strip().lower(),
+        sim_use_subprocess=bool(getattr(args, "sim_use_subprocess", True)),
+        sim_timeout_s=float(getattr(args, "sim_timeout_s", 180.0)),
         cosmos_root=str(getattr(args, "cosmos_root", "/data/zhenyangfan/cosmos-predict2.5")),
         cosmos_python_bin=str(getattr(args, "cosmos_python_bin", "/data/zhenyangfan/cosmos-predict2.5/.venv/bin/python")),
         cosmos_checkpoint_path=str(getattr(args, "cosmos_checkpoint_path", "")),
@@ -413,8 +417,8 @@ class ACTAlignedCorrectionBuilder:
         self.cfg = cfg
         self.device = torch.device(device)
         backend = str(getattr(self.cfg, "world_model_backend", "evac")).strip().lower()
-        if backend not in {"evac", "cosmos"}:
-            raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac' or 'cosmos'.")
+        if backend not in {"evac", "cosmos", "sim"}:
+            raise ValueError(f"Unsupported world_model_backend={backend!r}; expected 'evac', 'cosmos', or 'sim'.")
         compare_backends = _parse_world_model_compare_backends(
             getattr(self.cfg, "world_model_compare_backends", ())
         )
