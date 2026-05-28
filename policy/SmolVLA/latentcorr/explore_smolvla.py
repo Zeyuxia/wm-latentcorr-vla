@@ -396,7 +396,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--failure_rotation_mag_bins", type=int, required=True)
     parser.add_argument("--failure_explore_k", type=int, required=True)
     parser.add_argument("--explore_phase_keys", nargs="*", default=[])
+    parser.add_argument("--explore_phase_instance_idxs", nargs="*", type=int, default=[])
     parser.add_argument("--explore_error_modes", nargs="*", default=[])
+    parser.add_argument("--explore_translation_dir_bins", nargs="*", type=int, default=[])
+    parser.add_argument("--explore_rotation_dir_bins", nargs="*", type=int, default=[])
     parser.add_argument("--explore_disable_phase_bin_skip", type=str2bool, default=False)
     parser.add_argument("--explore_skip_open_laptop_transport", type=str2bool, default=False)
     parser.add_argument("--act_aligned_rollout_exec_steps", type=int, required=True)
@@ -462,7 +465,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cosmos_action_stats_path", type=str, default="")
     parser.add_argument("--cosmos_action_normalization_clip", type=str, default="")
     parser.add_argument("--cosmos_use_quat", type=str2bool, default=False)
-    parser.add_argument("--cosmos_quat_input_order", type=str, choices=["wxyz", "xyzw"], default="xyzw")
+    parser.add_argument("--cosmos_quat_input_order", type=str, choices=["wxyz", "xyzw"], default="wxyz")
     parser.add_argument("--cosmos_prompt", type=str, default="")
     parser.add_argument("--cosmos_negative_prompt", type=str, default="")
     parser.add_argument("--cosmos_seed", type=int, default=0)
@@ -631,7 +634,10 @@ def main() -> None:
         perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
         evac_sample_size=evac_sample_size,
         explore_phase_keys=list(args.explore_phase_keys),
+        explore_phase_instance_idxs=list(args.explore_phase_instance_idxs),
         explore_error_modes=list(args.explore_error_modes),
+        explore_translation_dir_bins=list(args.explore_translation_dir_bins),
+        explore_rotation_dir_bins=list(args.explore_rotation_dir_bins),
         explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
         explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
         world_model_quality_record=str(args.world_model_quality_record),
@@ -722,7 +728,10 @@ def main() -> None:
             perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
             evac_sample_size=evac_sample_size,
             explore_phase_keys=list(args.explore_phase_keys),
+            explore_phase_instance_idxs=list(args.explore_phase_instance_idxs),
             explore_error_modes=list(args.explore_error_modes),
+            explore_translation_dir_bins=list(args.explore_translation_dir_bins),
+            explore_rotation_dir_bins=list(args.explore_rotation_dir_bins),
             explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
             explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
             world_model_quality_record=str(args.world_model_quality_record),
@@ -831,7 +840,10 @@ def main() -> None:
             perturb_rot_max_deg=float(args.act_aligned_perturb_rot_max_deg),
             evac_sample_size=evac_sample_size,
             explore_phase_keys=list(args.explore_phase_keys),
+            explore_phase_instance_idxs=list(args.explore_phase_instance_idxs),
             explore_error_modes=list(args.explore_error_modes),
+            explore_translation_dir_bins=list(args.explore_translation_dir_bins),
+            explore_rotation_dir_bins=list(args.explore_rotation_dir_bins),
             explore_disable_phase_bin_skip=bool(args.explore_disable_phase_bin_skip),
             explore_skip_open_laptop_transport=bool(args.explore_skip_open_laptop_transport),
             world_model_quality_record=str(args.world_model_quality_record),
@@ -1051,6 +1063,20 @@ def main() -> None:
             if isinstance(corr_meta, dict):
                 recover_eval_last = corr_meta.get("recover_eval_last", {}) or {}
                 recoverable_raw = recover_eval_last.get("recoverable", None)
+                has_exportable_correction = (
+                    bool(args.corr_export_dataset)
+                    and isinstance(correction, dict)
+                    and correction.get("corr_image") is not None
+                    and correction.get("corr_qpos_norm") is not None
+                    and correction.get("corr_action_chunk_norm") is not None
+                    and bool(corr_meta.get("correction_generated", False))
+                )
+                if has_exportable_correction:
+                    recoverable_raw = False
+                    recover_eval_last = dict(recover_eval_last)
+                    recover_eval_last["recoverable"] = False
+                    recover_eval_last["forced_unrecoverable_for_demo_export"] = True
+                    corr_meta["recover_eval_last"] = recover_eval_last
                 error_mode_key = str(corr_meta.get("sampled_error_mode", "")).strip().lower()
                 if not error_mode_key:
                     error_mode_key = error_mode_id_to_key(int(batch["forced_error_mode_id"][0].item()))
@@ -1107,6 +1133,9 @@ def main() -> None:
                             "recover_eval_thresholds": recover_eval_last.get("thresholds"),
                             "recover_eval_passes": recover_eval_last.get("passes"),
                             "recover_eval_failed_thresholds": recover_eval_last.get("failed_thresholds"),
+                            "forced_unrecoverable_for_demo_export": recover_eval_last.get(
+                                "forced_unrecoverable_for_demo_export", False
+                            ),
                             "skip_reason": corr_meta.get("skip_reason"),
                             "skip_error": corr_meta.get("skip_error"),
                             "skip_traceback": corr_meta.get("skip_traceback"),
@@ -1114,12 +1143,7 @@ def main() -> None:
                         }
                     )
                 if (
-                    bool(args.corr_export_dataset)
-                    and isinstance(correction, dict)
-                    and correction.get("corr_image") is not None
-                    and correction.get("corr_qpos_norm") is not None
-                    and correction.get("corr_action_chunk_norm") is not None
-                    and bool(corr_meta.get("correction_generated", False))
+                    has_exportable_correction
                     and recoverable_raw is False
                 ):
                     corr_action_raw = corr_meta.get("corr_action_chunk_raw")

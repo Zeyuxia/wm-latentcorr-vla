@@ -42,7 +42,7 @@ class CosmosRolloutClient:
         action_stats_path: str = "",
         action_normalization_clip: float | None = None,
         use_quat: bool = False,
-        quat_input_order: str = "xyzw",
+        quat_input_order: str = "wxyz",
         prompt: str = "",
         negative_prompt: str = "",
         seed: int = 0,
@@ -510,7 +510,7 @@ def build_cosmos_client_from_cfg(cfg: dict[str, Any], device: str | torch.device
             else float(cfg.get("cosmos_action_normalization_clip"))
         ),
         use_quat=bool(cfg.get("cosmos_use_quat", False)),
-        quat_input_order=str(cfg.get("cosmos_quat_input_order", "xyzw")),
+            quat_input_order=str(cfg.get("cosmos_quat_input_order", "wxyz")),
         prompt=str(cfg.get("cosmos_prompt", "")),
         negative_prompt=str(cfg.get("cosmos_negative_prompt", "")),
         seed=int(cfg.get("cosmos_seed", cfg.get("seed", 0))),

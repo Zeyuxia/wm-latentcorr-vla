@@ -73,6 +73,8 @@ class Base_Task(gym.Env):
         self.render_freq = kwags.get("render_freq", 10)
         self.data_type = kwags.get("data_type", None)
         self.save_data = kwags.get("save_data", False)
+        self.memory_obs_capture = bool(kwags.get("memory_obs_capture", False))
+        self.memory_obs_frames = []
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
         self.disable_planner = bool(kwags.get("disable_planner", False))
@@ -524,6 +526,8 @@ class Base_Task(gym.Env):
         save_img(save_path, rgb[camera_name]['rgb'])
 
     def _take_picture(self):  # save data
+        if getattr(self, "memory_obs_capture", False):
+            self.memory_obs_frames.append(deepcopy(self.get_obs()))
         if not self.save_data:
             return
 

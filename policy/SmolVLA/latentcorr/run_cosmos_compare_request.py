@@ -55,7 +55,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--action_normalization_clip", default="")
     parser.add_argument("--use_quat", dest="use_quat", action="store_true", default=False)
     parser.add_argument("--no-use_quat", dest="use_quat", action="store_false")
-    parser.add_argument("--quat_input_order", choices=["wxyz", "xyzw"], default="xyzw")
+    parser.add_argument("--quat_input_order", choices=["wxyz", "xyzw"], default="wxyz")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative_prompt", default="")
     parser.add_argument("--seed", type=int, default=0)

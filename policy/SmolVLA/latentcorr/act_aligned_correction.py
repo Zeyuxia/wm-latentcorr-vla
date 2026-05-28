@@ -202,7 +202,7 @@ class ACTAlignedCorrectionConfig:
     cosmos_action_stats_path: str = ""
     cosmos_action_normalization_clip: float | None = None
     cosmos_use_quat: bool = False
-    cosmos_quat_input_order: str = "xyzw"
+    cosmos_quat_input_order: str = "wxyz"
     cosmos_prompt: str = ""
     cosmos_negative_prompt: str = ""
     cosmos_seed: int = 0
@@ -339,7 +339,7 @@ def build_act_aligned_cfg_from_args(args, max_action_len: int) -> ACTAlignedCorr
             else float(getattr(args, "cosmos_action_normalization_clip"))
         ),
         cosmos_use_quat=bool(getattr(args, "cosmos_use_quat", False)),
-        cosmos_quat_input_order=str(getattr(args, "cosmos_quat_input_order", "xyzw")),
+        cosmos_quat_input_order=str(getattr(args, "cosmos_quat_input_order", "wxyz")),
         cosmos_prompt=str(getattr(args, "cosmos_prompt", "")),
         cosmos_negative_prompt=str(getattr(args, "cosmos_negative_prompt", "")),
         cosmos_seed=int(getattr(args, "cosmos_seed", getattr(args, "seed", 0))),

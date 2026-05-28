@@ -7,8 +7,9 @@ OUT_DIR=${RUN_DIR}/correction_replay_videos_sim
 LOG_DIR=${RUN_DIR}/replay_logs
 SCRIPT=${ROOT}/policy/SmolVLA/replay_correction_samples.py
 PYTHONPATH_VALUE=${ROOT}/envs/curobo/src:${ROOT}/policy/SmolVLA/src:${ROOT}
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
 
-mkdir -p "${OUT_DIR}" "${LOG_DIR}"
+mkdir -p "${OUT_DIR}" "${LOG_DIR}" "${RUNTIME_ROOT}/mplconfig"
 cd "${ROOT}"
 source /data/miniconda3/etc/profile.d/conda.sh
 conda activate smolvla
@@ -17,7 +18,7 @@ launch_rank() {
   local gpu=$1
   local rank=$2
   CUDA_VISIBLE_DEVICES="${gpu}" \
-  MPLCONFIGDIR=/tmp/matplotlib-codex \
+  MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}" \
   PYTHONNOUSERSITE=1 \
   PYTHONPATH="${PYTHONPATH_VALUE}" \
   python "${SCRIPT}" \

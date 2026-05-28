@@ -211,7 +211,10 @@ class FailureAwareStage2Dataset(Dataset):
         perturb_rot_max_deg: float = 15.0,
         evac_sample_size: tuple[int, int] | None = None,
         explore_phase_keys: list[str] | None = None,
+        explore_phase_instance_idxs: list[int] | None = None,
         explore_error_modes: list[str] | None = None,
+        explore_translation_dir_bins: list[int] | None = None,
+        explore_rotation_dir_bins: list[int] | None = None,
         explore_disable_phase_bin_skip: bool = False,
         explore_skip_open_laptop_transport: bool = False,
         world_model_quality_record: str = "",
@@ -240,8 +243,23 @@ class FailureAwareStage2Dataset(Dataset):
         self.explore_phase_key_order = (
             None if not explore_phase_keys else [str(x).strip().lower() for x in explore_phase_keys if str(x).strip()]
         )
+        self.explore_phase_instance_idxs = (
+            None
+            if not explore_phase_instance_idxs
+            else {int(x) for x in explore_phase_instance_idxs if int(x) > 0}
+        )
         self.explore_error_mode_order = (
             None if not explore_error_modes else [str(x).strip().lower() for x in explore_error_modes if str(x).strip()]
+        )
+        self.explore_translation_dir_bins = (
+            None
+            if not explore_translation_dir_bins
+            else {int(x) for x in explore_translation_dir_bins if int(x) >= 0}
+        )
+        self.explore_rotation_dir_bins = (
+            None
+            if not explore_rotation_dir_bins
+            else {int(x) for x in explore_rotation_dir_bins if int(x) >= 0}
         )
         self.explore_phase_keys = None if self.explore_phase_key_order is None else set(self.explore_phase_key_order)
         self.explore_error_modes = None if self.explore_error_mode_order is None else set(self.explore_error_mode_order)
@@ -415,7 +433,8 @@ class FailureAwareStage2Dataset(Dataset):
                     }
                 )
         return {
-            "version": 2,
+            "version": 3,
+            "explore_unit_order": "mode_round_robin_v1",
             "dataset_format": dataset_format,
             "dataset_dir": os.path.realpath(self.dataset_dir),
             "dataset_sigs": dataset_sigs,
@@ -434,7 +453,18 @@ class FailureAwareStage2Dataset(Dataset):
             "perturb_rot_max_deg": float(self.perturb_rot_max_deg),
             "evac_sample_size": None if self.evac_sample_size is None else list(self.evac_sample_size),
             "explore_phase_keys": self.explore_phase_key_order,
+            "explore_phase_instance_idxs": (
+                None if self.explore_phase_instance_idxs is None else sorted(int(x) for x in self.explore_phase_instance_idxs)
+            ),
             "explore_error_modes": self.explore_error_mode_order,
+            "explore_translation_dir_bins": (
+                None
+                if self.explore_translation_dir_bins is None
+                else sorted(int(x) for x in self.explore_translation_dir_bins)
+            ),
+            "explore_rotation_dir_bins": (
+                None if self.explore_rotation_dir_bins is None else sorted(int(x) for x in self.explore_rotation_dir_bins)
+            ),
             "explore_disable_phase_bin_skip": bool(self.explore_disable_phase_bin_skip),
             "explore_skip_open_laptop_transport": bool(self.explore_skip_open_laptop_transport),
             "world_model_quality_record": (
@@ -508,34 +538,36 @@ class FailureAwareStage2Dataset(Dataset):
             trans_mag_bins = int(bin_cfg["translation_mag_bins"])
             rot_dir_bins = int(bin_cfg["rotation_dir_bins"])
             rot_mag_bins = int(bin_cfg["rotation_mag_bins"])
-            def add_if_valid(unit: dict) -> None:
+            def add_if_valid(target_units: list[dict], unit: dict) -> None:
                 if not self._world_model_quality_allows_unit(unit):
                     return
                 if self._unit_has_local_candidate(unit):
-                    units.append(unit)
+                    target_units.append(unit)
 
-            phase_sort_keys = (
-                EXPLORE_PHASE_SORT_KEYS
-                if self.explore_phase_key_order is None
-                else {key: idx for idx, key in enumerate(self.explore_phase_key_order)}
-            )
             error_mode_order = self.explore_error_mode_order or list(FAILURE_ERROR_MODES)
-            error_mode_sort_keys = {key: idx for idx, key in enumerate(error_mode_order)}
 
             for phase_unit in phase_units:
                 phase_key = str(phase_unit["phase_key"])
                 phase_instance_idx = int(phase_unit["phase_instance_idx"])
                 phase_bin_id = int(phase_unit["phase_bin_id"])
                 active_arm_pattern = str(phase_unit["active_arm_pattern"])
+                mode_unit_groups: list[list[dict]] = []
                 for mode in error_mode_order:
                     if self.explore_error_modes is not None and str(mode).strip().lower() not in self.explore_error_modes:
                         continue
                     if not _phase_allows_explore_error_mode(phase_key, mode):
                         continue
+                    mode_units: list[dict] = []
                     if mode == "translation":
                         for dir_bin_id in range(trans_dir_bins):
+                            if (
+                                self.explore_translation_dir_bins is not None
+                                and int(dir_bin_id) not in self.explore_translation_dir_bins
+                            ):
+                                continue
                             for mag_bin_id in range(trans_mag_bins):
                                 add_if_valid(
+                                    mode_units,
                                     {
                                         "phase_key": phase_key,
                                         "phase_instance_idx": phase_instance_idx,
@@ -549,8 +581,14 @@ class FailureAwareStage2Dataset(Dataset):
                                 )
                     elif mode == "rotation":
                         for dir_bin_id in range(rot_dir_bins):
+                            if (
+                                self.explore_rotation_dir_bins is not None
+                                and int(dir_bin_id) not in self.explore_rotation_dir_bins
+                            ):
+                                continue
                             for mag_bin_id in range(rot_mag_bins):
                                 add_if_valid(
+                                    mode_units,
                                     {
                                         "phase_key": phase_key,
                                         "phase_instance_idx": phase_instance_idx,
@@ -564,6 +602,7 @@ class FailureAwareStage2Dataset(Dataset):
                                 )
                     else:
                         add_if_valid(
+                            mode_units,
                             {
                                 "phase_key": phase_key,
                                 "phase_instance_idx": phase_instance_idx,
@@ -575,14 +614,20 @@ class FailureAwareStage2Dataset(Dataset):
                                 "weight": 1.0,
                             }
                         )
-            self._explore_units = sorted(
-                units,
-                key=lambda unit: _explore_unit_sort_key(
-                    unit,
-                    phase_sort_keys=phase_sort_keys,
-                    error_mode_sort_keys=error_mode_sort_keys,
-                ),
-            )
+                    if mode_units:
+                        mode_unit_groups.append(mode_units)
+
+                # Within the same phase/bin/arm, try one bin from each error
+                # mode before moving to the next bin of the same mode. This
+                # gives demo order like translation bin2 -> rotation bin2 ->
+                # translation bin3 -> rotation bin3 instead of exhausting all
+                # translation bins first.
+                max_group_len = max((len(group) for group in mode_unit_groups), default=0)
+                for group_idx in range(max_group_len):
+                    for mode_units in mode_unit_groups:
+                        if group_idx < len(mode_units):
+                            units.append(mode_units[group_idx])
+            self._explore_units = list(units)
             self._rebuild_explore_unit_targets()
             self._save_explore_unit_cache()
             return
@@ -697,6 +742,8 @@ class FailureAwareStage2Dataset(Dataset):
                 if self.explore_phase_keys is not None and str(phase_key).strip().lower() not in self.explore_phase_keys:
                     continue
                 phase_instance_idx = int(meta["phase_instance_idx"])
+                if self.explore_phase_instance_idxs is not None and phase_instance_idx not in self.explore_phase_instance_idxs:
+                    continue
                 phase_bin_id = int(meta["phase_bin_id"])
                 if self._is_open_laptop_dataset() and phase_key in {"transport", "place"}:
                     continue
@@ -1405,7 +1452,10 @@ def build_failure_table_dataset(
     perturb_rot_max_deg: float = 15.0,
     evac_sample_size: tuple[int, int] | None = None,
     explore_phase_keys: list[str] | None = None,
+    explore_phase_instance_idxs: list[int] | None = None,
     explore_error_modes: list[str] | None = None,
+    explore_translation_dir_bins: list[int] | None = None,
+    explore_rotation_dir_bins: list[int] | None = None,
     explore_disable_phase_bin_skip: bool = False,
     explore_skip_open_laptop_transport: bool = False,
     world_model_quality_record: str = "",
@@ -1436,7 +1486,10 @@ def build_failure_table_dataset(
         perturb_rot_max_deg=perturb_rot_max_deg,
         evac_sample_size=evac_sample_size,
         explore_phase_keys=explore_phase_keys,
+        explore_phase_instance_idxs=explore_phase_instance_idxs,
         explore_error_modes=explore_error_modes,
+        explore_translation_dir_bins=explore_translation_dir_bins,
+        explore_rotation_dir_bins=explore_rotation_dir_bins,
         explore_disable_phase_bin_skip=explore_disable_phase_bin_skip,
         explore_skip_open_laptop_transport=explore_skip_open_laptop_transport,
         world_model_quality_record=world_model_quality_record,

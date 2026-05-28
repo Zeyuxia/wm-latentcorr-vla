@@ -13,6 +13,16 @@ EVAL_CONDA_ENV="${EVAL_CONDA_ENV:-smolvla}"
 conda activate "${EVAL_CONDA_ENV}"
 cd "${SCRIPT_DIR}"
 
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
+mkdir -p \
+  "${RUNTIME_ROOT}/tmp" \
+  "${RUNTIME_ROOT}/torch_extensions" \
+  "${RUNTIME_ROOT}/mplconfig" \
+  "${RUNTIME_ROOT}/hf_home" \
+  "${RUNTIME_ROOT}/wandb" \
+  "${RUNTIME_ROOT}/xdg_cache" \
+  "${RUNTIME_ROOT}/xdg_config"
+
 # Edit the values in this block directly before launching the script.
 POLICY_NAME="${POLICY_NAME:-SmolVLA}"
 TASK_NAME="${TASK_NAME:-put_bottles_dustbin}"
@@ -34,6 +44,8 @@ INITIAL_TEST_COUNT="${INITIAL_TEST_COUNT:-}"
 EXPERT_CHECK="${EXPERT_CHECK:-}"
 POLICY_CONDA_ENV="${POLICY_CONDA_ENV:-}"
 EVAL_VIDEO_LOG="${EVAL_VIDEO_LOG:-}"
+ORACLE_FUTURE_OFFSET="${ORACLE_FUTURE_OFFSET:-}"
+TOKEN_INTERP_ALPHA="${TOKEN_INTERP_ALPHA:-}"
 PYTHONNOUSERSITE=1
 TOKENIZERS_PARALLELISM=false
 
@@ -44,6 +56,20 @@ export PYTHONPATH="${EFFECTIVE_PYTHONPATH}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TMP="${TMP:-${TMPDIR}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export WANDB_DIR="${WANDB_DIR:-${RUNTIME_ROOT}/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUNTIME_ROOT}/wandb/cache}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${RUNTIME_ROOT}/wandb/config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUNTIME_ROOT}/xdg_cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${RUNTIME_ROOT}/xdg_config}"
 
 if [[ -t 1 ]]; then
   YELLOW=$'\033[33m'
@@ -118,6 +144,14 @@ cmd=(
 
 if [[ -n "${EVAL_VIDEO_LOG}" ]]; then
   cmd+=(--eval_video_log "${EVAL_VIDEO_LOG}")
+fi
+
+if [[ -n "${ORACLE_FUTURE_OFFSET}" ]]; then
+  cmd+=(--oracle_future_offset "${ORACLE_FUTURE_OFFSET}")
+fi
+
+if [[ -n "${TOKEN_INTERP_ALPHA}" ]]; then
+  cmd+=(--token_interp_alpha "${TOKEN_INTERP_ALPHA}")
 fi
 
 if [[ -n "${SEED_FILE}" ]]; then

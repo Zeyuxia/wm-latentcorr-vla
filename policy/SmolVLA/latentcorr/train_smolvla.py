@@ -626,6 +626,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--token_loss_weight_late", type=float, default=0.02)
     parser.add_argument("--token_loss_decay_start_ratio", type=float, default=0.0)
     parser.add_argument("--token_loss_decay_end_ratio", type=float, default=1.0)
+    parser.add_argument("--teacher_action_weight", type=float, default=0.0)
+    parser.add_argument("--mixed_action_weight", type=float, default=0.0)
+    parser.add_argument("--token_mix_teacher_prob", type=float, default=0.0)
+    parser.add_argument("--token_mix_zero_prob", type=float, default=0.0)
     parser.add_argument("--act_chunk_size", type=int, required=True)
 
 
@@ -798,6 +802,10 @@ def build_stage1_loss_weights(args: argparse.Namespace) -> SmolVLAStage1LossWeig
         token_decay_start_ratio=float(args.token_loss_decay_start_ratio),
         token_decay_end_ratio=float(args.token_loss_decay_end_ratio),
         total_steps=max(1, int(args.max_steps)),
+        teacher_action_weight=float(args.teacher_action_weight),
+        mixed_action_weight=float(args.mixed_action_weight),
+        token_mix_teacher_prob=float(args.token_mix_teacher_prob),
+        token_mix_zero_prob=float(args.token_mix_zero_prob),
     )
 
 
@@ -900,11 +908,15 @@ def log_stage1_tensorboard(writer: SummaryWriter, step: int, output: Any, lr: fl
     writer.add_scalar("train/loss", float(output.loss.item()), step)
     writer.add_scalar("train/loss_action", float(output.loss_action.item()), step)
     writer.add_scalar("train/loss_action_conditioned", float(output.loss_action_conditioned.item()), step)
+    writer.add_scalar("train/loss_action_teacher_conditioned", float(output.loss_action_teacher_conditioned.item()), step)
+    writer.add_scalar("train/loss_action_mixed_conditioned", float(output.loss_action_mixed_conditioned.item()), step)
     writer.add_scalar("train/loss_dynamics", float(output.loss_dynamics.item()), step)
     writer.add_scalar("train/loss_condition_token", float(output.loss_condition_token.item()), step)
     writer.add_scalar("train/beta_condition", float(output.beta_condition), step)
     writer.add_scalar("train/beta_dynamics", float(output.beta_dynamics), step)
     writer.add_scalar("train/beta_token", float(output.beta_token), step)
+    writer.add_scalar("train/beta_teacher_action", float(output.beta_teacher_action), step)
+    writer.add_scalar("train/beta_mixed_action", float(output.beta_mixed_action), step)
     writer.add_scalar("train/lr", float(lr), step)
 
 
@@ -2901,11 +2913,15 @@ def run_stage1(args: argparse.Namespace) -> None:
                         "corr_prefix_loss_steps": int(stage1_corr_prefix_loss_steps),
                         "loss_action": float(output.loss_action.item()),
                         "loss_action_conditioned": float(output.loss_action_conditioned.item()),
+                        "loss_action_teacher_conditioned": float(output.loss_action_teacher_conditioned.item()),
+                        "loss_action_mixed_conditioned": float(output.loss_action_mixed_conditioned.item()),
                         "loss_dynamics": float(output.loss_dynamics.item()),
                         "loss_condition_token": float(output.loss_condition_token.item()),
                         "beta_condition": float(output.beta_condition),
                         "beta_dynamics": float(output.beta_dynamics),
                         "beta_token": float(output.beta_token),
+                        "beta_teacher_action": float(output.beta_teacher_action),
+                        "beta_mixed_action": float(output.beta_mixed_action),
                         "lr": float(current_lr),
                         "requested_units": corr_trace_records,
                     }
@@ -2918,6 +2934,8 @@ def run_stage1(args: argparse.Namespace) -> None:
                     loss=f"{output.loss.item():.4f}",
                     action=f"{output.loss_action.item():.4f}",
                     cond=f"{output.loss_action_conditioned.item():.4f}",
+                    teach=f"{output.loss_action_teacher_conditioned.item():.4f}",
+                    mix=f"{output.loss_action_mixed_conditioned.item():.4f}",
                     dyn=f"{output.loss_dynamics.item():.4f}",
                     ctoken=f"{output.loss_condition_token.item():.4f}",
                     beta_cond=f"{output.beta_condition:.4f}",

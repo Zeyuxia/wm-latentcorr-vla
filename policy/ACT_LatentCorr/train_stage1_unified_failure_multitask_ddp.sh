@@ -13,6 +13,29 @@ VENV_BIN_DIR=$(dirname "${PYTHON_BIN}")
 export PATH="${VENV_BIN_DIR}:${PATH}"
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.9}
 export PYTHONPATH="/data/zhenyangfan/RoboTwin:/data/zhenyangfan/RoboTwin/envs/curobo/src:/data/zhenyangfan/RoboTwin/envs/robot:${PYTHONPATH:-}"
+RUNTIME_ROOT=${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}
+mkdir -p \
+  "${RUNTIME_ROOT}/tmp" \
+  "${RUNTIME_ROOT}/torch_extensions" \
+  "${RUNTIME_ROOT}/mplconfig" \
+  "${RUNTIME_ROOT}/hf_home" \
+  "${RUNTIME_ROOT}/wandb" \
+  "${RUNTIME_ROOT}/xdg_cache" \
+  "${RUNTIME_ROOT}/xdg_config"
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TMP="${TMP:-${TMPDIR}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export WANDB_DIR="${WANDB_DIR:-${RUNTIME_ROOT}/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUNTIME_ROOT}/wandb/cache}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${RUNTIME_ROOT}/wandb/config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUNTIME_ROOT}/xdg_cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${RUNTIME_ROOT}/xdg_config}"
 
 OUTPUT_ROOT=${OUTPUT_ROOT:-/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_unified_failure_multitask}
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -184,7 +207,7 @@ else
   export WANDB_MODE="${WANDB_LOG_MODE}"
 fi
 
-TORCH_EXT_ROOT=${TORCH_EXTENSIONS_DIR:-${HOME}/.cache/torch_extensions}
+TORCH_EXT_ROOT=${TORCH_EXTENSIONS_DIR}
 SKIP_CUROBO_PREWARM=${SKIP_CUROBO_PREWARM:-false}
 
 cleanup_stale_curobo_locks() {

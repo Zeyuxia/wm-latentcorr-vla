@@ -63,7 +63,7 @@ COND_RAMP_STEPS=1000
 COND_MAX_WEIGHT=0.5
 COND_WARMUP_CURVE="cosine"
 FAILURE_MODE="train"
-FAILURE_TABLE_PATHS_JSON="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json"
+FAILURE_TABLE_PATHS_JSON="/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/filtered_first_pregrasp_single_mode/multitask_failure_manifest.json"
 FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.5}"
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
@@ -219,7 +219,28 @@ export TOKENIZERS_PARALLELISM
 export SMOLVLA_EVAC_PRINT_RUNTIME
 export HF_HUB_OFFLINE
 export TRANSFORMERS_OFFLINE
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
-export MPLCONFIGDIR=/tmp/mplconfig
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
+mkdir -p \
+  "${RUNTIME_ROOT}/tmp" \
+  "${RUNTIME_ROOT}/torch_extensions" \
+  "${RUNTIME_ROOT}/mplconfig" \
+  "${RUNTIME_ROOT}/hf_home" \
+  "${RUNTIME_ROOT}/wandb" \
+  "${RUNTIME_ROOT}/xdg_cache" \
+  "${RUNTIME_ROOT}/xdg_config"
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TMP="${TMP:-${TMPDIR}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export WANDB_DIR="${WANDB_DIR:-${RUNTIME_ROOT}/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUNTIME_ROOT}/wandb/cache}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${RUNTIME_ROOT}/wandb/config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUNTIME_ROOT}/xdg_cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${RUNTIME_ROOT}/xdg_config}"
 
 "${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/validate.log"

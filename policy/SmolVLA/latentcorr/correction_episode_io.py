@@ -538,6 +538,104 @@ def _label_video_segment(frames: list[np.ndarray], label: str) -> list[np.ndarra
     return out
 
 
+def _drop_duplicate_boundary_frame(
+    prev_frames: list[np.ndarray],
+    next_frames: list[np.ndarray],
+    *,
+    mae_threshold: float = 3.0,
+) -> list[np.ndarray]:
+    if not prev_frames or not next_frames:
+        return next_frames
+    prev = np.asarray(prev_frames[-1], dtype=np.float32)
+    nxt = np.asarray(next_frames[0], dtype=np.float32)
+    if prev.shape != nxt.shape:
+        return next_frames
+    if float(np.mean(np.abs(prev - nxt))) <= float(mae_threshold):
+        return next_frames[1:]
+    return next_frames
+
+
+def _video_frames_include_start_frame(
+    start_frame: np.ndarray,
+    video_frames: list[np.ndarray],
+    *,
+    mae_threshold: float = 3.0,
+) -> bool:
+    if not video_frames:
+        return False
+    start = np.asarray(start_frame, dtype=np.float32)
+    first = np.asarray(video_frames[0], dtype=np.float32)
+    if start.shape != first.shape:
+        return False
+    return float(np.mean(np.abs(start - first))) <= float(mae_threshold)
+
+
+def _record_action_count(video_record: dict[str, Any] | None) -> int | None:
+    if not isinstance(video_record, dict):
+        return None
+    for key in ("num_actions", "action_chunk_len", "n_valid"):
+        value = video_record.get(key)
+        if value is not None:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count >= 0:
+                return count
+
+    meta_value = video_record.get("runtime_meta_path")
+    meta_path = _resolve_debug_path(meta_value if isinstance(meta_value, str) else None)
+    if meta_path is None or not meta_path.is_file():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    for key in ("num_actions", "action_chunk_len", "n_valid"):
+        value = meta.get(key)
+        if value is not None:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count >= 0:
+                return count
+    summary = meta.get("action_summary")
+    if isinstance(summary, dict):
+        shape = summary.get("shape")
+        if isinstance(shape, (list, tuple)) and shape:
+            try:
+                count = int(shape[0])
+            except (TypeError, ValueError):
+                count = -1
+            if count >= 0:
+                return count
+    return None
+
+
+def _rollout_frames_include_start_frame(
+    video_record: dict[str, Any] | None,
+    start_frame: np.ndarray,
+    video_frames: list[np.ndarray],
+    *,
+    mae_threshold: float = 3.0,
+) -> bool:
+    action_count = _record_action_count(video_record)
+    if action_count is not None:
+        if len(video_frames) == action_count + 1:
+            return True
+        if len(video_frames) == action_count:
+            return False
+    return _video_frames_include_start_frame(
+        start_frame,
+        video_frames,
+        mae_threshold=mae_threshold,
+    )
+
+
 def _encoded_to_frames(encoded_frames: list[np.bytes_], target_hw: tuple[int, int] | None = None) -> list[np.ndarray]:
     frames: list[np.ndarray] = []
     for item in encoded_frames:
@@ -553,6 +651,86 @@ def _write_video_from_frames(frames: list[np.ndarray], out_path: Path, fps: int 
         return
     encoded = [_encode_rgb_jpeg(frame) for frame in frames]
     _write_video_from_encoded_head_frames(encoded, out_path, fps=fps)
+
+
+def _unique_debug_backends(corr_meta: dict[str, Any]) -> list[str]:
+    backends: list[str] = []
+    main_backend = str(corr_meta.get("world_model_backend", "") or "").strip().lower()
+    if main_backend in {"evac", "cosmos", "sim"}:
+        backends.append(main_backend)
+    for key in (
+        "world_model_rollout_videos",
+        "world_model_compare",
+        "world_model_compare_correction_videos",
+    ):
+        for record in corr_meta.get(key, []) or []:
+            if not isinstance(record, dict):
+                continue
+            backend = str(record.get("backend", "") or "").strip().lower()
+            if backend in {"evac", "cosmos", "sim"} and backend not in backends:
+                backends.append(backend)
+    return backends
+
+
+def _backend_rollout_records(corr_meta: dict[str, Any], backend: str) -> list[dict[str, Any]]:
+    backend = str(backend).strip().lower()
+    if backend == str(corr_meta.get("world_model_backend", "") or "").strip().lower():
+        main_records = [
+            record
+            for record in (corr_meta.get("world_model_rollout_videos", []) or [])
+            if isinstance(record, dict)
+        ]
+        if main_records:
+            return sorted(main_records, key=lambda item: int(item.get("step", 0)))
+    compare_records = [
+        record
+        for record in (corr_meta.get("world_model_compare", []) or [])
+        if isinstance(record, dict) and str(record.get("backend", "")).strip().lower() == backend
+    ]
+    if compare_records:
+        return sorted(compare_records, key=lambda item: int(item.get("step", 0)))
+    return []
+
+
+def _backend_correction_record(corr_meta: dict[str, Any], backend: str) -> dict[str, Any] | None:
+    backend = str(backend).strip().lower()
+    if backend == str(corr_meta.get("world_model_backend", "") or "").strip().lower():
+        record = corr_meta.get("world_model_correction_video") or corr_meta.get("evac_correction_video")
+        if isinstance(record, dict):
+            return record
+    for record in corr_meta.get("world_model_compare_correction_videos", []) or []:
+        if isinstance(record, dict) and str(record.get("backend", "")).strip().lower() == backend:
+            return record
+    return None
+
+
+def _build_debug_correction_prefix_frames(
+    *,
+    corr_image_rgb: np.ndarray,
+    num_corr_states: int,
+    corr_video_record: dict[str, Any] | None,
+    target_hw: tuple[int, int] | None,
+) -> tuple[list[np.ndarray], bool]:
+    if num_corr_states <= 0:
+        return [], False
+    base = np.ascontiguousarray(corr_image_rgb.astype(np.uint8))
+    if target_hw is not None and base.shape[:2] != (int(target_hw[0]), int(target_hw[1])):
+        base = cv2.resize(base, (int(target_hw[1]), int(target_hw[0])), interpolation=cv2.INTER_AREA)
+    video_frames = _read_clean_rollout_rgb_frames(corr_video_record, target_hw=target_hw)
+    used_rollout = bool(video_frames)
+    if used_rollout:
+        if _rollout_frames_include_start_frame(corr_video_record, base, video_frames):
+            frames = list(video_frames[:num_corr_states])
+        else:
+            frames = [base] + list(video_frames[: max(0, num_corr_states - 1)])
+        if len(frames) < num_corr_states:
+            frames.extend([frames[-1].copy()] * (num_corr_states - len(frames)))
+        return frames[:num_corr_states], True
+
+    frames = [base]
+    if len(frames) < num_corr_states:
+        frames.extend([frames[-1].copy()] * (num_corr_states - len(frames)))
+    return frames[:num_corr_states], False
 
 
 def _fk_endpose_from_action_sequence(actions: np.ndarray, fk) -> tuple[np.ndarray, np.ndarray]:
@@ -573,6 +751,7 @@ def _make_corr_camera_frames(
     num_corr_states: int,
     corr_image_rgb: np.ndarray,
     correction_video_frames: list[np.ndarray] | None = None,
+    correction_video_record: dict[str, Any] | None = None,
 ) -> list[np.bytes_]:
     source_rgb = source_file[f"observation/{camera_name}/rgb"]
     start_frame = source_rgb[int(np.clip(source_start_idx, 0, len(source_rgb) - 1))]
@@ -589,9 +768,9 @@ def _make_corr_camera_frames(
             )
         frames = [_encode_rgb_jpeg(corr_image_rgb)]
         video_frames = list(correction_video_frames or [])
-        if len(video_frames) >= num_corr_states:
-            # Correction videos usually include the start frame.  Drop it because
-            # corr_image_rgb is the authoritative perturbed-state observation.
+        if _rollout_frames_include_start_frame(correction_video_record, corr_image_rgb, video_frames):
+            # Some backends, e.g. simulator replay, include the perturbed start
+            # frame.  Keep corr_image_rgb as the authoritative start frame.
             video_frames = video_frames[1:]
         for frame in video_frames[: max(0, num_corr_states - 1)]:
             if frame.shape[:2] != target_hw:
@@ -747,6 +926,7 @@ def export_correction_raw_episode(
                     num_corr_states=prefix_len + 1,
                     corr_image_rgb=corr_image_rgb,
                     correction_video_frames=correction_video_frames,
+                    correction_video_record=corr_video_record if isinstance(corr_video_record, dict) else None,
                 )
                 tail_rgb = [np.bytes_(bytes(item)) for item in src_cam["rgb"][attach_idx:]]
                 rgb_frames = corr_rgb + tail_rgb
@@ -784,10 +964,10 @@ def export_correction_raw_episode(
         )
 
     debug_video_path = None
+    backend_debug_video_paths: dict[str, str] = {}
     if write_debug_video and debug_video_dir is not None:
         debug_video_dir = Path(debug_video_dir)
         debug_video_dir.mkdir(parents=True, exist_ok=True)
-        debug_video_path = debug_video_dir / f"episode{episode_id}_debug.mp4"
         with h5py.File(source_hdf5, "r") as src:
             prefix = [np.bytes_(bytes(item)) for item in src["observation/head_camera/rgb"][:start_ts]]
             target_hw = None
@@ -797,20 +977,49 @@ def export_correction_raw_episode(
             elif head_encoded_for_video:
                 first_head = _decode_jpeg_rgb(head_encoded_for_video[0])
                 target_hw = first_head.shape[:2]
+            tail = [np.bytes_(bytes(item)) for item in src["observation/head_camera/rgb"][attach_idx:]]
+        prefix_frames = _encoded_to_frames(prefix, target_hw=target_hw)
+        tail_frames = _encoded_to_frames(tail, target_hw=target_hw)
+        default_correction_prefix_frames = _encoded_to_frames(
+            head_encoded_for_video[: prefix_len + 1],
+            target_hw=target_hw,
+        )
+        main_backend = str(corr_meta.get("world_model_backend", "") or "").strip().lower()
+        debug_backends = _unique_debug_backends(corr_meta)
+        if not debug_backends:
+            debug_backends = [main_backend] if main_backend in {"evac", "cosmos", "sim"} else []
+        for backend in debug_backends:
             perturb_frames = []
-            for record in corr_meta.get("world_model_rollout_videos", []) or []:
+            for record in _backend_rollout_records(corr_meta, backend):
                 perturb_frames.extend(_read_rollout_debug_frames(record, target_hw=target_hw))
-            correction_prefix_frames = _encoded_to_frames(
-                head_encoded_for_video[: prefix_len + 1],
+            corr_record = _backend_correction_record(corr_meta, backend)
+            correction_prefix_frames, used_backend_correction = _build_debug_correction_prefix_frames(
+                corr_image_rgb=corr_image_rgb,
+                num_corr_states=prefix_len + 1,
+                corr_video_record=corr_record,
                 target_hw=target_hw,
             )
-            tail = [np.bytes_(bytes(item)) for item in src["observation/head_camera/rgb"][attach_idx:]]
-        debug_frames = []
-        debug_frames.extend(_label_video_segment(_encoded_to_frames(prefix, target_hw=target_hw), "original prefix"))
-        debug_frames.extend(_label_video_segment(perturb_frames, "perturb rollout"))
-        debug_frames.extend(_label_video_segment(correction_prefix_frames, "exported correction prefix"))
-        debug_frames.extend(_label_video_segment(_encoded_to_frames(tail, target_hw=target_hw), "original tail"))
-        _write_video_from_frames(debug_frames, debug_video_path, fps=fps)
+            if not used_backend_correction and backend == main_backend and default_correction_prefix_frames:
+                correction_prefix_frames = list(default_correction_prefix_frames)
+            # Keep only per-backend stitched videos. The generic
+            # episodeN_debug.mp4 duplicates the main backend and wastes time.
+            correction_prefix_frames = _drop_duplicate_boundary_frame(
+                perturb_frames,
+                correction_prefix_frames,
+            )
+            debug_frames = []
+            debug_frames.extend(_label_video_segment(prefix_frames, "original prefix"))
+            debug_frames.extend(_label_video_segment(perturb_frames, f"{backend} perturb rollout"))
+            correction_label = f"{backend} correction rollout"
+            if not used_backend_correction and backend != main_backend:
+                correction_label = f"{backend} correction rollout (missing)"
+            debug_frames.extend(_label_video_segment(correction_prefix_frames, correction_label))
+            debug_frames.extend(_label_video_segment(tail_frames, "original tail"))
+            backend_debug_path = debug_video_dir / f"episode{episode_id}_{backend}_debug.mp4"
+            _write_video_from_frames(debug_frames, backend_debug_path, fps=fps)
+            backend_debug_video_paths[backend] = str(backend_debug_path)
+            if debug_video_path is None or backend == main_backend:
+                debug_video_path = backend_debug_path
 
     record = {
         "export_path": str(out_hdf5),
@@ -818,6 +1027,7 @@ def export_correction_raw_episode(
         "instruction_path": str(instr_dir / f"episode{episode_id}.json"),
         "traj_path": str(traj_dir / f"episode{episode_id}.pkl"),
         "debug_video_path": None if debug_video_path is None else str(debug_video_path),
+        "backend_debug_video_paths": backend_debug_video_paths,
         "task": task_name,
         "task_config": task_config,
         "rank": int(rank),

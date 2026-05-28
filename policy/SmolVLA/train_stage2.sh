@@ -290,8 +290,29 @@ export PYTHONPATH
 export TOKENIZERS_PARALLELISM
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
-export MPLCONFIGDIR=/tmp/mplconfig
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
+mkdir -p \
+  "${RUNTIME_ROOT}/tmp" \
+  "${RUNTIME_ROOT}/torch_extensions" \
+  "${RUNTIME_ROOT}/mplconfig" \
+  "${RUNTIME_ROOT}/hf_home" \
+  "${RUNTIME_ROOT}/wandb" \
+  "${RUNTIME_ROOT}/xdg_cache" \
+  "${RUNTIME_ROOT}/xdg_config"
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TMP="${TMP:-${TMPDIR}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export WANDB_DIR="${WANDB_DIR:-${RUNTIME_ROOT}/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUNTIME_ROOT}/wandb/cache}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${RUNTIME_ROOT}/wandb/config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUNTIME_ROOT}/xdg_cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${RUNTIME_ROOT}/xdg_config}"
 
 "${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/log.log"
 

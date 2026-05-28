@@ -33,7 +33,14 @@ EVAC_CONFIG=/data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_
 WORLD_MODEL_BACKEND=${WORLD_MODEL_BACKEND:-cosmos}
 SIM_USE_SUBPROCESS=${SIM_USE_SUBPROCESS:-true}
 SIM_TIMEOUT_S=${SIM_TIMEOUT_S:-180}
-WORLD_MODEL_QUALITY_RECORD=${WORLD_MODEL_QUALITY_RECORD:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/world_model_quality_record.md}
+if [ -z "${WORLD_MODEL_QUALITY_RECORD+x}" ]; then
+  WORLD_MODEL_QUALITY_RECORD=/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore_analysis/world_model_quality_record.md
+fi
+case "${WORLD_MODEL_QUALITY_RECORD}" in
+  none|None|NONE|off|Off|OFF|false|False|FALSE|disabled|Disabled|DISABLED)
+    WORLD_MODEL_QUALITY_RECORD=""
+    ;;
+esac
 # Keep trial filtering independent from the rollout backend.
 # Default to EVAC so sim replays can reproduce the original EVAC-filtered trial
 # schedule unless explicitly overridden.
@@ -62,7 +69,7 @@ COSMOS_ACTION_NORMALIZATION_CLIP=${COSMOS_ACTION_NORMALIZATION_CLIP:-}
 COSMOS_USE_QUAT=${COSMOS_USE_QUAT:-false}
 # The current RoboTwin Cosmos checkpoint was trained with the converter that
 # read endpose quaternions as xyzw. Keep online FK action conditioning aligned.
-COSMOS_QUAT_INPUT_ORDER=${COSMOS_QUAT_INPUT_ORDER:-xyzw}
+COSMOS_QUAT_INPUT_ORDER=${COSMOS_QUAT_INPUT_ORDER:-wxyz}
 COSMOS_PROMPT=${COSMOS_PROMPT:-}
 COSMOS_NEGATIVE_PROMPT=${COSMOS_NEGATIVE_PROMPT:-}
 COSMOS_SEED=${COSMOS_SEED:-0}
@@ -118,6 +125,10 @@ EXPLORE_PHASE_KEYS=(
 if [ -n "${EXPLORE_PHASE_KEYS_OVERRIDE:-}" ]; then
   read -r -a EXPLORE_PHASE_KEYS <<< "${EXPLORE_PHASE_KEYS_OVERRIDE}"
 fi
+EXPLORE_PHASE_INSTANCE_IDXS=()
+if [ -n "${EXPLORE_PHASE_INSTANCE_IDXS_OVERRIDE:-}" ]; then
+  read -r -a EXPLORE_PHASE_INSTANCE_IDXS <<< "${EXPLORE_PHASE_INSTANCE_IDXS_OVERRIDE}"
+fi
 EXPLORE_ERROR_MODES=(
   gripper_close
   rotation
@@ -125,6 +136,17 @@ EXPLORE_ERROR_MODES=(
 )
 if [ -n "${EXPLORE_ERROR_MODES_OVERRIDE:-}" ]; then
   read -r -a EXPLORE_ERROR_MODES <<< "${EXPLORE_ERROR_MODES_OVERRIDE}"
+fi
+# Demo-direction defaults: translation left/right (local +/-Y) and planar yaw
+# rotation around local +/-Z. Override with empty string arrays from the env if
+# a full direction sweep is needed.
+EXPLORE_TRANSLATION_DIR_BINS=(2 3)
+if [ -n "${EXPLORE_TRANSLATION_DIR_BINS_OVERRIDE:-}" ]; then
+  read -r -a EXPLORE_TRANSLATION_DIR_BINS <<< "${EXPLORE_TRANSLATION_DIR_BINS_OVERRIDE}"
+fi
+EXPLORE_ROTATION_DIR_BINS=(2 3)
+if [ -n "${EXPLORE_ROTATION_DIR_BINS_OVERRIDE:-}" ]; then
+  read -r -a EXPLORE_ROTATION_DIR_BINS <<< "${EXPLORE_ROTATION_DIR_BINS_OVERRIDE}"
 fi
 EXPLORE_DISABLE_PHASE_BIN_SKIP=${EXPLORE_DISABLE_PHASE_BIN_SKIP:-false}
 EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT=${EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT:-false}
@@ -143,9 +165,9 @@ RECOVER_EVAL_ROT_THRESH_DEG=8.0
 RECOVER_EVAL_NEAREST_WINDOW_RADIUS=16
 RECOVER_EVAL_VIDEO_BRIDGE_STEPS=16
 ACT_ALIGNED_ENABLE_PERTURB=true
-ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN=0.05
-ACT_ALIGNED_PERTURB_ROT_MAX_DEG=15.0
-ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN=0.10
+ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN=${ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN:-0.08}
+ACT_ALIGNED_PERTURB_ROT_MAX_DEG=${ACT_ALIGNED_PERTURB_ROT_MAX_DEG:-25.0}
+ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN=${ACT_ALIGNED_PERTURB_GRIPPER_CLOSE_MIN:-0.02}
 EVAC_BLUR_FILTER_ENABLE=${EVAC_BLUR_FILTER_ENABLE:-false}
 EVAC_BLUR_FILTER_METRIC=${EVAC_BLUR_FILTER_METRIC:-sharpness_ratio}
 EVAC_BLUR_FILTER_MIN_RATIO=${EVAC_BLUR_FILTER_MIN_RATIO:-0.75}
@@ -311,7 +333,10 @@ CMD=(
     --failure_rotation_mag_bins "${FAILURE_ROTATION_MAG_BINS}" \
     --failure_explore_k "${FAILURE_EXPLORE_K}" \
     --explore_phase_keys "${EXPLORE_PHASE_KEYS[@]}" \
+    --explore_phase_instance_idxs "${EXPLORE_PHASE_INSTANCE_IDXS[@]}" \
     --explore_error_modes "${EXPLORE_ERROR_MODES[@]}" \
+    --explore_translation_dir_bins "${EXPLORE_TRANSLATION_DIR_BINS[@]}" \
+    --explore_rotation_dir_bins "${EXPLORE_ROTATION_DIR_BINS[@]}" \
     --explore_disable_phase_bin_skip "${EXPLORE_DISABLE_PHASE_BIN_SKIP}" \
     --explore_skip_open_laptop_transport "${EXPLORE_SKIP_OPEN_LAPTOP_TRANSPORT}" \
     --act_aligned_rollout_exec_steps "${ACT_ALIGNED_ROLLOUT_EXEC_STEPS}" \

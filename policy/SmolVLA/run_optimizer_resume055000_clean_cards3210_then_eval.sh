@@ -50,8 +50,11 @@ export PYTHONPATH="${SCRIPT_DIR}/src"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export LEROBOT_RANDOMIZE_TASK_FROM_EPISODE_INSTRUCTIONS=1
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
-export MPLCONFIGDIR=/tmp/mplconfig
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
+mkdir -p "${RUNTIME_ROOT}/tmp" "${RUNTIME_ROOT}/torch_extensions" "${RUNTIME_ROOT}/mplconfig"
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
 
 cmd=(
   accelerate

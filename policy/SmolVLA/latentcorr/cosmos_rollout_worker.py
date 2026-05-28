@@ -159,7 +159,7 @@ def _poses_to_cosmos_state_data(
     fk_poses: np.ndarray,
     grippers: np.ndarray,
     *,
-    quat_input_order: str = "xyzw",
+    quat_input_order: str = "wxyz",
 ) -> dict[str, list]:
     fk_poses = np.asarray(fk_poses, dtype=np.float32)
     grippers = np.asarray(grippers, dtype=np.float32)
@@ -494,7 +494,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--action_stats_path", type=str, default="")
     parser.add_argument("--action_normalization_clip", type=str, default="")
     parser.add_argument("--use_quat", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--quat_input_order", type=str, choices=["wxyz", "xyzw"], default="xyzw")
+    parser.add_argument("--quat_input_order", type=str, choices=["wxyz", "xyzw"], default="wxyz")
     parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--negative_prompt", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)

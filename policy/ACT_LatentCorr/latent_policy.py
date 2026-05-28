@@ -14,10 +14,9 @@ from .config_latent import DynamicsWarmupConfig, LatentLossConfig, LatentModelCo
 from .latent_modules import (
     ActionConditionedPredictor,
     DynamicsWarmup,
-    LatentToTokenAdapter,
+    FutureTokenPredictor,
     LatentActionDecoder,
     LatentProjector,
-    ObservationConditionedFuturePredictor,
     ResidualLatentAdapter,
 )
 
@@ -26,30 +25,16 @@ from .latent_modules import (
 class Stage1LossOutput:
     loss: torch.Tensor
     loss_action: torch.Tensor
-    loss_action_conditioned_teacher: torch.Tensor
-    loss_action_conditioned_pred: torch.Tensor
     loss_action_conditioned: torch.Tensor
     loss_condition_token: torch.Tensor
-    loss_latent: torch.Tensor
+    loss_align: torch.Tensor
     loss_dynamics: torch.Tensor
     loss_wm_action_current: torch.Tensor
     loss_wm_action_future: torch.Tensor
     loss_bridge_future: torch.Tensor
     beta_dynamics: float
-    progress: float
-    lambda_teacher: float
-    lambda_pred: float
-    lambda_latent: float
-    lambda_token: float
-    cond_keep_ratio: float
-    teacher_token_norm_mean: torch.Tensor
-    pred_token_norm_mean: torch.Tensor
-    delta_action_mean: torch.Tensor
-    delta_action_normal_mean: torch.Tensor
-    delta_action_failure_mean: torch.Tensor
-    delta_action_teacher_mean: torch.Tensor
-    delta_action_teacher_normal_mean: torch.Tensor
-    delta_action_teacher_failure_mean: torch.Tensor
+    alpha_latent: float
+    lambda_action_conditioned_eff: float
 
 
 @dataclass
@@ -102,8 +87,7 @@ class ACTLatentStage1(nn.Module):
         self.wm_adapter: ResidualLatentAdapter | None = None
         self.readout_adapter: ResidualLatentAdapter | None = None
         self.predictor: ActionConditionedPredictor | None = None
-        self.obs_future_predictor: ObservationConditionedFuturePredictor | None = None
-        self.token_adapter: LatentToTokenAdapter | None = None
+        self.future_token_predictor: FutureTokenPredictor | None = None
         self.action_decoder: LatentActionDecoder | None = None
         self.act_condition_proj: nn.Linear | None = None
         self.register_buffer(
@@ -117,7 +101,6 @@ class ACTLatentStage1(nn.Module):
             persistent=False,
         )
         self._freeze_base_act = False
-        self._latent_target_hw: tuple[int, int] | None = None
 
     def forward(self, *args, mode: str = "stage1", **kwargs):
         if mode == "stage1":
@@ -155,7 +138,7 @@ class ACTLatentStage1(nn.Module):
         mean = self._imagenet_mean.to(device=image.device, dtype=image.dtype)
         std = self._imagenet_std.to(device=image.device, dtype=image.dtype)
         return (image - mean) / std
-
+在·
     def _extract_act_feature(self, image: torch.Tensor) -> torch.Tensor:
         """
         Extract ACT visual map before transformer decoding.
@@ -173,19 +156,12 @@ class ACTLatentStage1(nn.Module):
             all_cam_features.append(model.input_proj(features))
         return torch.cat(all_cam_features, dim=3)
 
-    def _lazy_init_heads_from_shapes(
-        self,
-        z_act: torch.Tensor,
-        wm_channels: int,
-        target_hw: tuple[int, int],
-    ) -> None:
+    def _lazy_init_heads(self, z_act: torch.Tensor, z_wm: torch.Tensor):
         if self.projector is not None:
             return
 
         _, c_act, _, _ = z_act.shape
-        c_wm = int(wm_channels)
-        h_wm, w_wm = int(target_hw[0]), int(target_hw[1])
-        self._latent_target_hw = (h_wm, w_wm)
+        _, c_wm, _, _ = z_wm.shape
         self.projector = LatentProjector(
             in_channels=c_act,
             out_channels=c_wm,
@@ -206,12 +182,6 @@ class ACTLatentStage1(nn.Module):
             mlp_hidden_dim=self.latent_model_cfg.predictor_mlp_hidden,
             num_blocks=self.latent_model_cfg.predictor_num_blocks,
         ).to(z_act.device)
-        self.obs_future_predictor = ObservationConditionedFuturePredictor(
-            channels=c_wm,
-            state_dim=self.latent_model_cfg.state_dim,
-            hidden_dim=self.latent_model_cfg.predictor_mlp_hidden,
-            num_blocks=self.latent_model_cfg.predictor_num_blocks,
-        ).to(z_act.device)
         self.action_decoder = LatentActionDecoder(
             in_channels=c_wm,
             hidden_dim=self.latent_model_cfg.action_decoder_hidden,
@@ -219,33 +189,21 @@ class ACTLatentStage1(nn.Module):
             action_dim=self.latent_model_cfg.action_dim,
         ).to(z_act.device)
         hidden_dim = int(self.base_act.model.transformer.d_model)
-        self.token_adapter = LatentToTokenAdapter(
+        self.future_token_predictor = FutureTokenPredictor(
             latent_channels=c_wm,
+            state_dim=self.latent_model_cfg.state_dim,
+            hidden_dim=self.latent_model_cfg.predictor_mlp_hidden,
             token_dim=hidden_dim,
-            hidden_dim=self.latent_model_cfg.token_adapter_hidden_dim,
-            num_layers=self.latent_model_cfg.token_adapter_num_layers,
-            dropout=self.latent_model_cfg.token_adapter_dropout,
         ).to(z_act.device)
         self.act_condition_proj = nn.Linear(c_wm, hidden_dim).to(z_act.device)
+        nn.init.zeros_(self.act_condition_proj.weight)
         nn.init.zeros_(self.act_condition_proj.bias)
-
-    def _lazy_init_heads(self, z_act: torch.Tensor, z_wm: torch.Tensor):
-        self._lazy_init_heads_from_shapes(
-            z_act=z_act,
-            wm_channels=int(z_wm.shape[1]),
-            target_hw=(int(z_wm.shape[-2]), int(z_wm.shape[-1])),
-        )
 
     def initialize_latent_heads(self, image_t: torch.Tensor, wm_teacher) -> None:
         with torch.no_grad():
             z_act = self._extract_act_feature(image_t)
             z_wm = wm_teacher.encode_image(image_t[:, 0])
         self._lazy_init_heads(z_act, z_wm)
-
-    def initialize_latent_heads_from_shapes(self, image_t: torch.Tensor, wm_channels: int, target_hw: tuple[int, int]) -> None:
-        with torch.no_grad():
-            z_act = self._extract_act_feature(image_t)
-        self._lazy_init_heads_from_shapes(z_act, wm_channels=wm_channels, target_hw=target_hw)
 
     def _shared_wm_latent(self, z_wm: torch.Tensor) -> torch.Tensor:
         assert self.wm_adapter is not None
@@ -265,112 +223,10 @@ class ACTLatentStage1(nn.Module):
         token = self.act_condition_proj(pooled)
         return token * float(scale)
 
-    def _predict_future_latent(self, z_t: torch.Tensor, qpos_t: torch.Tensor) -> torch.Tensor:
-        assert self.obs_future_predictor is not None
-        return self.obs_future_predictor(z_t, qpos_t)
-
-    def _adapt_latent_to_token(self, z_t: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-        assert self.token_adapter is not None
-        token = self.token_adapter(z_t)
+    def _predict_future_token(self, z_t: torch.Tensor, qpos_t: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        assert self.future_token_predictor is not None
+        token = self.future_token_predictor(z_t, qpos_t)
         return token * float(scale)
-
-    @staticmethod
-    def _normalized_mse(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        denom = target.pow(2).mean().detach().clamp_min(eps)
-        return (pred - target).pow(2).mean() / denom
-
-    @staticmethod
-    def _cosine_latent_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_flat = pred.flatten(1)
-        target_flat = target.flatten(1)
-        return 1.0 - F.cosine_similarity(pred_flat, target_flat, dim=1).mean()
-
-    def _latent_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss_type = str(self.latent_loss_cfg.latent_loss_type).strip().lower()
-        if loss_type == "normalized_mse":
-            return self._normalized_mse(pred, target)
-        if loss_type == "cosine":
-            return self._cosine_latent_loss(pred, target)
-        if loss_type == "raw_mse":
-            return F.mse_loss(pred, target)
-        raise ValueError(f"Unsupported latent_loss_type={self.latent_loss_cfg.latent_loss_type}")
-
-    def _token_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss_type = str(self.latent_loss_cfg.token_loss_type).strip().lower()
-        if loss_type == "mse":
-            return F.mse_loss(pred, target)
-        raise ValueError(f"Unsupported token_loss_type={self.latent_loss_cfg.token_loss_type}")
-
-    def _schedule_weight(self, progress: float, start_ratio: float, end_ratio: float, start_value: float, end_value: float) -> float:
-        p = float(max(0.0, min(1.0, progress)))
-        if p <= start_ratio:
-            return float(start_value)
-        if p >= end_ratio:
-            return float(end_value)
-        if end_ratio <= start_ratio:
-            return float(end_value)
-        r = (p - start_ratio) / float(end_ratio - start_ratio)
-        return float(start_value * (1.0 - r) + end_value * r)
-
-    def _compute_stage1_schedule(self, progress: float) -> dict[str, float]:
-        cfg = self.latent_loss_cfg
-        p = float(max(0.0, min(1.0, progress)))
-        if p < cfg.teacher_decay_start_ratio:
-            lambda_teacher = float(cfg.lambda_teacher_max)
-        elif p < cfg.teacher_decay_end_ratio:
-            lambda_teacher = self._schedule_weight(
-                p,
-                cfg.teacher_decay_start_ratio,
-                cfg.teacher_decay_end_ratio,
-                cfg.lambda_teacher_max,
-                0.0,
-            )
-        else:
-            lambda_teacher = 0.0
-
-        if p < cfg.pred_warmup_start_ratio:
-            lambda_pred = 0.0
-        elif p < cfg.pred_warmup_end_ratio:
-            lambda_pred = self._schedule_weight(
-                p,
-                cfg.pred_warmup_start_ratio,
-                cfg.pred_warmup_end_ratio,
-                0.0,
-                cfg.lambda_pred_max,
-            )
-        else:
-            lambda_pred = float(cfg.lambda_pred_max)
-
-        if p < cfg.latent_warmup_end_ratio:
-            lambda_latent = self._schedule_weight(
-                p,
-                0.0,
-                cfg.latent_warmup_end_ratio,
-                0.0,
-                cfg.lambda_latent_max,
-            )
-        else:
-            lambda_latent = float(cfg.lambda_latent_max)
-
-        if p < cfg.token_decay_start_ratio:
-            lambda_token = float(cfg.lambda_token_init)
-        elif p < cfg.token_decay_end_ratio:
-            lambda_token = self._schedule_weight(
-                p,
-                cfg.token_decay_start_ratio,
-                cfg.token_decay_end_ratio,
-                cfg.lambda_token_init,
-                cfg.lambda_token_late,
-            )
-        else:
-            lambda_token = float(cfg.lambda_token_late)
-        return {
-            "progress": p,
-            "lambda_teacher": lambda_teacher,
-            "lambda_pred": lambda_pred,
-            "lambda_latent": lambda_latent,
-            "lambda_token": lambda_token,
-        }
 
     def predict_act_chunk(self, qpos_t: torch.Tensor, image_t: torch.Tensor) -> torch.Tensor:
         return self.base_act(qpos_t, image_t)
@@ -415,16 +271,16 @@ class ACTLatentStage1(nn.Module):
         self,
         qpos_t: torch.Tensor,
         image_t: torch.Tensor,
+        wm_teacher,
+        alpha_latent: float = 1.0,
     ) -> torch.Tensor:
         z_act = self._extract_act_feature(image_t)
-        if self.projector is None or self.wm_adapter is None:
-            raise RuntimeError("Latent heads are not initialized before pred inference.")
-        # Match the spatial latent size learned during initialization without querying WM again.
-        if not hasattr(self, "_latent_target_hw") or self._latent_target_hw is None:
-            raise RuntimeError("Missing cached latent target resolution for pred inference.")
-        z_proj = self.projector(z_act, target_hw=self._latent_target_hw)
-        z_pred = self._predict_future_latent(z_proj, qpos_t)
-        token = self._adapt_latent_to_token(z_pred, scale=1.0)
+        z_wm_t = wm_teacher.encode_image(image_t[:, 0])
+        self._lazy_init_heads(z_act, z_wm_t)
+        assert self.projector is not None
+        target_hw = (z_wm_t.shape[-2], z_wm_t.shape[-1])
+        z_proj = self.projector(z_act, target_hw=target_hw)
+        token = self._predict_future_token(z_proj, qpos_t, scale=alpha_latent)
         return self.base_act(qpos_t, image_t, external_latent_input=token)
 
     def forward_stage1(
@@ -442,10 +298,7 @@ class ACTLatentStage1(nn.Module):
         wm_teacher,
         global_step: int,
         use_act_head_conditioning: bool = False,
-        teacher_current_latent: torch.Tensor | None = None,
         future_teacher_latent: torch.Tensor | None = None,
-        is_failure_sample: torch.Tensor | None = None,
-        return_dict: bool = False,
     ) -> Stage1LossOutput:
         if image_t.ndim != 5:
             raise ValueError(f"image_t must be (B,num_cam,3,H,W), got {image_t.shape}")
@@ -455,15 +308,8 @@ class ACTLatentStage1(nn.Module):
         z_act_latent = z_act.detach() if self.latent_loss_cfg.detach_act_feature_for_latent else z_act
 
         # Teacher latent from EVAC final VAE latent, head camera only for stage-1.
-        if teacher_current_latent is None:
-            if wm_teacher is None:
-                raise ValueError("wm_teacher is required when teacher_current_latent is not provided")
-            z_wm_t = wm_teacher.encode_image(image_t[:, 0])
-        else:
-            z_wm_t = teacher_current_latent
+        z_wm_t = wm_teacher.encode_image(image_t[:, 0])
         if future_teacher_latent is None:
-            if wm_teacher is None:
-                raise ValueError("wm_teacher is required when future_teacher_latent is not provided")
             z_wm_t1 = wm_teacher.encode_image(image_t1[:, 0])
         else:
             z_wm_t1 = future_teacher_latent
@@ -472,9 +318,8 @@ class ACTLatentStage1(nn.Module):
         assert self.wm_adapter is not None
         assert self.readout_adapter is not None
         assert self.predictor is not None
-        assert self.obs_future_predictor is not None
         assert self.action_decoder is not None
-        assert self.token_adapter is not None
+        assert self.future_token_predictor is not None
 
         target_hw = (z_wm_t.shape[-2], z_wm_t.shape[-1])
         z_proj = self.projector(z_act_latent, target_hw=target_hw)
@@ -482,113 +327,35 @@ class ACTLatentStage1(nn.Module):
             z_wm_shared_t = z_wm_t.detach()
             z_wm_shared_t1 = z_wm_t1.detach()
         else:
-            # Freeze EVAC features themselves, but keep the shared-manifold adapter trainable.
             z_wm_shared_t = self._shared_wm_latent(z_wm_t.detach())
             z_wm_shared_t1 = self._shared_wm_latent(z_wm_t1.detach())
+        loss_align = F.mse_loss(z_proj, z_wm_shared_t.detach())
 
         act_loss_dict = self.base_act(qpos_t, image_t, actions=act_action_chunk, is_pad=act_is_pad)
         loss_action = act_loss_dict["loss"]
 
-        z_pred_input = z_proj.detach() if self.latent_loss_cfg.use_projector_detach_for_predictor else z_proj
-        z_hat_next = self._predict_future_latent(z_pred_input, qpos_t)
-        # `stopgrad_wm_teacher` is already enforced by detaching the EVAC latent before
-        # feeding it into `wm_adapter`. Do not detach again here, otherwise `wm_adapter`
-        # becomes log-only and DDP sees it as used-by-output but not used-by-loss.
-        teacher_latent_target = z_wm_shared_t1
-        loss_latent = self._latent_loss(z_hat_next, teacher_latent_target)
-        # Stage-1 mainline no longer carries an independent dynamics term.
-        loss_dynamics = torch.zeros_like(loss_latent)
+        z_for_pred = z_proj.detach() if self.latent_loss_cfg.use_projector_detach_for_predictor else z_proj
+        z_hat_next = self.predictor(z_for_pred, action_prefix, is_pad=is_pad_prefix)
+        loss_dynamics = F.mse_loss(z_hat_next, z_wm_shared_t1.detach())
 
-        progress = float(max(0.0, min(1.0, float(global_step))))
-        weights = self._compute_stage1_schedule(progress)
+        alpha_latent = self.beta_scheduler.weight(global_step)
         loss_action_conditioned = torch.zeros_like(loss_action)
-        loss_action_conditioned_teacher = torch.zeros_like(loss_action)
-        loss_action_conditioned_pred = torch.zeros_like(loss_action)
-        teacher_cond_source = z_wm_shared_t1
-        teacher_cond_token_raw = self._latent_to_act_token(teacher_cond_source, scale=1.0)
-        pred_cond_source = z_hat_next.detach() if self.latent_loss_cfg.stopgrad_adapter_input_for_token_loss else z_hat_next
-        pred_cond_token_raw = self._adapt_latent_to_token(pred_cond_source, scale=1.0)
-        teacher_token_target = teacher_cond_token_raw.detach() if self.latent_loss_cfg.stopgrad_teacher_token else teacher_cond_token_raw
-        loss_condition_token = self._token_loss(pred_cond_token_raw, teacher_token_target)
-        cond_keep_ratio = 1.0
-        teacher_token_norm_mean = teacher_cond_token_raw.norm(dim=1).mean()
-        pred_token_norm_mean = pred_cond_token_raw.norm(dim=1).mean()
-        delta_action_mean = torch.zeros_like(loss_action)
-        delta_action_normal_mean = torch.zeros_like(loss_action)
-        delta_action_failure_mean = torch.zeros_like(loss_action)
-        delta_action_teacher_mean = torch.zeros_like(loss_action)
-        delta_action_teacher_normal_mean = torch.zeros_like(loss_action)
-        delta_action_teacher_failure_mean = torch.zeros_like(loss_action)
+        teacher_cond_token = self._latent_to_act_token(z_wm_shared_t1.detach(), scale=1.0)
+        pred_cond_token = self._predict_future_token(z_for_pred, qpos_t, scale=1.0)
+        loss_condition_token = F.mse_loss(pred_cond_token, teacher_cond_token.detach())
         if use_act_head_conditioning:
-            keep_mask = torch.ones(
-                (pred_cond_token_raw.shape[0], 1),
-                device=pred_cond_token_raw.device,
-                dtype=pred_cond_token_raw.dtype,
+            # Deployable conditioned action loss: predict the future token
+            # directly from current observation/state, then consume it in the
+            # same ACT forward pass.
+            cond_token = pred_cond_token * float(alpha_latent)
+            cond_loss_dict = self.base_act(
+                qpos_t,
+                image_t,
+                actions=act_action_chunk,
+                is_pad=act_is_pad,
+                external_latent_input=cond_token,
             )
-            if (
-                is_failure_sample is not None
-                and self.training
-                and float(self.latent_loss_cfg.normal_condition_keep_prob) < 1.0
-            ):
-                keep_prob = float(max(0.0, min(1.0, self.latent_loss_cfg.normal_condition_keep_prob)))
-                normal_mask = (~is_failure_sample.bool()).view(-1, 1)
-                if keep_prob <= 0.0:
-                    keep_mask = torch.where(normal_mask, torch.zeros_like(keep_mask), keep_mask)
-                elif keep_prob < 1.0:
-                    sampled = (torch.rand_like(keep_mask) < keep_prob).to(pred_cond_token_raw.dtype)
-                    keep_mask = torch.where(normal_mask, sampled, keep_mask)
-                cond_keep_ratio = float(keep_mask.mean().item())
-
-            teacher_token_for_action = teacher_cond_token_raw * keep_mask
-            pred_token_for_action = pred_cond_token_raw * keep_mask
-            if weights["lambda_teacher"] > 0.0:
-                teacher_loss_dict = self.base_act(
-                    qpos_t,
-                    image_t,
-                    actions=act_action_chunk,
-                    is_pad=act_is_pad,
-                    external_latent_input=teacher_token_for_action,
-                    return_per_sample=True,
-                )
-                loss_action_conditioned_teacher = teacher_loss_dict["loss"]
-            if weights["lambda_pred"] > 0.0:
-                pred_loss_dict = self.base_act(
-                    qpos_t,
-                    image_t,
-                    actions=act_action_chunk,
-                    is_pad=act_is_pad,
-                    external_latent_input=pred_token_for_action,
-                    return_per_sample=True,
-                )
-                loss_action_conditioned_pred = pred_loss_dict["loss"]
-            loss_action_conditioned = (
-                float(weights["lambda_teacher"]) * loss_action_conditioned_teacher
-                + float(weights["lambda_pred"]) * loss_action_conditioned_pred
-            )
-            with torch.no_grad():
-                a_base = self.base_act(qpos_t, image_t)
-                a_teacher = self.base_act(
-                    qpos_t,
-                    image_t,
-                    external_latent_input=teacher_token_for_action,
-                )
-                a_pred = self.base_act(
-                    qpos_t,
-                    image_t,
-                    external_latent_input=pred_token_for_action,
-                )
-                per_sample_delta_teacher = (a_teacher - a_base).abs().mean(dim=(1, 2))
-                per_sample_delta = (a_pred - a_base).abs().mean(dim=(1, 2))
-                delta_action_teacher_mean = per_sample_delta_teacher.mean()
-                delta_action_mean = per_sample_delta.mean()
-                if is_failure_sample is not None:
-                    failure_mask = is_failure_sample.bool()
-                    if bool((~failure_mask).any().item()):
-                        delta_action_teacher_normal_mean = per_sample_delta_teacher[~failure_mask].mean()
-                        delta_action_normal_mean = per_sample_delta[~failure_mask].mean()
-                    if bool(failure_mask.any().item()):
-                        delta_action_teacher_failure_mean = per_sample_delta_teacher[failure_mask].mean()
-                        delta_action_failure_mean = per_sample_delta[failure_mask].mean()
+            loss_action_conditioned = cond_loss_dict["loss"]
 
         wm_action_current = self.decode_action_latent(z_wm_shared_t)
         loss_wm_action_current = self._masked_l1(wm_action_current, action_prefix, is_pad_prefix)
@@ -599,72 +366,35 @@ class ACTLatentStage1(nn.Module):
         bridge_future = self.decode_action_latent(z_hat_next)
         loss_bridge_future = self._masked_l1(bridge_future, action_future_prefix, is_pad_future_prefix)
 
-        beta_dyn = 0.0
+        beta_dyn = alpha_latent * self.latent_loss_cfg.beta_dynamics_max
+        lambda_action_conditioned_eff = float(self.latent_loss_cfg.lambda_action_conditioned)
+        if self.latent_loss_cfg.schedule_action_conditioned:
+            lambda_action_conditioned_eff *= float(alpha_latent)
         loss = (
             (self.latent_loss_cfg.lambda_action * loss_action)
-            + loss_action_conditioned
-            + (float(weights["lambda_token"]) * loss_condition_token)
-            + (float(weights["lambda_latent"]) * loss_latent)
+            + (lambda_action_conditioned_eff * loss_action_conditioned)
+            + (beta_dyn * self.latent_loss_cfg.lambda_condition_token * loss_condition_token)
+            + (self.latent_loss_cfg.lambda_align * loss_align)
+            + (self.latent_loss_cfg.lambda_wm_action_current * loss_wm_action_current)
+            + (self.latent_loss_cfg.lambda_wm_action_future * loss_wm_action_future)
+            + (beta_dyn * loss_dynamics)
+            + (beta_dyn * self.latent_loss_cfg.lambda_bridge_future * loss_bridge_future)
         )
 
-        output = Stage1LossOutput(
+        return Stage1LossOutput(
             loss=loss,
-            loss_action=loss_action.detach(),
-            loss_action_conditioned_teacher=loss_action_conditioned_teacher.detach(),
-            loss_action_conditioned_pred=loss_action_conditioned_pred.detach(),
-            loss_action_conditioned=loss_action_conditioned.detach(),
-            loss_condition_token=loss_condition_token.detach(),
-            loss_latent=loss_latent.detach(),
-            loss_dynamics=loss_dynamics.detach(),
-            loss_wm_action_current=loss_wm_action_current.detach(),
-            loss_wm_action_future=loss_wm_action_future.detach(),
-            loss_bridge_future=loss_bridge_future.detach(),
+            loss_action=loss_action,
+            loss_action_conditioned=loss_action_conditioned,
+            loss_condition_token=loss_condition_token,
+            loss_align=loss_align,
+            loss_dynamics=loss_dynamics,
+            loss_wm_action_current=loss_wm_action_current,
+            loss_wm_action_future=loss_wm_action_future,
+            loss_bridge_future=loss_bridge_future,
             beta_dynamics=beta_dyn,
-            progress=float(weights["progress"]),
-            lambda_teacher=float(weights["lambda_teacher"]),
-            lambda_pred=float(weights["lambda_pred"]),
-            lambda_latent=float(weights["lambda_latent"]),
-            lambda_token=float(weights["lambda_token"]),
-            cond_keep_ratio=cond_keep_ratio,
-            teacher_token_norm_mean=teacher_token_norm_mean.detach(),
-            pred_token_norm_mean=pred_token_norm_mean.detach(),
-            delta_action_mean=delta_action_mean.detach(),
-            delta_action_normal_mean=delta_action_normal_mean.detach(),
-            delta_action_failure_mean=delta_action_failure_mean.detach(),
-            delta_action_teacher_mean=delta_action_teacher_mean.detach(),
-            delta_action_teacher_normal_mean=delta_action_teacher_normal_mean.detach(),
-            delta_action_teacher_failure_mean=delta_action_teacher_failure_mean.detach(),
+            alpha_latent=alpha_latent,
+            lambda_action_conditioned_eff=lambda_action_conditioned_eff,
         )
-        if not return_dict:
-            return output
-        return {
-            "loss": output.loss,
-            "loss_action": output.loss_action,
-            "loss_action_conditioned_teacher": output.loss_action_conditioned_teacher,
-            "loss_action_conditioned_pred": output.loss_action_conditioned_pred,
-            "loss_action_conditioned": output.loss_action_conditioned,
-            "loss_condition_token": output.loss_condition_token,
-            "loss_latent": output.loss_latent,
-            "loss_dynamics": output.loss_dynamics,
-            "loss_wm_action_current": output.loss_wm_action_current,
-            "loss_wm_action_future": output.loss_wm_action_future,
-            "loss_bridge_future": output.loss_bridge_future,
-            "beta_dynamics": torch.tensor(float(output.beta_dynamics), device=loss.device),
-            "progress": torch.tensor(float(output.progress), device=loss.device),
-            "lambda_teacher": torch.tensor(float(output.lambda_teacher), device=loss.device),
-            "lambda_pred": torch.tensor(float(output.lambda_pred), device=loss.device),
-            "lambda_latent": torch.tensor(float(output.lambda_latent), device=loss.device),
-            "lambda_token": torch.tensor(float(output.lambda_token), device=loss.device),
-            "cond_keep_ratio": torch.tensor(float(output.cond_keep_ratio), device=loss.device),
-            "teacher_token_norm_mean": output.teacher_token_norm_mean,
-            "pred_token_norm_mean": output.pred_token_norm_mean,
-            "delta_action_mean": output.delta_action_mean,
-            "delta_action_normal_mean": output.delta_action_normal_mean,
-            "delta_action_failure_mean": output.delta_action_failure_mean,
-            "delta_action_teacher_mean": output.delta_action_teacher_mean,
-            "delta_action_teacher_normal_mean": output.delta_action_teacher_normal_mean,
-            "delta_action_teacher_failure_mean": output.delta_action_teacher_failure_mean,
-        }
 
     def prepare_stage2_context(
         self,

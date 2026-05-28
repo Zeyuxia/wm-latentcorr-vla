@@ -118,6 +118,8 @@ def main(usr_args):
             args["eval_video_log"] = value.strip().lower() in {"1", "true", "yes", "y"}
         else:
             args["eval_video_log"] = bool(value)
+    if "oracle_future_offset" in usr_args and usr_args["oracle_future_offset"] is not None:
+        args["oracle_future_offset"] = int(usr_args["oracle_future_offset"])
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -273,6 +275,13 @@ def eval_policy(task_name,
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
     reset_func = eval_function_decorator(policy_name, "reset_model")
+    oracle_mode = str(getattr(model, "inference_mode", "")).strip().lower() in {
+        "oracle",
+        "future_image_oracle",
+        "wm_rollout_interp",
+        "future_image_interp",
+    }
+    oracle_future_offset = int(args.get("oracle_future_offset", 16))
 
     now_seed = st_seed
     task_total_reward = 0
@@ -292,16 +301,28 @@ def eval_policy(task_name,
         args["render_freq"] = 0
 
         episode_info = None
+        oracle_expert_obs = []
         if expert_check:
             try:
+                prev_memory_obs_capture = args.get("memory_obs_capture", None)
+                if oracle_mode:
+                    args["memory_obs_capture"] = True
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
+                if oracle_mode:
+                    oracle_expert_obs = list(getattr(TASK_ENV, "memory_obs_frames", []) or [])
                 TASK_ENV.close_env()
+                if prev_memory_obs_capture is None:
+                    args.pop("memory_obs_capture", None)
+                else:
+                    args["memory_obs_capture"] = prev_memory_obs_capture
             except UnStableError as e:
                 # print(" -------------")
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
+                if oracle_mode:
+                    args.pop("memory_obs_capture", None)
                 if use_seed_list:
                     print(f"skip unstable seed: {now_seed}")
                     now_id += 1
@@ -315,6 +336,8 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
+                if oracle_mode:
+                    args.pop("memory_obs_capture", None)
                 if use_seed_list:
                     print(f"skip seed due to exception: {now_seed}, error: {e}")
                     now_id += 1
@@ -386,6 +409,8 @@ def eval_policy(task_name,
 
         succ = False
         reset_func(model)
+        if oracle_mode and hasattr(model, "set_oracle_future_observations"):
+            model.set_oracle_future_observations(oracle_expert_obs, future_offset=oracle_future_offset)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             eval_func(TASK_ENV, model, observation)

@@ -39,11 +39,15 @@ class SmolVLAStage1LossOutput:
     loss: torch.Tensor
     loss_action: torch.Tensor
     loss_action_conditioned: torch.Tensor
+    loss_action_teacher_conditioned: torch.Tensor
+    loss_action_mixed_conditioned: torch.Tensor
     loss_dynamics: torch.Tensor
     loss_condition_token: torch.Tensor
     beta_condition: float
     beta_dynamics: float
     beta_token: float
+    beta_teacher_action: float
+    beta_mixed_action: float
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,10 @@ class SmolVLAStage1LossWeights:
     token_decay_start_ratio: float = 0.0
     token_decay_end_ratio: float = 1.0
     total_steps: int = 1
+    teacher_action_weight: float = 0.0
+    mixed_action_weight: float = 0.0
+    token_mix_teacher_prob: float = 0.0
+    token_mix_zero_prob: float = 0.0
 
 
 @dataclass
@@ -241,6 +249,32 @@ class SmolVLALatentPolicy(nn.Module):
             float(cfg.token_init),
             float(cfg.token_late),
         )
+
+    def _mix_condition_tokens(
+        self,
+        pred_token: torch.Tensor,
+        teacher_token: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.loss_weights
+        p_teacher = max(0.0, float(cfg.token_mix_teacher_prob))
+        p_zero = max(0.0, float(cfg.token_mix_zero_prob))
+        total = p_teacher + p_zero
+        if total <= 0.0:
+            return pred_token
+        if total > 1.0:
+            p_teacher /= total
+            p_zero /= total
+
+        batch_size = int(pred_token.shape[0])
+        selector = torch.rand(batch_size, device=pred_token.device)
+        use_teacher = selector < p_teacher
+        use_zero = (selector >= p_teacher) & (selector < p_teacher + p_zero)
+        mixed = pred_token
+        if bool(use_teacher.any()):
+            mixed = torch.where(use_teacher[:, None, None], teacher_token.detach(), mixed)
+        if bool(use_zero.any()):
+            mixed = torch.where(use_zero[:, None, None], torch.zeros_like(mixed), mixed)
+        return mixed
 
     @property
     def device(self) -> torch.device:
@@ -477,10 +511,41 @@ class SmolVLALatentPolicy(nn.Module):
             external_prefix_mask=cond_mask,
             external_prefix_att_mask=cond_att_mask,
         )
+        beta_teacher_action = float(self.loss_weights.teacher_action_weight)
+        if beta_teacher_action > 0.0:
+            teacher_cond_token, teacher_cond_mask, teacher_cond_att_mask = self.build_condition_token(
+                teacher_shared.detach(),
+                scale=1.0,
+            )
+            loss_action_teacher_conditioned = self._action_loss(
+                batch=batch,
+                actions=batch[ACTION],
+                external_prefix_tokens=teacher_cond_token,
+                external_prefix_mask=teacher_cond_mask,
+                external_prefix_att_mask=teacher_cond_att_mask,
+            )
+        else:
+            loss_action_teacher_conditioned = loss_action.new_zeros(())
+
+        beta_mixed_action = float(self.loss_weights.mixed_action_weight)
+        if beta_mixed_action > 0.0:
+            mixed_token = self._mix_condition_tokens(cond_token, teacher_token_raw)
+            loss_action_mixed_conditioned = self._action_loss(
+                batch=batch,
+                actions=batch[ACTION],
+                external_prefix_tokens=mixed_token,
+                external_prefix_mask=cond_mask,
+                external_prefix_att_mask=cond_att_mask,
+            )
+        else:
+            loss_action_mixed_conditioned = loss_action.new_zeros(())
+
         loss_dynamics = F.mse_loss(predicted_latent, teacher_shared)
         loss = (
             loss_action
             + (beta_condition * loss_action_conditioned)
+            + (beta_teacher_action * loss_action_teacher_conditioned)
+            + (beta_mixed_action * loss_action_mixed_conditioned)
             + (beta_dynamics * loss_dynamics)
             + (beta_token * loss_condition_token)
         )
@@ -488,11 +553,15 @@ class SmolVLALatentPolicy(nn.Module):
             loss=loss,
             loss_action=loss_action,
             loss_action_conditioned=loss_action_conditioned,
+            loss_action_teacher_conditioned=loss_action_teacher_conditioned,
+            loss_action_mixed_conditioned=loss_action_mixed_conditioned,
             loss_dynamics=loss_dynamics,
             loss_condition_token=loss_condition_token,
             beta_condition=beta_condition,
             beta_dynamics=beta_dynamics,
             beta_token=beta_token,
+            beta_teacher_action=beta_teacher_action,
+            beta_mixed_action=beta_mixed_action,
         )
 
     def forward(self, train_stage: str, **kwargs):

@@ -11,6 +11,16 @@ SMOLVLA_CONDA_ENV="${SMOLVLA_CONDA_ENV:-smolvla_cosmos}"
 conda activate "${SMOLVLA_CONDA_ENV}"
 cd "${SCRIPT_DIR}"
 
+RUNTIME_ROOT="${RUNTIME_ROOT:-/data/zhenyangfan/runtime_cache}"
+mkdir -p \
+  "${RUNTIME_ROOT}/tmp" \
+  "${RUNTIME_ROOT}/torch_extensions" \
+  "${RUNTIME_ROOT}/mplconfig" \
+  "${RUNTIME_ROOT}/hf_home" \
+  "${RUNTIME_ROOT}/wandb" \
+  "${RUNTIME_ROOT}/xdg_cache" \
+  "${RUNTIME_ROOT}/xdg_config"
+
 # Edit the values in this block directly before launching the script.
 DATASET_REPO_ID="${DATASET_REPO_ID:-robotwin_multitask_5_cam_high_rgbfix}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/stage1/${DATASET_REPO_ID}}"
@@ -96,6 +106,10 @@ TOKEN_LOSS_WEIGHT_INIT="${TOKEN_LOSS_WEIGHT_INIT:-0.1}"
 TOKEN_LOSS_WEIGHT_LATE="${TOKEN_LOSS_WEIGHT_LATE:-0.02}"
 TOKEN_LOSS_DECAY_START_RATIO="${TOKEN_LOSS_DECAY_START_RATIO:-0.0}"
 TOKEN_LOSS_DECAY_END_RATIO="${TOKEN_LOSS_DECAY_END_RATIO:-1.0}"
+TEACHER_ACTION_WEIGHT="${TEACHER_ACTION_WEIGHT:-0.0}"
+MIXED_ACTION_WEIGHT="${MIXED_ACTION_WEIGHT:-0.0}"
+TOKEN_MIX_TEACHER_PROB="${TOKEN_MIX_TEACHER_PROB:-0.0}"
+TOKEN_MIX_ZERO_PROB="${TOKEN_MIX_ZERO_PROB:-0.0}"
 FAILURE_MODE="${FAILURE_MODE:-train}"
 STAGE1_CORR_SOURCE="${STAGE1_CORR_SOURCE:-online}"
 OFFLINE_CORR_DATA_ROOT="${OFFLINE_CORR_DATA_ROOT:-/data/zhenyangfan/RoboTwin/data}"
@@ -106,7 +120,7 @@ STAGE1_CORR_OUTLIER_FILTER="${STAGE1_CORR_OUTLIER_FILTER:-true}"
 STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS="${STAGE1_CORR_OUTLIER_MAX_ACTION_LOSS:-0.3}"
 STAGE1_CORR_PREFIX_LOSS_WEIGHT="${STAGE1_CORR_PREFIX_LOSS_WEIGHT:-0.0}"
 STAGE1_CORR_PREFIX_LOSS_STEPS="${STAGE1_CORR_PREFIX_LOSS_STEPS:-0}"
-FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/multitask_failure_manifest.json}"
+FAILURE_TABLE_PATHS_JSON="${FAILURE_TABLE_PATHS_JSON:-/data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/filtered_first_pregrasp_single_mode/multitask_failure_manifest.json}"
 FAILURE_CORR_BATCH_RATIO="${FAILURE_CORR_BATCH_RATIO:-0.25}"
 SAMPLE_PHASE_WINDOW_LEN=20
 START_MARGIN=0
@@ -258,6 +272,10 @@ token_loss_weight_init=${TOKEN_LOSS_WEIGHT_INIT}
 token_loss_weight_late=${TOKEN_LOSS_WEIGHT_LATE}
 token_loss_decay_start_ratio=${TOKEN_LOSS_DECAY_START_RATIO}
 token_loss_decay_end_ratio=${TOKEN_LOSS_DECAY_END_RATIO}
+teacher_action_weight=${TEACHER_ACTION_WEIGHT}
+mixed_action_weight=${MIXED_ACTION_WEIGHT}
+token_mix_teacher_prob=${TOKEN_MIX_TEACHER_PROB}
+token_mix_zero_prob=${TOKEN_MIX_ZERO_PROB}
 run_tag=${RUN_TAG}
 train_tag=${TRAIN_TAG}
 output_dir=${OUTPUT_DIR}
@@ -359,6 +377,10 @@ CMD+=(
   --token_loss_weight_late "${TOKEN_LOSS_WEIGHT_LATE}"
   --token_loss_decay_start_ratio "${TOKEN_LOSS_DECAY_START_RATIO}"
   --token_loss_decay_end_ratio "${TOKEN_LOSS_DECAY_END_RATIO}"
+  --teacher_action_weight "${TEACHER_ACTION_WEIGHT}"
+  --mixed_action_weight "${MIXED_ACTION_WEIGHT}"
+  --token_mix_teacher_prob "${TOKEN_MIX_TEACHER_PROB}"
+  --token_mix_zero_prob "${TOKEN_MIX_ZERO_PROB}"
   --failure_mode "${FAILURE_MODE}"
   --stage1_corr_source "${STAGE1_CORR_SOURCE}"
   --failure_table_paths_json "${FAILURE_TABLE_PATHS_JSON}"
@@ -464,8 +486,20 @@ export SMOLVLA_LATENT_DATA_ROOT
 export SMOLVLA_LATENT_DATA_SUFFIX
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
-export MPLCONFIGDIR=/tmp/mplconfig
+export TMPDIR="${TMPDIR:-${RUNTIME_ROOT}/tmp}"
+export TEMP="${TEMP:-${TMPDIR}}"
+export TMP="${TMP:-${TMPDIR}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RUNTIME_ROOT}/torch_extensions}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${RUNTIME_ROOT}/mplconfig}"
+export HF_HOME="${HF_HOME:-/data/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/hub}"
+export WANDB_DIR="${WANDB_DIR:-${RUNTIME_ROOT}/wandb}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${RUNTIME_ROOT}/wandb/cache}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-${RUNTIME_ROOT}/wandb/config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${RUNTIME_ROOT}/xdg_cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${RUNTIME_ROOT}/xdg_config}"
 
 "${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/log.log"
 
