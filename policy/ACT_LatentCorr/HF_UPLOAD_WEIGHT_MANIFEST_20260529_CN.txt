@@ -1,0 +1,422 @@
+LatentCorr 权重上传清单
+生成时间：2026-05-29
+工作目录：/data/zhenyangfan/RoboTwin
+
+用途
+====
+这份文件用于记录服务器停机前需要上传到 Hugging Face 的关键实验产物。
+每个条目都包含：
+- 上传优先级
+- 权重/文件分类
+- HF staging 目录中的本地传输地址
+- 原始实验路径
+- 这个权重来自什么实验
+- 为什么要保留这个权重
+
+重要说明
+========
+/data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529 是一个 HF 上传 staging 目录。
+其中大多数大文件都是从原始实验输出 hardlink 过来的，不是重新复制了一份。
+所以这个目录可以当成普通目录上传到 HF，但它本身没有额外占用同等大小的磁盘空间。
+
+完整上传该目录大约需要传输 206GB。
+如果时间紧，建议先上传 CORE 部分，再上传 EXPANDED 灾备部分。
+
+推荐上传顺序
+============
+1. 先上传 CORE：SmolVLA core、SmolVLA failure tables、SmolVLA eval summaries、ACT core、EVAC。
+2. 如果 PI05 分支还需要恢复，再上传 PI05。
+3. 如果带宽和时间允许，再上传 EXPANDED。EXPANDED 主要用于灾备、后续重新挑 checkpoint、复查训练曲线。
+
+完整上传命令
+============
+cd /data/zhenyangfan/RoboTwin
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529 . --repo-type model
+
+只上传核心部分的建议命令
+========================
+cd /data/zhenyangfan/RoboTwin
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/README_HF_EXPORT.md README_HF_EXPORT.md --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/HF_UPLOAD_WEIGHT_MANIFEST_20260529_CN.txt HF_UPLOAD_WEIGHT_MANIFEST_20260529_CN.txt --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/smolvla/core smolvla/core --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/smolvla/failure_tables smolvla/failure_tables --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/smolvla/eval_summaries smolvla/eval_summaries --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/act/core act/core --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/act/eval_summaries act/eval_summaries --repo-type model
+huggingface-cli upload <HF_REPO_ID> hf_export_latentcorr_20260529/evac evac --repo-type model
+
+
+CORE：SmolVLA 基础权重 / 主线 LatentCorr 权重
+=============================================
+
+[CORE][SmolVLA 基础 open-loop RGB-fix 权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/core/base_rgbfix_70000_pretrained_model/
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/train/robotwin_multitask_5_cam_high_rgbfix/20260502_201333-rgbfix_from_smolvla_base_step70000/checkpoints/070000/pretrained_model/
+作用：
+  SmolVLA 五任务、单视角、RGB-fix 的基础 open-loop 权重，训练到 70000 step。
+  这是后续 SmolVLA LatentCorr stage1 训练的起点，也是和 LatentCorr 方法做对比的 base model。
+包含内容：
+  model.safetensors、config.json、train_config.json、policy pre/post processor 的 json 和 safetensors。
+
+[CORE][SmolVLA LatentCorr 当前最佳权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/core/stage1_actsync_step017000_best.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260516_012823-stage1_actsync_losses_on_from070000_step20000/stage1_step_017000.pt
+作用：
+  当前 SmolVLA LatentCorr / ACT-sync 路线中最重要的主线权重。
+  使用 pred-token 推理路径，100 seed 总成功率为 78.0%。
+评测结果：
+  open_laptop 87/100
+  place_burger_fries 88/100
+  handover_block 77/100
+  pick_dual_bottles 78/100
+  put_bottles_dustbin 60/100
+  TOTAL 390/500 = 78.00%
+
+[CORE][SmolVLA 主线附近较好权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/core/stage1_actsync_step018000_eval_good.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260516_012823-stage1_actsync_losses_on_from070000_step20000/stage1_step_018000.pt
+作用：
+  17000 step 附近的候选权重。
+  保留它是因为 17000/18000 都处在效果较好的区间，后续如果要复查 checkpoint 敏感性，这个点很有用。
+
+[CORE][SmolVLA 后期掉点参考权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/core/stage1_actsync_step020000_drop_reference.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260516_012823-stage1_actsync_losses_on_from070000_step20000/stage1_step_020000.pt
+作用：
+  后期训练后性能下降的参考权重。
+  保留它是为了对比训练过久后的退化现象，而不是因为它是最佳模型。
+评测结果：
+  100 seed 总成功率为 72.8%。
+
+
+CORE：SmolVLA failure table 和评测结果
+======================================
+
+[CORE][SmolVLA 主 failure table]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/failure_tables/merged_20260427_235851/
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged/
+作用：
+  当前 SmolVLA LatentCorr stage1 训练使用的主 failure table。
+  如果只保存权重但不保存这个 failure table，后续很难完整复现训练数据构造。
+
+[CORE][SmolVLA first-pregrasp 过滤版 failure table]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/failure_tables/merged_filtered_first_pregrasp_only/
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/explore/20260427_235851-explore_stage1_spatial_projector_accelerate_45_vreuse_4_8_12_14/merged_filtered_first_pregrasp_only/
+作用：
+  后续调试 perturbation / correction 样本质量时使用的 first-pregrasp 过滤版本。
+  不是主训练表，但对于分析失败样本是否过于宽泛、是否引入策略扰动很重要。
+
+[CORE][SmolVLA 评测结果和 paired seed 分析]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/eval_summaries/
+作用：
+  保存 100 seed 评测、base/pred/random 诊断、oracle token 诊断、paired seed 分析等结果。
+关键文件：
+  paired_base70000_vs_actsync17000_seed_analysis.json
+主要结论：
+  LatentCorr 确实带来了 recovery gain，尤其是在 handover_block、pick_dual_bottles、put_bottles_dustbin 上。
+  但它也会带来 policy disturbance，在 open_laptop、place_burger_fries 这类高 baseline 任务上，扰动有时会抵消修复收益。
+
+
+CORE：SmolVLA 消融 / 诊断权重
+=============================
+
+[CORE-ABLATION][Normal-only WM rollout 消融，10000 step]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/ablation/normal_only_wmrollout_step010000.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260517_000318-stage1_ablate_normal_only_wmrollout_from070000_step20000_20260517_000248/stage1_step_010000.pt
+作用：
+  消融实验：去掉 failure batch，只保留 normal batch，并且 normal batch 的 latent 对齐目标也改成 WM rollout latent。
+  用来验证“性能变化到底来自 failure batch，还是来自 WM rollout latent 对齐本身”。
+
+[CORE-ABLATION][Normal-only WM rollout 消融，15000 step]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/ablation/normal_only_wmrollout_step015000.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260517_000318-stage1_ablate_normal_only_wmrollout_from070000_step20000_20260517_000248/stage1_step_015000.pt
+作用：
+  同一个 normal-only WM rollout 消融实验的后期权重。
+  这个点被评测过，适合和主线 17000 做对比。
+
+[CORE-ABLATION][Token-coupling 诊断权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/ablation/tokencouple_resume17000_step020000.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260520_010228-stage1_tokencouple_resume17000_to20000/stage1_step_020000.pt
+作用：
+  用来验证更强的 teacher/mixed token action loss 是否能让 condition token 成为更强的动作控制变量。
+主要结论：
+  oracle / teacher token 并没有稳定优于 pred token。
+  这个结果说明 VLA 可能并不直接吃 WM latent token，或者 token 会引入额外扰动。
+
+[CORE-ABLATION][Gated residual smoke 权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/ablation/gated_residual_smoke_step017001.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/SmolVLA/outputs/stage1/robotwin_multitask_5_cam_high_rgbfix/20260528_184018-stage1_gated_residual_smoke/stage1_step_017001.pt
+作用：
+  新设计的 gated residual correction head 的一轮 smoke checkpoint。
+  它不是最终实验结果，只用于证明新 head 的训练、保存、加载、推理路径可以跑通。
+
+
+CORE：ACT 权重
+==============
+
+[CORE][ACT 五任务基础权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/core/base_multitask5_policy_epoch2000.ckpt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-robotwin_multitask_5/demo_clean-50/20260417_002800_robotwin_multitask_5_no_wm/policy_epoch_2000_seed_0.ckpt
+作用：
+  ACT 五任务基础权重。
+  这是 ACT LatentCorr 的起点，也是所有 ACT base 对照实验的基础。
+
+[CORE][ACT 五任务基础训练状态]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/core/base_multitask5_resume_epoch2000_training_state.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-robotwin_multitask_5/demo_clean-50/20260417_002800_robotwin_multitask_5_no_wm/resume_epoch_2000_seed_0.pt
+作用：
+  ACT base 的训练状态文件。
+  如果后续只做推理，这个文件不是必须；如果要从 base 精确续训，则需要它。
+
+[CORE][ACT LatentCorr 主线参考权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/core/latentcorr_fulltable_lctok05_epoch0650_best.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_unified_failure_multitask/stage1_unified_failure_multitask_resume450_gpu0123_20260512_134044/stage1_unified_epoch_0650.pt
+作用：
+  ACT 侧使用完整 failure table、predicted condition token 路线训练得到的关键权重。
+  这是 ACT LatentCorr 里最值得保留的主线参考点之一。
+
+[CORE-ABLATION][ACT failure-action-only 消融权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/core/latentcorr_failure_action_only_epoch0900_ablation.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_unified_failure_multitask/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0900.pt
+作用：
+  ACT 侧 failure-action-only / rebalanced diagnostic 路线的权重。
+  用于分析 failure 样本是否真正进入训练、以及只训练 failure correction action 是否能带来修复。
+
+[CORE][ACT paired seed 分析]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/eval_summaries/paired_actbase2000_vs_actmt650_seed_analysis.json
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/logs/paired_actbase2000_vs_actmt650_seed_analysis.json
+作用：
+  ACT base 和 ACT LatentCorr 的 paired seed 对比结果。
+  用来分析 recovery gain 和 policy disturbance。
+
+
+CORE：PI05 和 EVAC
+==================
+
+[CORE][PI05 RobotWin 权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/pi05_robotwin2_model.safetensors
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/PI05_LatentCorr/outputs/hf_cache/pi05_robotwin2/model.safetensors
+作用：
+  PI05 RobotWin 基础/导出权重。
+  保留它是因为 PI05_LatentCorr 分支、PI05 训练框架、以及 EVAC/PI05 rollout 讨论都依赖这条线。
+
+[CORE][PI05 metadata]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/pi05_robotwin2_metadata.pt
+原始实验路径：
+  /data/zhenyangfan/RoboTwin/policy/PI05_LatentCorr/outputs/hf_cache/pi05_robotwin2/metadata.pt
+作用：
+  PI05 RobotWin 权重对应的 metadata。
+
+[CORE][EVAC_new 权重]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/evac/evac_robotwin_new_mixed50p12_plus_pi05_rollout_epoch333_step10000.ckpt
+原始实验路径：
+  /data/yujieyang/EVAC_new/runs/evac_robotwin_new_mixed50p12_plus_pi05_rollout_2026-04-22T17-46-59/checkpoints/epoch=333-step=10000.ckpt
+作用：
+  新版 EVAC 权重，解决了一部分旧 EVAC 渲染/rollout 不出来的问题。
+  这是后续 WM rollout latent 路线和新版 explore 的关键依赖。
+
+[CORE][EVAC_new 配置]
+本地上传路径：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/evac/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
+原始实验路径：
+  /data/yujieyang/EVAC_new/configs/robotwin/train_config_robotwin_new_mixed50p12_plus_pi05_rollout.yaml
+作用：
+  EVAC_new 权重对应的训练配置。
+
+
+EXPANDED：灾备 checkpoint 组
+===========================
+这些不是马上复现实验结论所必需的，但如果服务器停掉之后需要重新画 checkpoint 曲线、恢复中间模型、或者 debug 为什么某个阶段掉点，就会非常重要。
+
+[EXPANDED][SmolVLA 主线全部保存点]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/
+作用：
+  SmolVLA LatentCorr 主线训练的完整 checkpoint 序列。
+  用于后续重新评测 10000/11000/13000/15000/17000/18000/20000 等节点，或分析 checkpoint 敏感性。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_001000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_002000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_003000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_004000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_005000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_006000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_007000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_008000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_009000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_010000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_011000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_012000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_013000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_014000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_015000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_016000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_017000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_017001.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_018000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_019000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_mainline/actsync_from070000_step20000/stage1_step_020000.pt
+
+[EXPANDED][SmolVLA normal-only WM rollout 消融全部保存点]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/
+作用：
+  去掉 failure batch、normal batch 使用 WM rollout latent 对齐的完整 checkpoint 序列。
+  用于判断 failure batch 是否真的提供了额外收益。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_001000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_002000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_003000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_004000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_005000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_006000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_007000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_008000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_009000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_010000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_011000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_012000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_013000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_014000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/normal_only_wmrollout_from070000/stage1_step_015000.pt
+
+[EXPANDED][SmolVLA token-coupling 诊断 checkpoint]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/tokencouple_resume17000_to20000/
+作用：
+  用于检查 condition token 是否能在更强 action/token coupling 下成为有效控制变量。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/tokencouple_resume17000_to20000/stage1_step_017000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/tokencouple_resume17000_to20000/stage1_step_018000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/tokencouple_resume17000_to20000/stage1_step_019000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/tokencouple_resume17000_to20000/stage1_step_020000.pt
+
+[EXPANDED][SmolVLA 早期 correction 路线代表 checkpoint]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/
+作用：
+  早期 correction / arcfix / filter 版本的代表 checkpoint。
+  不是最终模型，但有助于复盘为什么后续设计发生变化。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_075329-stage1_offline_corr_sim_exec16_arcfix_v1_corr05_filter1p0_steps30000/stage1_step_002000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_075329-stage1_offline_corr_sim_exec16_arcfix_v1_corr05_filter1p0_steps30000/stage1_step_012000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_075329-stage1_offline_corr_sim_exec16_arcfix_v1_corr05_filter1p0_steps30000/stage1_step_020000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_075329-stage1_offline_corr_sim_exec16_arcfix_v1_corr05_filter1p0_steps30000/stage1_step_022000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_075329-stage1_offline_corr_sim_exec16_arcfix_v1_corr05_filter1p0_steps30000/stage1_step_030000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_151356-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filteroff_steps30000/stage1_step_002000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_151356-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filteroff_steps30000/stage1_step_012000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_151356-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filteroff_steps30000/stage1_step_020000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_151356-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filteroff_steps30000/stage1_step_022000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260512_151356-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filteroff_steps30000/stage1_step_030000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260513_000247-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filter1p0_steps30000/stage1_step_002000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260513_000247-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filter1p0_steps30000/stage1_step_012000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260513_000247-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filter1p0_steps30000/stage1_step_020000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260513_000247-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filter1p0_steps30000/stage1_step_022000.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/smolvla/expanded_ablation/older_corr_runs/20260513_000247-stage1_offline_corr_sim_exec16_arcfix_v1_corr10_filter1p0_steps30000/stage1_step_030000.pt
+
+[EXPANDED][ACT 关键训练段完整 epoch 序列]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/
+作用：
+  ACT fulltable 50-650、resume/rebalanced 700-900、failure-action-only diagnostic 等关键训练段的 epoch 序列。
+  用于回看 ACT 侧训练震荡、checkpoint 敏感性和 failure 样本是否起作用。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_diag_failure_action_only_gpu0123_20260515_115821/stage1_unified_epoch_0700.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_diag_failure_action_only_gpu0123_20260515_115821/stage1_unified_epoch_0750.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_diag_failure_action_only_gpu0123_20260515_115821/stage1_unified_epoch_0800.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_diag_failure_action_only_gpu0123_20260515_115821/stage1_unified_epoch_0850.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_diag_failure_action_only_gpu0123_20260515_115821/stage1_unified_epoch_0900.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0050.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0100.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0150.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0200.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0250.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0300.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0350.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0400.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_fulltable_lctok05_gpu0123_20260512_012833/stage1_unified_epoch_0450.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume450_gpu0123_20260512_134044/stage1_unified_epoch_0500.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume450_gpu0123_20260512_134044/stage1_unified_epoch_0550.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume450_gpu0123_20260512_134044/stage1_unified_epoch_0600.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume450_gpu0123_20260512_134044/stage1_unified_epoch_0650.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0700.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0750.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0800.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0850.pt
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/act/expanded/stage1_unified_failure_multitask_resume650_rebalfg_rank0fail_gpu0123_20260513_024859/stage1_unified_epoch_0900.pt
+
+[EXPANDED][PI05 已评测 milestone]
+目录：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/
+作用：
+  PI05 open-loop 训练过程中评测过的 milestone 权重。
+  注意：这里默认不包含 optimizer/training_state，因为这些文件非常大，且推理通常不需要。
+文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/openloop_headonly_bg4_step10000_model.safetensors
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/openloop_headonly_bg4_step18000_model.safetensors
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/openloop_headonly_bg4_step20000_model.safetensors
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/openloop_headonly_bg4_step22000_model.safetensors
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/pi05/expanded/openloop_headonly_bg4_step24000_model.safetensors
+
+本次有意排除的内容
+==================
+- SmolVLA / PI05 的 optimizer state 和 training_state 文件，除了 ACT base 的 resume state。
+  原因：文件很大，推理和大多数分析不需要。如果未来要精确恢复 optimizer 继续训练，再单独上传。
+
+- debug WM rollout output.pt 和渲染视频。
+  原因：体量大、噪声多。failure table 和 eval summary 已经保留了更关键的信息。
+
+- 当前设计稳定之前的旧 smoke checkpoint。
+  原因：这些只证明代码能跑，不代表有效实验结果。
+
+如果未来必须精确续训
+====================
+需要额外上传对应原始训练目录下的 optimizer / training_state 文件。
+当前这份清单优先保证模型权重、failure table、评测结论和实验语义可以恢复，而不是保证 optimizer 状态逐 bit 复现。
+
+HF 命名与说明指南
+=================
+我另外生成了一份更短的命名说明文件：
+  /data/zhenyangfan/RoboTwin/hf_export_latentcorr_20260529/HF_UPLOAD_NAMING_GUIDE_20260529_CN.txt
+
+这份文件建议上传到 HF 仓库根目录，用来快速解释：
+- 每个核心权重在 HF 上应该叫什么
+- 属于主线、消融、诊断还是负例参考
+- 推荐推理路径是 base、pred、residual 还是 oracle/diagnostic
+- 是否必传
+- 推荐 HF commit message

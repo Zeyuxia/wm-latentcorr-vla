@@ -1,0 +1,31 @@
+# Basic experiment configuration
+task_name: null
+policy_name: ACT_LatentCorr
+task_config: null
+ckpt_setting: null
+seed: 0
+seed_file: null
+instruction_type: unseen
+
+# Runtime / policy config
+device: cuda:0
+temporal_agg: false
+inference_mode: teacher   # {base, pred, teacher, bridge}
+ddim_steps: 27
+max_timesteps: 3000
+
+# Latent checkpoint
+latent_ckpt_path: null
+ckpt_dir: null
+ckpt_name: null
+
+# EVAC / geometry
+evac_ckpt: null
+evac_config: null
+urdf_path: /data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf
+
+# Optional dataset overrides for loading normalization stats
+dataset_dir: null
+num_episodes: null
+camera_names:
+  - cam_high

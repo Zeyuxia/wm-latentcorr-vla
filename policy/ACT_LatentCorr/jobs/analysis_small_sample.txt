@@ -1,0 +1,11 @@
+# Stage-1 小样本开环分析
+/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/.venv-act-latent/bin/python -m policy.ACT_LatentCorr.analyze_stage1_latent --ckpt_path $(ls -1dt /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/stage1/*/stage1_epoch_*.pt | head -n 1) --num_eval_episodes 8 --samples_per_episode 3
+
+# Stage-2 小样本最小闭环分析
+/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/.venv-act-latent/bin/python -m policy.ACT_LatentCorr.analyze_stage2_latent --ckpt_path $(ls -1dt /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/stage2/*/stage2_epoch_*.pt | head -n 1) --urdf_path /data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf --num_eval_episodes 4 --samples_per_episode 2
+
+# Stage-1 更细一点的取样分析
+/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/.venv-act-latent/bin/python -m policy.ACT_LatentCorr.analyze_stage1_latent --ckpt_path $(ls -1dt /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/stage1/*/stage1_epoch_*.pt | head -n 1) --num_eval_episodes 12 --samples_per_episode 4
+
+# Stage-2 更细一点的 teacher-forcing 检查
+/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/.venv-act-latent/bin/python -m policy.ACT_LatentCorr.analyze_stage2_latent --ckpt_path $(ls -1dt /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/stage2/*/stage2_epoch_*.pt | head -n 1) --urdf_path /data/zhenyangfan/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf --num_eval_episodes 6 --samples_per_episode 2

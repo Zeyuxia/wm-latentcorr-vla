@@ -1,0 +1,4 @@
+VARIANT_NAME=shared_default bash /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/run_variant_pipeline.sh
+VARIANT_NAME=shared_no_bridge LAMBDA_BRIDGE_FUTURE=0.0 bash /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/run_variant_pipeline.sh
+VARIANT_NAME=shared_future_only LAMBDA_WM_ACTION_CURRENT=0.0 LAMBDA_BRIDGE_FUTURE=0.0 bash /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/run_variant_pipeline.sh
+VARIANT_NAME=shared_future_bridge LAMBDA_WM_ACTION_CURRENT=0.0 LAMBDA_BRIDGE_FUTURE=0.25 bash /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/run_variant_pipeline.sh

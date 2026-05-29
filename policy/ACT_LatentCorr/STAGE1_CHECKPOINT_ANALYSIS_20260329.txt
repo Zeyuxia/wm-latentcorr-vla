@@ -1,0 +1,123 @@
+Stage1 关键 checkpoint 对照表与当前失败原因判断
+
+时间：2026-03-29
+项目：/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr
+任务：open_laptop
+评测口径：demo_clean，50 seed，8 卡并行，base mode
+
+一、核心结论
+
+1. 同一评测链路下，原始 ACT 基线是 31/50 = 62.0%。
+2. 当前所有 ACT_LatentCorr 的 stage1 方案，都明显低于这个基线。
+3. 当前最好的 checkpoint 是 clean 线的 750/800 epoch，成功率都是 18/50 = 36.0%。
+4. 1000 epoch clean 线反而退化到 11/50 = 22.0%，说明后期继续训练会破坏开环能力。
+5. 从原始 ACT 1000 epoch 权重继续做 250 epoch warm-up，也没有保住原始开环能力，最终只有 11/50 = 22.0%。
+
+二、关键 checkpoint 对照表
+
+1. 原始 ACT 基线
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT/act_ckpt/act-open_laptop/demo_clean-50/20260213_001933/policy_epoch_1000_seed_0.ckpt
+- 结果: 31/50 = 62.0%
+- 说明: 这是当前最可靠的开环基线，证明评测链路没有问题。
+
+2. ACT_LatentCorr，resume75 线，250 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_act_mainline_8gpu_resume75_dz1000/20260328_183702/stage1_epoch_0250.pt
+- 结果: 13/50 = 26.0%
+- 最终训练指标:
+  loss=5.6086
+  action=1.7247
+  align=1.5550
+  dyn=0.6028
+- 说明: 修正为“原 ACT 主线 + latent 辅助”以后，虽然比更早的错误结构好，但仍然离 ACT 基线很远。
+
+3. ACT_LatentCorr，resume250_to500，wm_future=0.1，500 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_act_mainline_8gpu_resume250_to500_wmf010/20260328_214615/stage1_epoch_0500.pt
+- 结果: 15/50 = 30.0%
+- 最终训练指标:
+  loss=2.9599
+  action=1.0746
+  align=1.3086
+  dyn=0.5655
+- 说明: 把 lambda_wm_action_future 从 0.25 降到 0.1 后，开环成功率有所回升，但仍然明显低于基线。
+
+4. ACT_LatentCorr，resume500_to1000，clean 线，750 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_act_mainline_8gpu_resume500_to1000_clean/20260329_024356/stage1_epoch_0750.pt
+- 结果: 18/50 = 36.0%
+- 说明: 这是目前 clean 线的最佳点。
+
+5. ACT_LatentCorr，resume500_to1000，clean 线，800 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_act_mainline_8gpu_resume500_to1000_clean/20260329_024356/stage1_epoch_0800.pt
+- 结果: 18/50 = 36.0%
+- 说明: 与 750 epoch 持平，说明 clean 线的最优区间大概在 750 到 800 epoch。
+
+6. ACT_LatentCorr，resume500_to1000，clean 线，1000 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_act_mainline_8gpu_resume500_to1000_clean/20260329_024356/stage1_epoch_1000.pt
+- 结果: 11/50 = 22.0%
+- 最终训练指标:
+  loss=1.2521
+  action=0.3646
+  align=1.1478
+  dyn=0.6006
+- 说明: 训练 loss 更低，但成功率更差，证明 loss 继续下降不等于开环策略更强。
+
+7. 从原始 ACT 1000 epoch 权重继续 warm-up 250 epoch
+- checkpoint: /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage1_from_act1000_warmup250/20260329_121249/stage1_epoch_0250.pt
+- 结果: 11/50 = 22.0%
+- 最终训练指标:
+  loss=0.8550
+  action=0.3729
+  align=1.5334
+  dyn=0.6576
+- 说明: 即使从强 ACT 权重初始化，继续做 250 epoch warm-up，开环成功率依然被明显破坏。
+
+三、按成功率排序
+
+1. 原始 ACT 1000 epoch: 62.0%
+2. clean 750 epoch: 36.0%
+3. clean 800 epoch: 36.0%
+4. wmf=0.1，500 epoch: 30.0%
+5. resume75，250 epoch: 26.0%
+6. clean 1000 epoch: 22.0%
+7. 从原始 ACT 初始化后 warm-up 250 epoch: 22.0%
+
+四、当前对 stage1 失败原因的判断
+
+1. 问题不是评测链路
+- 原始 ACT 在同一条链路里能达到 62.0%，所以当前的低成功率不是由评测脚本或环境配置导致的。
+
+2. 问题也不只是初始化方式
+- 从头训练 latent warm-up 会伤开环。
+- 从原始 ACT checkpoint 继续 warm-up 也会伤开环。
+- 这说明真正的问题在于 warm-up 训练目标本身会改坏原始 ACT 的控制表征。
+
+3. 当前最可能的根因是：align 和 dynamics 的梯度仍在破坏开环控制能力
+- 训练指标里，action、align、dynamics 都可以下降。
+- 但真实成功率仍然显著低于基线。
+- 这说明这些 latent 目标虽然在数值上学到了东西，但学到的方向并不等于任务执行能力更强。
+
+4. 过训练确实存在
+- clean 线从 750/800 epoch 的 36.0% 掉到 1000 epoch 的 22.0%。
+- 这说明后期继续训练会进一步洗掉 ACT 原本的开环能力。
+
+5. 之前的三个辅助动作读出损失不是主要突破口
+- wm_action_current 与 wm_action_future 的优化意义很弱。
+- 它们删掉以后，训练 loss 变好看了，但也没有把成功率拉回到基线附近。
+- 所以真正的瓶颈仍然是：latent 对齐和 dynamics 目标如何作用到 ACT 主链路。
+
+五、当前最可信的判断
+
+1. 当前 stage1 方案不能直接作为闭环前的可靠 warm-up 权重。
+2. 目前最好的 latent checkpoint 也只有 36.0%，离 ACT 基线 62.0% 仍然差距很大。
+3. 如果继续沿着当前“end-to-end 用 latent loss 改 ACT 主策略”的路线推进，风险很高。
+
+六、下一步最值得优先验证的方向
+
+1. 尽量冻结 ACT 主干和主头，只训练 projector/predictor 这类附加模块。
+2. 让 latent 分支去适配 ACT，而不是让 ACT 去适配 latent。
+3. 先把目标改成“不明显损伤原始开环成功率”，再谈闭环收益。
+4. 在新的实验里，优先监控 250、500、750 这类中间 checkpoint，而不是默认训到 1000。
+
+七、一句话总结
+
+目前最关键的事实是：
+原始 ACT 基线已经在同口径下验证为 62.0%，而我们当前所有 stage1 latent warm-up 方案都会显著破坏开环能力；最佳点大约出现在 clean 线的 750 到 800 epoch，但也只有 36.0%。因此，接下来应该把重点转到“冻结或弱化对 ACT 主控制链路的扰动”上，而不是继续强化当前的端到端 latent warm-up。

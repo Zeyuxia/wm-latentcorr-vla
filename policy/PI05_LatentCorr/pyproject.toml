@@ -1,0 +1,29 @@
+[project]
+name = "pi0-latentcorr"
+version = "0.1.0"
+description = "Standalone uv environment for RoboTwin PI0 open-loop experiments"
+requires-python = ">=3.11"
+dependencies = [
+    "openpi",
+    "opencv-python>=4.10.0.84",
+    "h5py>=3.11.0",
+    "pytest>=8.3.4",
+    "setuptools<81",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+openpi = { path = "../pi05", editable = true }
+openpi-client = { path = "../pi05/packages/openpi-client", editable = true }
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "a445d9c9da6bea99a8972daa4fe1fdd053d711d2" }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

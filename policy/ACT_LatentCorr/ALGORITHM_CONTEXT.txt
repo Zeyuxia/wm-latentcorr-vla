@@ -1,0 +1,116 @@
+ACT_LatentCorr 算法上下文
+=========================
+
+目标
+----
+在不修改原始 `policy/ACT` 的前提下，在 `policy/ACT_LatentCorr` 下构建一套独立的潜空间特征级闭环纠错策略包。
+
+整体思路
+--------
+原始 ACT 主要学习从观测到动作的行为克隆映射。新的算法在训练中引入世界模型的潜空间监督，使策略的视觉特征逐步具备物理一致性和未来状态推理能力。
+
+当前统一口径如下：
+- 对齐目标使用 EVAC 的最终 VAE latent，不使用中间 encoder feature。
+- 动作监督使用实际执行的前缀 chunk，而不是单步动作。
+
+第一阶段：开环潜空间预热
+------------------------
+输入：
+- 当前图像 `I_t`
+- 未来真实图像 `I_{t+\Delta}`
+- GT 动作前缀 `a_gt_prefix`
+
+教师 latent：
+- `z_wm_t      = EVAC_VAE_Encoder(I_t)`
+- `z_wm_t1     = EVAC_VAE_Encoder(I_{t+\Delta})`
+
+学生特征：
+- `z_act_t     =` ACT 在 transformer 解码前的视觉特征图
+- `z_proj_t    = Projector(z_act_t)`
+- `z_hat_next  = Predictor(stop_grad(z_proj_t), a_gt_prefix)`
+
+损失：
+- `L_align     = || z_proj_t - stop_grad(z_wm_t) ||^2`
+- `L_dynamics  = || z_hat_next - stop_grad(z_wm_t1) ||^2`
+- `L_action    = || ActionDecoder(stop_grad(z_proj_t)) - a_gt_prefix ||_1`
+
+第一阶段总损失：
+- `L_total = L_action + lambda_align * L_align + beta_dyn(step) * L_dynamics`
+
+重要训练约束：
+- 第一阶段里，`Predictor` 的输入对 `z_proj_t` 做 `detach()`。
+- 第一阶段里，`ActionDecoder` 的输入也对 `z_proj_t` 做 `detach()`。
+- `beta_dyn(step)` 采用按 step 的 warm-up：
+  - 前期为 0
+  - 后期逐步增加
+
+Projector 设计
+--------------
+`Projector` 保留二维拓扑结构，将 ACT 视觉特征映射到 WM latent 空间：
+
+`Interpolate(z_act_t) -> Conv1x1 -> GroupNorm -> GELU -> Conv1x1 -> GroupNorm`
+
+设计原因：
+- 保留空间布局
+- 避免过早 flatten 成 token
+- 缓解 ACT 特征与 EVAC latent 的尺度不一致问题
+
+Predictor 设计
+--------------
+`Predictor` 是动作条件的潜空间状态预测头：
+
+- `ActionPrefixEncoder(a_prefix) -> gamma, beta`
+- 重复的 AdaLN 残差块：
+  - `z <- z + Conv3x3(GELU(Conv3x3(gamma * LN(z) + beta)))`
+
+设计原因：
+- 动作本身是低维信号，直接拼接容易被高维视觉特征淹没
+- AdaLN 调制更适合保留空间 latent 结构
+- 多层残差块比单层结构容量更强，也更稳定
+
+动作解码头设计
+--------------
+当前第一版实现刻意保持简单：
+- `latent map -> Conv1x1 -> GELU -> global pooling -> MLP -> action prefix`
+
+这一版足以验证第一阶段链路。
+后续应升级为更接近 ACT 风格的 latent query decoder。
+
+第二阶段：闭环潜空间纠错
+------------------------
+这一阶段目前只完成算法定义，还未完整实现。
+
+当 ACT 输出偏差动作前缀 `a_dev_prefix` 且异常触发器生效后：
+
+- planner 生成纠错动作前缀 `a_corr_prefix`
+- `z_wm_sim_t1 = EVAC_DiT(z_wm_t, a_dev_prefix)`
+- `z_hat_next  = Predictor(z_proj_t, a_dev_prefix)`
+
+闭环损失：
+- `L_dynamics = || z_hat_next - stop_grad(z_wm_sim_t1) ||^2`
+- `L_correct  = || ActionDecoder(stop_grad(z_wm_sim_t1)) - a_corr_prefix ||^2`
+
+重要修正：
+- 纠错动作监督使用 teacher forcing，即把 `z_wm_sim_t1` 输入 `ActionDecoder`
+- 不是把 `z_hat_next` 输入 `ActionDecoder`
+
+后期可选蒸馏损失：
+- `L_bridge = || ActionDecoder(z_hat_next) - a_corr_prefix ||^2`
+
+当前实现状态
+------------
+已经实现：
+- 独立的新策略包
+- 第一阶段数据集与训练脚本
+- `Projector`
+- `Predictor`
+- `ActionDecoder`
+- dynamics warmup
+- `detach` 行为
+- EVAC 真实图像到最终 VAE latent 的封装
+
+尚未实现：
+- EVAC DiT latent rollout 封装
+- planner 触发的潜空间纠错数据生成
+- `L_correct` 与 `L_bridge` 的训练链路
+- 完整的 ACT_LatentCorr 部署推理路径

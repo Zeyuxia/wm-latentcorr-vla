@@ -1,0 +1,134 @@
+ACT_LatentCorr 代码实现规划
+==========================
+
+仓库改造策略
+------------
+不修改原始 `policy/ACT`。
+所有新实现都放在 `policy/ACT_LatentCorr` 下。
+原始 ACT 与 EVAC 仅作为被导入的依赖与教师模型使用。
+
+当前文件与职责
+--------------
+`config_latent.py`
+- 保存 warmup、latent loss、latent model 的 dataclass 配置
+
+`latent_modules.py`
+- `LayerNorm2d`
+- `DynamicsWarmup`
+- `LatentProjector`
+- `ActionPrefixEncoder`
+- `AdaLNResBlock`
+- `ActionConditionedPredictor`
+- `LatentActionDecoder`
+
+`latent_policy.py`
+- `ACTLatentStage1` 模型封装
+- 构建基础 ACT 模型
+- 提取 ACT 视觉特征图
+- 计算第一阶段损失
+
+`utils_latent.py`
+- 第一阶段的 episodic warmup dataset
+- 当前返回：
+  - `image_t`
+  - `image_t_future`
+  - `qpos_t`
+  - `action_prefix`
+  - `is_pad_prefix`
+  - `episode_id`
+  - `start_ts`
+
+`evac_interface.py`
+- 加载 EVAC checkpoint 与 config
+- 把真实图像编码为最终 VAE latent
+- 第二阶段需要继续补 `DiT` latent rollout 接口
+
+`train_stage1_latent.py`
+- 第一阶段训练入口
+- 构建 dataloader
+- 构建 ACT latent 模型
+- 构建 EVAC teacher
+- 执行 warmup 训练循环
+
+`train_stage1.sh`
+- 便捷启动脚本
+- 默认走本地 `.venv-act-latent`
+- 支持常用环境变量覆盖训练参数
+
+完整实验前仍存在的缺口
+----------------------
+1. 当前基础 ACT 模型只用于提取视觉特征。
+   第一阶段动作头还是自定义的简单版本，不是 ACT 原生 query decoder。
+
+2. `qpos_t` 已经加载，但还没有融合进 latent 分支。
+   对于第一阶段可运行验证来说可以接受，后续如果发现状态约束不足，需要接入。
+
+3. 当前 teacher 默认只用第一路相机 `image[:, 0]` 做 EVAC latent。
+   这与当前 RoboTwin 配置里的 `cam_high` 一致，但代码中需要持续保持显式。
+
+4. 第二阶段闭环 latent 路径还没实现：
+   - trigger 逻辑复用
+   - planner 纠错动作生成
+   - EVAC DiT latent rollout
+   - 纠错损失接入
+
+接下来的具体任务
+----------------
+任务 A：让第一阶段稳定可运行
+- 验证 ACT 模型构造
+- 验证 EVAC latent 编码链路
+- 验证 dataloader 的 shape 和图像格式
+- 保存首个成功 checkpoint
+
+任务 B：升级动作解码头
+- 将当前 global pooling + MLP 替换为 latent query decoder
+- 尽量复用 ACT 原本的 chunk 解码语义
+
+任务 C：增加 EVAC DiT latent rollout 接口
+- 在 `evac_interface.py` 中新增方法
+- 输入：
+  - 当前 latent 或当前图像历史
+  - 偏差动作前缀
+  - 原始相机与机器人元信息
+- 输出：
+  - `z_wm_sim_t1`
+
+任务 D：接入纠错逻辑
+- 新建 `correction_latent.py`
+- 复用原 ACT 中的 trigger / planner / FK / curobo 思路
+- 输出：
+  - `a_dev_prefix`
+  - `a_corr_prefix`
+  - `z_wm_sim_t1` teacher
+
+任务 E：实现第二阶段训练器
+- 新建 `train_stage2_latent.py`
+- 接入损失：
+  - `L_dynamics`
+  - `L_correct`
+  - 可选 `L_retain`
+  - 可选 `L_bridge`
+
+需要持续检查的运行风险
+----------------------
+1. ACT 构造函数原本依赖 argparse。
+   当前已经通过显式传入 `Namespace` 修复。
+
+2. EVAC 运行环境依赖较多。
+   需要持续验证：
+   - teacher 能否初始化
+   - teacher 能否编码一个 batch
+
+3. CUDA 显存压力可能偏高：
+   - ACT backbone 与 EVAC teacher 同时驻留一张 GPU
+   - 第一阶段建议先从 batch size 1 或 2 起步
+
+4. 原始 ACT 环境里有很多第一阶段并不需要的包。
+   当前策略是不追求完整环境复刻，而是优先保证最小可运行集合。
+
+从现在开始的建议执行顺序
+------------------------
+1. 先跑第一阶段的 import 和单步 smoke test。
+2. 把缺参数、缺路径、缺依赖的问题补到至少能稳定跑通一步。
+3. 跑一个短训练并保存 checkpoint。
+4. 第一阶段稳定后，再进入第二阶段闭环纠错路径。

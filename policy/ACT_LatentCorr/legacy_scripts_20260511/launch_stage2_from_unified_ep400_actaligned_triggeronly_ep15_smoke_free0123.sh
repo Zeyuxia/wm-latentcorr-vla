@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+
+cd /data/zhenyangfan/RoboTwin
+
+STAGE1_CKPT=${STAGE1_CKPT:-/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/unified_stage1_acthead_open1000_trainable_base/20260330_100537/stage1_epoch_0400.pt}
+BASE_ANCHOR_CKPT=${BASE_ANCHOR_CKPT:-${STAGE1_CKPT}}
+ERROR_POLICY_CKPT=${ERROR_POLICY_CKPT:-/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage2_from_unified_ep400_actalignedcorr_probe25_free01234567/20260406_205807/stage2_epoch_0015.pt}
+RUN_ROOT=${RUN_ROOT:-/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/formal_runs/stage2_from_unified_ep400_actaligned_triggeronly_ep15_smoke_free0123}
+RUN_TAG=${RUN_TAG:-stage2_from_unified_ep400_actaligned_triggeronly_ep15_smoke_free0123_$(date +"%Y%m%d_%H%M%S")}
+LOG_FILE=/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/logs/${RUN_TAG}.log
+TRAIN_SESSION=${TRAIN_SESSION:-stage2_from_unified_ep400_actaligned_triggeronly_ep15_smoke_free0123}
+
+mkdir -p "${RUN_ROOT}"
+mkdir -p /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/outputs/logs
+
+if tmux has-session -t "${TRAIN_SESSION}" 2>/dev/null; then
+  tmux kill-session -t "${TRAIN_SESSION}"
+fi
+
+tmux new-session -d -s "${TRAIN_SESSION}" \
+  "CUDA_VISIBLE_DEVICES=0,1,2,3 \
+   STAGE1_CKPT=${STAGE1_CKPT} \
+   BASE_ANCHOR_CKPT=${BASE_ANCHOR_CKPT} \
+   ACT_ALIGNED_ERROR_POLICY_CKPT=${ERROR_POLICY_CKPT} \
+   OUTPUT_ROOT=${RUN_ROOT} \
+   NPROC_PER_NODE=4 \
+   NUM_EPOCHS=2 \
+   MAX_STEPS=2 \
+   SAVE_FREQ=1 \
+   BATCH_SIZE=1 \
+   CORRECTION_BATCH_SIZE=0 \
+   LR=3e-5 \
+   RETAIN_WEIGHT=1.0 \
+   BRIDGE_WEIGHT=0.0 \
+   FREEZE_BASE_ACT=false \
+   DETACH_ACT_FEATURE_FOR_LATENT=true \
+   USE_ACT_HEAD_CORRECTION=true \
+   LAMBDA_WM_ACTION_CURRENT=0.0 \
+   LAMBDA_WM_ACTION_FUTURE=0.0 \
+   LAMBDA_BRIDGE_FUTURE=0.0 \
+   DYN_ZERO_STEPS=0 \
+   DYN_RAMP_STEPS=200 \
+   REFERENCE_GLOBAL_BATCH_SIZE=4 \
+   CORRECTION_BUILDER_MODE=act_aligned \
+   ACT_ALIGNED_ROLLOUT_EXEC_STEPS=16 \
+   ACT_ALIGNED_ENABLE_PERTURB=false \
+   ACT_ALIGNED_PERTURB_PROB=0.0 \
+   ACT_ALIGNED_MIN_DIST_FALLBACK_FORCE_CORRECTION=false \
+   ACT_ALIGNED_REAL_ERROR_TRIGGER_ENABLE=true \
+   ACT_ALIGNED_REAL_ERROR_MIN_DIST_THRESH=0.01 \
+   ACT_ALIGNED_REAL_ERROR_MIN_DIST_DELTA_THRESH=0.005 \
+   ACT_ALIGNED_CORRECTION_INTERP_NEAREST_ENABLE=false \
+   ACT_ALIGNED_CORRECTION_PLANNER_PREFIX_RATIO=0.5 \
+   ACT_ALIGNED_CORRECTION_COMPOSE_GT_TAIL_ENABLE=true \
+   PLANNER_TARGET_MODE=backward \
+   PLANNER_TARGET_LOOKAHEAD_STEPS=4 \
+   PLANNER_WARMUP=false \
+   WANDB_RUN_NAME=${RUN_TAG} \
+   WANDB_GROUP=stage2_from_unified_ep400_actaligned_triggeronly_ep15_smoke_free0123 \
+   /data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/train_stage2_ddp.sh > ${LOG_FILE} 2>&1"
+
+TARGET_DIR=""
+for _ in $(seq 1 20); do
+  TARGET_DIR=$(find "${RUN_ROOT}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -n 1)
+  [ -n "${TARGET_DIR}" ] && break
+  sleep 3
+done
+
+if [ -z "${TARGET_DIR}" ]; then
+  echo "failed to resolve target output directory under ${RUN_ROOT}" >&2
+  exit 1
+fi
+
+echo "train_session=${TRAIN_SESSION}"
+echo "log_file=${LOG_FILE}"
+echo "output_dir=${TARGET_DIR}"

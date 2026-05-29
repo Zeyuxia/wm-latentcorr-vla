@@ -1,0 +1,60 @@
+问题定义
+当前算法的关键风险是：decoder 在训练时主要读取 projector 输出的潜特征，而在闭环 teacher forcing 或世界模型纠错路径中，需要直接读取来自 WM / EVAC 的 latent，导致输入流形不一致，进而使 teacher 分支长期劣于 base 分支。
+
+本轮尝试的三条路线
+1. 共享读出流形 + WM adapter
+思路：先把 WM latent 通过一个轻量 residual adapter 映射到和 projector latent 更接近的共享空间，再让 action decoder 同时读取 projector latent 与适配后的 WM latent。
+结果：有部分缓解，但 teacher 分支平均仍劣于 base。
+
+2. stage1 使用 simulated future teacher
+思路：不是用真实下一帧图像的 WM latent 监督 future readout，而是用“当前状态 + GT 动作前缀”经 EVAC rollout 得到 simulated future latent，再监督 future 动作前缀。这样 decoder 从开环阶段就开始读取闭环真正会遇到的 latent 类型。
+结果：比上一条更接近闭环语义，teacher 分支进一步改善，但仍没有真正接近 0 偏差。
+
+3. 共享 readout canonicalizer（当前最佳）
+思路：在 action decoder 前新增一个共享的 readout canonicalizer。无论输入来自 z_proj、z_wm、z_wm_sim 还是 z_hat_next，都先进入同一个 canonical readout space，然后再解码动作。这样 decoder 从头到尾只看一种 canonical latent，而不是直接看不同来源的原始 latent。
+结果：这是当前最好的方案。
+
+关键实验结果
+A. 旧 best：shared_future_only
+- stage1 sim latent probe: loss_wm_action_future.mean = 11.901694
+- stage2: teacher_improvement_l1.mean = -0.045528
+- stage2: teacher_better_ratio = 0.166667
+
+B. sim_future_only
+- stage1: loss_wm_action_future.mean = 11.921623
+- stage2: teacher_improvement_l1.mean = -0.030638
+- stage2: teacher_better_ratio = 0.333333
+
+C. sim_future_canon_only（当前最佳）
+- stage1: loss_wm_action_future.mean = 11.875798
+- stage1: loss_dynamics.mean = 2.274811
+- stage2: teacher_improvement_l1.mean = -0.003145
+- stage2: teacher_better_ratio = 0.583333
+- stage2: bridge_improvement_l1.mean = 0.000460
+- stage2: dynamics_mse.mean = 1.825992
+
+结论
+1. 单纯切换为 sim future teacher 不够，无法从结构上解决 decoder 输入源不同的问题。
+2. 对 action decoder 前增加共享 canonical readout space 是有效的，而且解释性强：
+   - 动力学空间仍由 projector / predictor / wm_adapter 负责
+   - 控制读出空间由 readout canonicalizer 统一处理
+   - decoder 只负责从 canonical 控制特征中读动作
+3. 当前最佳配置是：
+   - future_teacher_source = sim
+   - lambda_wm_action_current = 0.0
+   - lambda_wm_action_future = 1.0
+   - lambda_bridge_future = 0.0
+   - 加入共享 readout canonicalizer
+
+涉及的主要代码文件
+- latent_policy.py
+  新增共享 readout canonicalizer，并让所有 action decoder 输入先走 canonicalizer。
+- train_stage1_latent.py
+  支持 future_teacher_source=sim，允许 stage1 直接使用 EVAC rollout latent 做 future teacher。
+- analyze_stage1_latent.py
+  支持对任意 checkpoint 做 sim future teacher probe。
+- run_variant_pipeline.sh / train_stage1.sh / train_stage2.sh
+  支持新配置透传。
+
+当前建议
+如果下一步要并入主 workflow，优先采用 sim_future_canon_only 这条配置作为新的默认实验线，再继续向真正 planner 版 a_corr 过渡。

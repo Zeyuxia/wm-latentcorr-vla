@@ -1,0 +1,26 @@
+policy_name: PI0_LatentCorr
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+train_config_name: pi05_aloha_full_base
+model_name: pi05_openloop_default
+checkpoint_id: latest
+stage1_ckpt: null
+latent_ckpt_path: null
+inference_mode: base
+camera_mode: head_only
+pi0_step: 50
+num_steps: 10
+temporal_agg: false
+checkpoint_base_dir: null
+assets_base_dir: null
+asset_repo_id: null
+repo_id: null
+evac_ckpt: null
+evac_config: null
+urdf_path: null
+ddim_steps: 27
+device: cuda:0

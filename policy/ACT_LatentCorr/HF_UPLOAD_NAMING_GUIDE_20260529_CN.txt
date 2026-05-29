@@ -1,0 +1,167 @@
+HF 上传命名与说明指南
+生成时间：2026-05-29
+
+为什么需要这个文件
+==================
+上传 Hugging Face 时，权重文件本身通常只能看到文件名。
+如果没有额外说明，后面很容易忘记：
+- 这个权重来自哪个实验
+- 是主线、消融、诊断，还是负例参考
+- 应该用 base / pred / residual / oracle 哪条推理路径
+- 是否需要配套 failure table / EVAC / config
+
+所以建议 HF 仓库至少保留两个说明文件：
+1. HF_UPLOAD_WEIGHT_MANIFEST_20260529_CN.txt
+   详细清单，记录每个权重的来源和作用。
+2. HF_UPLOAD_NAMING_GUIDE_20260529_CN.txt
+   简短命名指南，方便快速浏览。
+
+HF 仓库推荐目录结构
+==================
+建议上传后保持如下结构：
+
+smolvla/
+  core/
+  ablation/
+  expanded_mainline/
+  expanded_ablation/
+  failure_tables/
+  eval_summaries/
+act/
+  core/
+  expanded/
+  eval_summaries/
+pi05/
+  expanded/
+evac/
+metadata/
+
+不要把所有 .pt / .safetensors 平铺在根目录。
+平铺会让文件名越来越难读，也很难判断哪些是主线，哪些是消融。
+
+核心权重推荐名称和说明
+======================
+
+1. smolvla/core/base_rgbfix_70000_pretrained_model/
+显示名称：SmolVLA base 70000step RGB-fix single-view five-task checkpoint
+类型：基础 open-loop 权重
+用途：SmolVLA LatentCorr 训练起点；base model 对照。
+推理路径：原始 SmolVLA base policy。
+是否必传：必传。
+
+2. smolvla/core/stage1_actsync_step017000_best.pt
+显示名称：SmolVLA LatentCorr main checkpoint, step 17000, pred-token inference, best observed
+类型：主线最佳权重
+用途：当前 SmolVLA LatentCorr 最重要结果；100 seed 总成功率 78.0%。
+推理路径：pred-token inference。
+是否必传：必传。
+备注：这是目前最应该优先保存和引用的 SmolVLA 方法权重。
+
+3. smolvla/core/stage1_actsync_step018000_eval_good.pt
+显示名称：SmolVLA LatentCorr nearby checkpoint, step 18000
+类型：主线候选权重
+用途：17000 附近的候选点，用于 checkpoint 敏感性分析。
+推理路径：pred-token inference。
+是否必传：建议上传。
+
+4. smolvla/core/stage1_actsync_step020000_drop_reference.pt
+显示名称：SmolVLA LatentCorr late checkpoint, step 20000, degradation reference
+类型：主线负例/退化参考
+用途：用于说明训练过久后可能掉点，不是最佳权重。
+推理路径：pred-token inference。
+是否必传：建议上传。
+
+5. smolvla/ablation/normal_only_wmrollout_step010000.pt
+显示名称：SmolVLA ablation, normal-only WM-rollout latent alignment, step 10000
+类型：消融权重
+用途：去掉 failure batch，只用 normal batch + WM rollout latent 对齐，验证 failure batch 是否真的有用。
+推理路径：pred-token inference。
+是否必传：建议上传。
+
+6. smolvla/ablation/normal_only_wmrollout_step015000.pt
+显示名称：SmolVLA ablation, normal-only WM-rollout latent alignment, step 15000
+类型：消融权重
+用途：normal-only WM rollout 消融后期节点。
+推理路径：pred-token inference。
+是否必传：建议上传。
+
+7. smolvla/ablation/tokencouple_resume17000_step020000.pt
+显示名称：SmolVLA token-coupling diagnostic, resume from 17000 to 20000
+类型：诊断权重
+用途：验证 teacher/oracle token 是否能成为更强控制变量。
+推理路径：pred / oracle / diagnostic modes。
+是否必传：建议上传。
+
+8. smolvla/ablation/gated_residual_smoke_step017001.pt
+显示名称：SmolVLA gated residual correction head smoke checkpoint, step 17001
+类型：代码 smoke 权重
+用途：验证 gated residual head 的训练、保存、加载、推理路径能跑通。
+推理路径：residual inference。
+是否必传：可选。
+备注：不是正式结果，不建议在报告中当作方法效果引用。
+
+9. smolvla/failure_tables/merged_20260427_235851/
+显示名称：SmolVLA failure table, merged explore result, 20260427_235851
+类型：训练数据索引 / failure table
+用途：SmolVLA LatentCorr stage1 训练所需 failure 样本表。
+是否必传：必传。
+备注：没有 failure table，只保存 checkpoint 会削弱可复现性。
+
+10. act/core/base_multitask5_policy_epoch2000.ckpt
+显示名称：ACT base five-task checkpoint, epoch 2000
+类型：ACT 基础权重
+用途：ACT LatentCorr 起点和 base 对照。
+推理路径：ACT base inference。
+是否必传：建议上传。
+
+11. act/core/latentcorr_fulltable_lctok05_epoch0650_best.pt
+显示名称：ACT LatentCorr full-table predicted-token checkpoint, epoch 650
+类型：ACT 主线方法权重
+用途：ACT 侧 predicted condition token 路线的关键结果。
+推理路径：pred-token inference。
+是否必传：建议上传。
+
+12. act/core/latentcorr_failure_action_only_epoch0900_ablation.pt
+显示名称：ACT failure-action-only ablation checkpoint, epoch 900
+类型：ACT 消融权重
+用途：诊断 failure action-only / rebalanced 训练效果。
+推理路径：pred-token inference / diagnostic。
+是否必传：可选但建议上传。
+
+13. pi05/pi05_robotwin2_model.safetensors
+显示名称：PI05 RobotWin model export
+类型：PI05 基础/导出权重
+用途：PI05_LatentCorr 分支和 PI05 相关后续工作。
+是否必传：如果还需要 PI05 分支，就上传。
+
+14. evac/evac_robotwin_new_mixed50p12_plus_pi05_rollout_epoch333_step10000.ckpt
+显示名称：EVAC_new RobotWin mixed50p12 plus PI05 rollout checkpoint, epoch 333 step 10000
+类型：世界模型 / EVAC 权重
+用途：新版 WM rollout latent、explore、渲染修复链路依赖。
+是否必传：必传。
+
+HF commit message 建议
+=====================
+如果分批上传，可以用这些 commit message：
+
+1. 上传核心 SmolVLA：
+   add SmolVLA LatentCorr core checkpoints and failure tables
+
+2. 上传 ACT：
+   add ACT LatentCorr core and paired-eval artifacts
+
+3. 上传 EVAC / PI05：
+   add EVAC and PI05 dependency checkpoints
+
+4. 上传 expanded：
+   add expanded checkpoint histories for disaster recovery
+
+根目录说明建议
+==============
+HF 仓库根目录最好保留：
+- HF_UPLOAD_WEIGHT_MANIFEST_20260529_CN.txt
+- HF_UPLOAD_NAMING_GUIDE_20260529_CN.txt
+- README_HF_EXPORT.md
+
+其中中文 manifest 是最重要的。
+如果只保留一个说明文件，就保留 HF_UPLOAD_WEIGHT_MANIFEST_20260529_CN.txt。

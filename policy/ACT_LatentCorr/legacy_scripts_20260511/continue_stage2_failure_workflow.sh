@@ -1,0 +1,133 @@
+#!/bin/bash
+set -euo pipefail
+
+cd /data/zhenyangfan/RoboTwin
+
+WORKFLOW_DIR=${WORKFLOW_DIR:?WORKFLOW_DIR is required}
+STAGE1_CKPT=${STAGE1_CKPT:?STAGE1_CKPT is required}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/train_stage2_ddp.sh}
+CONTINUE_LOG=${CONTINUE_LOG:-${WORKFLOW_DIR}/continue.log}
+EXPLORE_OUTPUT_DIR=${EXPLORE_OUTPUT_DIR:-${WORKFLOW_DIR}/explore}
+TRAIN_OUTPUT_DIR=${TRAIN_OUTPUT_DIR:-${WORKFLOW_DIR}/train}
+FAILURE_TABLE_PATH=${FAILURE_TABLE_PATH:-${EXPLORE_OUTPUT_DIR}/failure_explore/failure_table.json}
+POLL_SEC=${POLL_SEC:-30}
+MAX_WAIT_SEC=${MAX_WAIT_SEC:-0}
+
+TRAIN_GPU=${TRAIN_GPU:-4,5,6,7}
+NPROC_PER_NODE=${NPROC_PER_NODE:-4}
+MASTER_PORT=${MASTER_PORT:-29631}
+USE_WANDB=${USE_WANDB:-false}
+NUM_EPOCHS=${NUM_EPOCHS:-250}
+BATCH_SIZE=${BATCH_SIZE:-1}
+TRAIN_CORRECTION_BATCH_SIZE=${TRAIN_CORRECTION_BATCH_SIZE:-1}
+NUM_WORKERS=${NUM_WORKERS:-4}
+SAVE_FREQ=${SAVE_FREQ:-25}
+CORRECTION_BUILDER_MODE=${CORRECTION_BUILDER_MODE:-act_aligned}
+MAX_ROLLOUT_STEPS=${MAX_ROLLOUT_STEPS:-1}
+FAILURE_EXPLORE_K=${FAILURE_EXPLORE_K:-4}
+FAILURE_FAIL_RECOVER_RATE_THRESH=${FAILURE_FAIL_RECOVER_RATE_THRESH:-0.5}
+EVAC_CKPT=${EVAC_CKPT:-/data/zhenyangfan/EVAC/logs/evac_robotwin_finetune_2026-02-07T21-13-51/checkpoints/epoch=2499-step=10000.ckpt}
+EVAC_CONFIG=${EVAC_CONFIG:-/data/zhenyangfan/RoboTwin/policy/ACT/evac/configs/robotwin/train_config.yaml}
+USE_ACT_HEAD_CORRECTION=${USE_ACT_HEAD_CORRECTION:-true}
+DETACH_ACT_FEATURE_FOR_LATENT=${DETACH_ACT_FEATURE_FOR_LATENT:-true}
+LAMBDA_WM_ACTION_CURRENT=${LAMBDA_WM_ACTION_CURRENT:-0.0}
+LAMBDA_WM_ACTION_FUTURE=${LAMBDA_WM_ACTION_FUTURE:-0.0}
+LAMBDA_BRIDGE_FUTURE=${LAMBDA_BRIDGE_FUTURE:-0.0}
+DYN_RAMP_STEPS=${DYN_RAMP_STEPS:-200}
+REFERENCE_GLOBAL_BATCH_SIZE=${REFERENCE_GLOBAL_BATCH_SIZE:-$(( NPROC_PER_NODE * (BATCH_SIZE + TRAIN_CORRECTION_BATCH_SIZE) ))}
+PLANNER_TARGET_LOOKAHEAD_STEPS=${PLANNER_TARGET_LOOKAHEAD_STEPS:-4}
+PLANNER_GRIPPER_SWITCH_RATIO=${PLANNER_GRIPPER_SWITCH_RATIO:-0.5}
+PLANNER_WARMUP=${PLANNER_WARMUP:-false}
+
+mkdir -p "${TRAIN_OUTPUT_DIR}"
+
+if [ ! -f "${STAGE1_CKPT}" ]; then
+  echo "[continue] missing stage1_ckpt=${STAGE1_CKPT}" | tee -a "${CONTINUE_LOG}"
+  exit 1
+fi
+if [ ! -f "${EVAC_CKPT}" ]; then
+  echo "[continue] missing evac_ckpt=${EVAC_CKPT}" | tee -a "${CONTINUE_LOG}"
+  exit 1
+fi
+if [ ! -f "${EVAC_CONFIG}" ]; then
+  echo "[continue] missing evac_config=${EVAC_CONFIG}" | tee -a "${CONTINUE_LOG}"
+  exit 1
+fi
+
+echo "[continue] workflow_dir=${WORKFLOW_DIR}" | tee -a "${CONTINUE_LOG}"
+echo "[continue] waiting for explore to finish and failure_table=${FAILURE_TABLE_PATH}" | tee -a "${CONTINUE_LOG}"
+
+START_TS=$(date +%s)
+seen_explore_process=0
+while true; do
+  if pgrep -af "policy.ACT_LatentCorr.train_stage2_latent.*${EXPLORE_OUTPUT_DIR}" >/dev/null; then
+    seen_explore_process=1
+    echo "[continue] $(date '+%F %T') explore still running" >> "${CONTINUE_LOG}"
+  else
+    if [ -f "${FAILURE_TABLE_PATH}" ]; then
+      echo "[continue] $(date '+%F %T') explore finished; launching train" | tee -a "${CONTINUE_LOG}"
+      break
+    fi
+    if [ "${seen_explore_process}" -eq 1 ]; then
+      echo "[continue] $(date '+%F %T') explore exited but failure table missing" | tee -a "${CONTINUE_LOG}"
+      exit 1
+    fi
+    echo "[continue] $(date '+%F %T') waiting for explore process to appear" >> "${CONTINUE_LOG}"
+  fi
+
+  if [ "${MAX_WAIT_SEC}" -gt 0 ]; then
+    NOW_TS=$(date +%s)
+    if [ $((NOW_TS - START_TS)) -ge "${MAX_WAIT_SEC}" ]; then
+      echo "[continue] timeout waiting for explore" | tee -a "${CONTINUE_LOG}"
+      exit 1
+    fi
+  fi
+  sleep "${POLL_SEC}"
+done
+
+MODE=train \
+WORKFLOW_DIR="${WORKFLOW_DIR}" \
+STAGE1_CKPT="${STAGE1_CKPT}" \
+TRAIN_SCRIPT="${TRAIN_SCRIPT}" \
+EXPLORE_GPU="${TRAIN_GPU}" \
+TRAIN_GPU="${TRAIN_GPU}" \
+NPROC_PER_NODE="${NPROC_PER_NODE}" \
+MASTER_PORT="${MASTER_PORT}" \
+USE_WANDB="${USE_WANDB}" \
+NUM_EPOCHS="${NUM_EPOCHS}" \
+BATCH_SIZE="${BATCH_SIZE}" \
+TRAIN_CORRECTION_BATCH_SIZE="${TRAIN_CORRECTION_BATCH_SIZE}" \
+NUM_WORKERS="${NUM_WORKERS}" \
+SAVE_FREQ="${SAVE_FREQ}" \
+CORRECTION_BUILDER_MODE="${CORRECTION_BUILDER_MODE}" \
+MAX_ROLLOUT_STEPS="${MAX_ROLLOUT_STEPS}" \
+FAILURE_EXPLORE_K="${FAILURE_EXPLORE_K}" \
+FAILURE_FAIL_RECOVER_RATE_THRESH="${FAILURE_FAIL_RECOVER_RATE_THRESH}" \
+EVAC_CKPT="${EVAC_CKPT}" \
+EVAC_CONFIG="${EVAC_CONFIG}" \
+USE_ACT_HEAD_CORRECTION="${USE_ACT_HEAD_CORRECTION}" \
+DETACH_ACT_FEATURE_FOR_LATENT="${DETACH_ACT_FEATURE_FOR_LATENT}" \
+LAMBDA_WM_ACTION_CURRENT="${LAMBDA_WM_ACTION_CURRENT}" \
+LAMBDA_WM_ACTION_FUTURE="${LAMBDA_WM_ACTION_FUTURE}" \
+LAMBDA_BRIDGE_FUTURE="${LAMBDA_BRIDGE_FUTURE}" \
+DYN_RAMP_STEPS="${DYN_RAMP_STEPS}" \
+REFERENCE_GLOBAL_BATCH_SIZE="${REFERENCE_GLOBAL_BATCH_SIZE}" \
+PLANNER_TARGET_LOOKAHEAD_STEPS="${PLANNER_TARGET_LOOKAHEAD_STEPS}" \
+PLANNER_GRIPPER_SWITCH_RATIO="${PLANNER_GRIPPER_SWITCH_RATIO}" \
+PLANNER_WARMUP="${PLANNER_WARMUP}" \
+ACT_ALIGNED_SAMPLE_PREGRASP_PHASE_WINDOW_LEN=20 \
+FAILURE_SAMPLE_SKIP_HEAD_RATIO=0.6 \
+ACT_ALIGNED_PERTURB_EEF_FAIL_GAIN=0.12 \
+ACT_ALIGNED_PERTURB_ROT_MAX_DEG=24 \
+FAILURE_TRANSLATION_MAG_BINS=3 \
+FAILURE_ROTATION_MAG_BINS=3 \
+RECOVER_EVAL_ENABLE=true \
+RECOVER_EVAL_SAVE_VIDEO=false \
+RECOVER_EVAL_GRIPPER_OPEN_THRESH=0.8 \
+RECOVER_EVAL_POS_THRESH_M=0.04 \
+RECOVER_EVAL_ROT_THRESH_DEG=10.0 \
+RECOVER_EVAL_NEAREST_WINDOW_RADIUS=16 \
+PLANNER_ORIENT_WEIGHT=0.0573 \
+PLANNER_GRIPPER_PENALTY=1.0 \
+/data/zhenyangfan/RoboTwin/policy/ACT_LatentCorr/run_stage2_failure_workflow.sh \
+  2>&1 | tee -a "${CONTINUE_LOG}"
