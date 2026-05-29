@@ -110,6 +110,11 @@ TEACHER_ACTION_WEIGHT="${TEACHER_ACTION_WEIGHT:-0.0}"
 MIXED_ACTION_WEIGHT="${MIXED_ACTION_WEIGHT:-0.0}"
 TOKEN_MIX_TEACHER_PROB="${TOKEN_MIX_TEACHER_PROB:-0.0}"
 TOKEN_MIX_ZERO_PROB="${TOKEN_MIX_ZERO_PROB:-0.0}"
+RESIDUAL_CORRECT_WEIGHT="${RESIDUAL_CORRECT_WEIGHT:-0.0}"
+RESIDUAL_RETAIN_WEIGHT="${RESIDUAL_RETAIN_WEIGHT:-0.0}"
+RESIDUAL_GATE_CLEAN_WEIGHT="${RESIDUAL_GATE_CLEAN_WEIGHT:-0.0}"
+RESIDUAL_GATE_CORR_WEIGHT="${RESIDUAL_GATE_CORR_WEIGHT:-0.0}"
+RESIDUAL_DELTA_L1_WEIGHT="${RESIDUAL_DELTA_L1_WEIGHT:-0.0}"
 FAILURE_MODE="${FAILURE_MODE:-train}"
 STAGE1_CORR_SOURCE="${STAGE1_CORR_SOURCE:-online}"
 OFFLINE_CORR_DATA_ROOT="${OFFLINE_CORR_DATA_ROOT:-/data/zhenyangfan/RoboTwin/data}"
@@ -276,6 +281,11 @@ teacher_action_weight=${TEACHER_ACTION_WEIGHT}
 mixed_action_weight=${MIXED_ACTION_WEIGHT}
 token_mix_teacher_prob=${TOKEN_MIX_TEACHER_PROB}
 token_mix_zero_prob=${TOKEN_MIX_ZERO_PROB}
+residual_correct_weight=${RESIDUAL_CORRECT_WEIGHT}
+residual_retain_weight=${RESIDUAL_RETAIN_WEIGHT}
+residual_gate_clean_weight=${RESIDUAL_GATE_CLEAN_WEIGHT}
+residual_gate_corr_weight=${RESIDUAL_GATE_CORR_WEIGHT}
+residual_delta_l1_weight=${RESIDUAL_DELTA_L1_WEIGHT}
 run_tag=${RUN_TAG}
 train_tag=${TRAIN_TAG}
 output_dir=${OUTPUT_DIR}
@@ -381,6 +391,11 @@ CMD+=(
   --mixed_action_weight "${MIXED_ACTION_WEIGHT}"
   --token_mix_teacher_prob "${TOKEN_MIX_TEACHER_PROB}"
   --token_mix_zero_prob "${TOKEN_MIX_ZERO_PROB}"
+  --residual_correct_weight "${RESIDUAL_CORRECT_WEIGHT}"
+  --residual_retain_weight "${RESIDUAL_RETAIN_WEIGHT}"
+  --residual_gate_clean_weight "${RESIDUAL_GATE_CLEAN_WEIGHT}"
+  --residual_gate_corr_weight "${RESIDUAL_GATE_CORR_WEIGHT}"
+  --residual_delta_l1_weight "${RESIDUAL_DELTA_L1_WEIGHT}"
   --failure_mode "${FAILURE_MODE}"
   --stage1_corr_source "${STAGE1_CORR_SOURCE}"
   --failure_table_paths_json "${FAILURE_TABLE_PATHS_JSON}"

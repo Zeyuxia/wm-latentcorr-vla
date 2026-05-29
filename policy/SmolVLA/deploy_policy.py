@@ -189,6 +189,15 @@ class SmolVLAEvalWrapper:
             token_decay_start_ratio=float(checkpoint["args"].get("token_loss_decay_start_ratio", 0.0)),
             token_decay_end_ratio=float(checkpoint["args"].get("token_loss_decay_end_ratio", 1.0)),
             total_steps=max(1, int(checkpoint["args"].get("max_steps", 1))),
+            teacher_action_weight=float(checkpoint["args"].get("teacher_action_weight", 0.0)),
+            mixed_action_weight=float(checkpoint["args"].get("mixed_action_weight", 0.0)),
+            token_mix_teacher_prob=float(checkpoint["args"].get("token_mix_teacher_prob", 0.0)),
+            token_mix_zero_prob=float(checkpoint["args"].get("token_mix_zero_prob", 0.0)),
+            residual_correct_weight=float(checkpoint["args"].get("residual_correct_weight", 0.0)),
+            residual_retain_weight=float(checkpoint["args"].get("residual_retain_weight", 0.0)),
+            residual_gate_clean_weight=float(checkpoint["args"].get("residual_gate_clean_weight", 0.0)),
+            residual_gate_corr_weight=float(checkpoint["args"].get("residual_gate_corr_weight", 0.0)),
+            residual_delta_l1_weight=float(checkpoint["args"].get("residual_delta_l1_weight", 0.0)),
         )
         latent_policy = SmolVLALatentPolicy(
             base_policy=policy,
@@ -205,10 +214,11 @@ class SmolVLAEvalWrapper:
         visual_channels = int(model_state[projector_key].shape[1])
         hidden_size = int(model_state[condition_key].shape[0])
         latent_policy._ensure_bridge_modules(visual_channels=visual_channels, hidden_size=hidden_size)
-        missing, unexpected = latent_policy.load_state_dict(model_state, strict=True)
-        if missing or unexpected:
+        missing, unexpected = latent_policy.load_state_dict(model_state, strict=False)
+        disallowed_missing = [name for name in missing if not name.startswith("residual_action_head.")]
+        if disallowed_missing or unexpected:
             raise RuntimeError(
-                f"Latent policy state mismatch for {model_path}: missing={missing}, unexpected={unexpected}"
+                f"Latent policy state mismatch for {model_path}: missing={disallowed_missing}, unexpected={unexpected}"
             )
         target_hw = checkpoint.get("target_hw")
         if target_hw is not None:
@@ -252,7 +262,7 @@ class SmolVLAEvalWrapper:
                 action = self._select_interp_action(model_input, observation)
             elif self.latent_policy is not None and self.inference_mode in {"oracle", "future_image_oracle"}:
                 action = self._select_oracle_action(model_input, observation)
-            elif self.latent_policy is not None and self.inference_mode in {"pred", "random"}:
+            elif self.latent_policy is not None and self.inference_mode in {"residual", "pred", "random"}:
                 action = self._select_pred_action(model_input)
             else:
                 action = self.policy.select_action(model_input)
@@ -368,6 +378,24 @@ class SmolVLAEvalWrapper:
         )
         return self.latent_policy.build_predicted_condition_token(predicted_latent, scale=1.0)
 
+    def _residual_first_action_from_input(self, model_input):
+        if self.target_hw is None:
+            raise RuntimeError("Missing target_hw in stage1 checkpoint; cannot run residual inference.")
+        base_chunk = self.latent_policy.base_policy.predict_action_chunk(model_input)
+        prefix_steps = int(self.latent_policy.bridge_cfg.prefix_steps)
+        action_dim = int(self.latent_policy.bridge_cfg.action_dim)
+        action_prefix = base_chunk[:, :prefix_steps, :action_dim]
+        corrected_chunk, _delta, _gate, _base = self.latent_policy.predict_action_chunk_residual(
+            model_input,
+            action_prefix=action_prefix,
+            target_hw=self.target_hw,
+            base_chunk=base_chunk,
+        )
+        n_action_steps = int(getattr(self.policy.config, "n_action_steps", 1))
+        for idx in range(1, min(n_action_steps, int(corrected_chunk.shape[1]))):
+            self._action_queue.append(corrected_chunk[:, idx, :])
+        return corrected_chunk[:, 0, :]
+
     def _oracle_condition_token_from_input(self, model_input, observation, source: str):
         if not self._oracle_future_observations:
             raise RuntimeError("oracle inference requires expert future observations from eval_policy.")
@@ -424,6 +452,8 @@ class SmolVLAEvalWrapper:
             raise RuntimeError("pred inference requires a stage1 latent checkpoint.")
         if self.target_hw is None:
             raise RuntimeError("Missing target_hw in stage1 checkpoint; cannot run pred inference.")
+        if self.inference_mode == "residual":
+            return self._residual_first_action_from_input(model_input)
 
         token, mask, att_mask = self._predicted_condition_token_from_input(model_input)
         if self.inference_mode == "random":

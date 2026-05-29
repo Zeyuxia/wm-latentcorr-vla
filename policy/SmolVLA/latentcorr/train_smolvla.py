@@ -630,6 +630,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mixed_action_weight", type=float, default=0.0)
     parser.add_argument("--token_mix_teacher_prob", type=float, default=0.0)
     parser.add_argument("--token_mix_zero_prob", type=float, default=0.0)
+    parser.add_argument("--residual_correct_weight", type=float, default=0.0)
+    parser.add_argument("--residual_retain_weight", type=float, default=0.0)
+    parser.add_argument("--residual_gate_clean_weight", type=float, default=0.0)
+    parser.add_argument("--residual_gate_corr_weight", type=float, default=0.0)
+    parser.add_argument("--residual_delta_l1_weight", type=float, default=0.0)
     parser.add_argument("--act_chunk_size", type=int, required=True)
 
 
@@ -806,6 +811,11 @@ def build_stage1_loss_weights(args: argparse.Namespace) -> SmolVLAStage1LossWeig
         mixed_action_weight=float(args.mixed_action_weight),
         token_mix_teacher_prob=float(args.token_mix_teacher_prob),
         token_mix_zero_prob=float(args.token_mix_zero_prob),
+        residual_correct_weight=float(args.residual_correct_weight),
+        residual_retain_weight=float(args.residual_retain_weight),
+        residual_gate_clean_weight=float(args.residual_gate_clean_weight),
+        residual_gate_corr_weight=float(args.residual_gate_corr_weight),
+        residual_delta_l1_weight=float(args.residual_delta_l1_weight),
     )
 
 
@@ -912,6 +922,14 @@ def log_stage1_tensorboard(writer: SummaryWriter, step: int, output: Any, lr: fl
     writer.add_scalar("train/loss_action_mixed_conditioned", float(output.loss_action_mixed_conditioned.item()), step)
     writer.add_scalar("train/loss_dynamics", float(output.loss_dynamics.item()), step)
     writer.add_scalar("train/loss_condition_token", float(output.loss_condition_token.item()), step)
+    writer.add_scalar("train/loss_residual_correct", float(output.loss_residual_correct.item()), step)
+    writer.add_scalar("train/loss_residual_retain", float(output.loss_residual_retain.item()), step)
+    writer.add_scalar("train/loss_residual_gate_clean", float(output.loss_residual_gate_clean.item()), step)
+    writer.add_scalar("train/loss_residual_gate_corr", float(output.loss_residual_gate_corr.item()), step)
+    writer.add_scalar("train/residual_gate_clean_mean", float(output.residual_gate_clean_mean), step)
+    writer.add_scalar("train/residual_gate_corr_mean", float(output.residual_gate_corr_mean), step)
+    writer.add_scalar("train/residual_delta_clean_abs", float(output.residual_delta_clean_abs), step)
+    writer.add_scalar("train/residual_delta_corr_abs", float(output.residual_delta_corr_abs), step)
     writer.add_scalar("train/beta_condition", float(output.beta_condition), step)
     writer.add_scalar("train/beta_dynamics", float(output.beta_dynamics), step)
     writer.add_scalar("train/beta_token", float(output.beta_token), step)
@@ -1865,9 +1883,26 @@ def resume_training_checkpoint(
     if not path.is_file():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    lr_scheduler.load_state_dict(checkpoint["scheduler"])
+    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+    allowed_missing = [name for name in missing if name.startswith("residual_action_head.")]
+    disallowed_missing = [name for name in missing if not name.startswith("residual_action_head.")]
+    residual_head_was_missing = bool(allowed_missing)
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint state mismatch: "
+            f"missing={disallowed_missing[:20]} unexpected={list(unexpected)[:20]}"
+        )
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        lr_scheduler.load_state_dict(checkpoint["scheduler"])
+    except ValueError as exc:
+        if not residual_head_was_missing:
+            raise
+        print(
+            "[resume] optimizer/scheduler state skipped because residual_action_head "
+            f"was newly initialized: {exc}",
+            flush=True,
+        )
     return int(checkpoint["global_step"]), int(checkpoint.get("epoch", 0))
 
 
@@ -2785,6 +2820,11 @@ def run_stage1(args: argparse.Namespace) -> None:
                     future_teacher_latent=future_teacher_latent,
                     action_prefix=action_prefix_tensor,
                     global_step=global_step,
+                    is_correction_mask=torch.as_tensor(
+                        [bool(value) for value in raw_is_correction],
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    ),
                 )
                 corr_prefix_extra_loss = None
                 if stage1_corr_prefix_loss_weight > 0.0 and corr_generated_count > 0:
@@ -2917,6 +2957,14 @@ def run_stage1(args: argparse.Namespace) -> None:
                         "loss_action_mixed_conditioned": float(output.loss_action_mixed_conditioned.item()),
                         "loss_dynamics": float(output.loss_dynamics.item()),
                         "loss_condition_token": float(output.loss_condition_token.item()),
+                        "loss_residual_correct": float(output.loss_residual_correct.item()),
+                        "loss_residual_retain": float(output.loss_residual_retain.item()),
+                        "loss_residual_gate_clean": float(output.loss_residual_gate_clean.item()),
+                        "loss_residual_gate_corr": float(output.loss_residual_gate_corr.item()),
+                        "residual_gate_clean_mean": float(output.residual_gate_clean_mean),
+                        "residual_gate_corr_mean": float(output.residual_gate_corr_mean),
+                        "residual_delta_clean_abs": float(output.residual_delta_clean_abs),
+                        "residual_delta_corr_abs": float(output.residual_delta_corr_abs),
                         "beta_condition": float(output.beta_condition),
                         "beta_dynamics": float(output.beta_dynamics),
                         "beta_token": float(output.beta_token),
@@ -2936,6 +2984,8 @@ def run_stage1(args: argparse.Namespace) -> None:
                     cond=f"{output.loss_action_conditioned.item():.4f}",
                     teach=f"{output.loss_action_teacher_conditioned.item():.4f}",
                     mix=f"{output.loss_action_mixed_conditioned.item():.4f}",
+                    res=f"{output.loss_residual_correct.item():.4f}",
+                    gate=f"{output.residual_gate_corr_mean:.3f}",
                     dyn=f"{output.loss_dynamics.item():.4f}",
                     ctoken=f"{output.loss_condition_token.item():.4f}",
                     beta_cond=f"{output.beta_condition:.4f}",

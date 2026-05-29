@@ -43,6 +43,14 @@ class SmolVLAStage1LossOutput:
     loss_action_mixed_conditioned: torch.Tensor
     loss_dynamics: torch.Tensor
     loss_condition_token: torch.Tensor
+    loss_residual_correct: torch.Tensor
+    loss_residual_retain: torch.Tensor
+    loss_residual_gate_clean: torch.Tensor
+    loss_residual_gate_corr: torch.Tensor
+    residual_gate_clean_mean: float
+    residual_gate_corr_mean: float
+    residual_delta_clean_abs: float
+    residual_delta_corr_abs: float
     beta_condition: float
     beta_dynamics: float
     beta_token: float
@@ -61,6 +69,11 @@ class SmolVLAStage1LossWeights:
     mixed_action_weight: float = 0.0
     token_mix_teacher_prob: float = 0.0
     token_mix_zero_prob: float = 0.0
+    residual_correct_weight: float = 0.0
+    residual_retain_weight: float = 0.0
+    residual_gate_clean_weight: float = 0.0
+    residual_gate_corr_weight: float = 0.0
+    residual_delta_l1_weight: float = 0.0
 
 
 @dataclass
@@ -203,6 +216,52 @@ class LatentToTokenAdapter(nn.Module):
         return self.net(pooled)
 
 
+class GatedResidualActionHead(nn.Module):
+    """Predict a bounded residual action chunk and a state-wise intervention gate.
+
+    The last layers are initialized so the module starts close to identity:
+    delta ~= 0 and gate ~= sigmoid(-4) ~= 0.018.
+    """
+
+    def __init__(self, latent_channels: int, action_dim: int, chunk_size: int, hidden_dim: int):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.chunk_size = int(chunk_size)
+        in_dim = int(latent_channels) + int(action_dim)
+        out_dim = self.chunk_size * self.action_dim
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.GELU(),
+        )
+        self.delta_head = nn.Linear(int(hidden_dim), out_dim)
+        self.gate_head = nn.Linear(int(hidden_dim), self.chunk_size)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, -4.0)
+
+    def forward(
+        self,
+        latent_map: torch.Tensor,
+        base_action_chunk: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if latent_map.ndim != 4:
+            raise ValueError(f"latent_map must be (B,C,H,W), got {tuple(latent_map.shape)}")
+        if base_action_chunk.ndim != 3:
+            raise ValueError(f"base_action_chunk must be (B,T,A), got {tuple(base_action_chunk.shape)}")
+        base = base_action_chunk[:, : self.chunk_size, : self.action_dim]
+        pooled = F.adaptive_avg_pool2d(latent_map, output_size=1).flatten(1)
+        base_summary = base.mean(dim=1)
+        features = torch.cat([pooled, base_summary.to(dtype=pooled.dtype)], dim=1)
+        hidden = self.trunk(features)
+        delta = self.delta_head(hidden).view(-1, self.chunk_size, self.action_dim)
+        gate = torch.sigmoid(self.gate_head(hidden)).unsqueeze(-1)
+        corrected = base + gate * delta
+        return corrected, delta, gate
+
+
 class SmolVLALatentPolicy(nn.Module):
     def __init__(
         self,
@@ -225,6 +284,7 @@ class SmolVLALatentPolicy(nn.Module):
         self.wm_adapter: ResidualLatentAdapter | None = None
         self.predictor: ActionConditionedPredictor | None = None
         self.token_adapter: LatentToTokenAdapter | None = None
+        self.residual_action_head: GatedResidualActionHead | None = None
         self.condition_proj: nn.Linear | None = None
         self._target_hw: tuple[int, int] | None = None
 
@@ -347,6 +407,12 @@ class SmolVLALatentPolicy(nn.Module):
             hidden_dim=int(self.bridge_cfg.adapter_hidden_dim),
             num_layers=2,
             dropout=0.1,
+        ).to(self.device)
+        self.residual_action_head = GatedResidualActionHead(
+            latent_channels=latent_dim,
+            action_dim=int(self.bridge_cfg.action_dim),
+            chunk_size=int(self.base_policy.config.chunk_size),
+            hidden_dim=int(self.bridge_cfg.adapter_hidden_dim),
         ).to(self.device)
         self.condition_proj = nn.Linear(latent_dim, hidden_size).to(self.device)
         nn.init.zeros_(self.condition_proj.bias)
@@ -478,12 +544,106 @@ class SmolVLALatentPolicy(nn.Module):
             action_prefix.to(dtype=predictor_dtype),
         )
 
+    def predict_action_chunk_residual(
+        self,
+        batch: dict,
+        action_prefix: torch.Tensor | None = None,
+        target_hw: tuple[int, int] | None = None,
+        base_chunk: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.residual_action_head is None:
+            raise RuntimeError("Residual action head is not initialized.")
+        if target_hw is None:
+            if self._target_hw is None:
+                raise RuntimeError("target_hw is unknown; initialize bridge or pass target_hw explicitly.")
+            target_hw = self._target_hw
+        if base_chunk is None:
+            base_chunk = self.base_policy.predict_action_chunk(batch)
+        base_chunk = base_chunk[:, : int(self.base_policy.config.chunk_size), : int(self.bridge_cfg.action_dim)]
+        if action_prefix is None:
+            action_prefix = base_chunk[:, : int(self.bridge_cfg.prefix_steps), : int(self.bridge_cfg.action_dim)]
+        predicted_latent = self.predict_next_latent(batch, action_prefix, target_hw=target_hw)
+        head_dtype = next(self.residual_action_head.parameters()).dtype
+        corrected, delta, gate = self.residual_action_head(
+            predicted_latent.to(dtype=head_dtype),
+            base_chunk.detach().to(dtype=head_dtype),
+        )
+        return corrected, delta, gate, base_chunk.detach()
+
+    def _residual_losses(
+        self,
+        batch: dict,
+        predicted_latent: torch.Tensor,
+        clean_mask: torch.Tensor,
+        corr_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float, float, float]:
+        zero = predicted_latent.new_zeros(())
+        cfg = self.loss_weights
+        if (
+            self.residual_action_head is None
+            or (
+                float(cfg.residual_correct_weight) <= 0.0
+                and float(cfg.residual_retain_weight) <= 0.0
+                and float(cfg.residual_gate_clean_weight) <= 0.0
+                and float(cfg.residual_gate_corr_weight) <= 0.0
+                and float(cfg.residual_delta_l1_weight) <= 0.0
+            )
+        ):
+            return zero, zero, zero, zero, 0.0, 0.0, 0.0, 0.0
+
+        with torch.no_grad():
+            images, img_masks, lang_tokens, lang_masks, state = self._policy_inputs_from_batch(batch)
+            base_chunk = self.base_policy.model.sample_actions(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+            )
+        action_dim = int(self.bridge_cfg.action_dim)
+        chunk_size = int(self.base_policy.config.chunk_size)
+        base_chunk = base_chunk[:, :chunk_size, :action_dim].detach()
+        target = batch[ACTION][:, :chunk_size, :action_dim]
+        head_dtype = next(self.residual_action_head.parameters()).dtype
+        corrected, delta, gate = self.residual_action_head(
+            predicted_latent.to(dtype=head_dtype),
+            base_chunk.to(dtype=head_dtype),
+        )
+        corrected = corrected.to(dtype=target.dtype)
+        delta = delta.to(dtype=target.dtype)
+        gate = gate.to(dtype=target.dtype)
+
+        clean_mask = clean_mask.to(device=target.device, dtype=torch.bool)
+        corr_mask = corr_mask.to(device=target.device, dtype=torch.bool)
+        loss_correct = F.mse_loss(corrected[corr_mask], target[corr_mask]) if bool(corr_mask.any()) else zero
+        loss_retain = F.mse_loss(corrected[clean_mask], base_chunk.to(dtype=target.dtype)[clean_mask]) if bool(clean_mask.any()) else zero
+        loss_gate_clean = gate[clean_mask].mean() if bool(clean_mask.any()) else zero
+        loss_gate_corr = (1.0 - gate[corr_mask]).mean() if bool(corr_mask.any()) else zero
+        loss_delta_l1 = delta.abs().mean()
+        loss_retain = loss_retain + (float(cfg.residual_delta_l1_weight) * loss_delta_l1)
+
+        gate_clean_mean = float(gate[clean_mask].detach().mean().cpu().item()) if bool(clean_mask.any()) else 0.0
+        gate_corr_mean = float(gate[corr_mask].detach().mean().cpu().item()) if bool(corr_mask.any()) else 0.0
+        delta_clean_abs = float(delta[clean_mask].detach().abs().mean().cpu().item()) if bool(clean_mask.any()) else 0.0
+        delta_corr_abs = float(delta[corr_mask].detach().abs().mean().cpu().item()) if bool(corr_mask.any()) else 0.0
+        return (
+            loss_correct,
+            loss_retain,
+            loss_gate_clean,
+            loss_gate_corr,
+            gate_clean_mean,
+            gate_corr_mean,
+            delta_clean_abs,
+            delta_corr_abs,
+        )
+
     def compute_stage1_loss(
         self,
         batch: dict,
         future_teacher_latent: torch.Tensor,
         action_prefix: torch.Tensor,
         global_step: int,
+        is_correction_mask: torch.Tensor | None = None,
     ) -> SmolVLAStage1LossOutput:
         if ACTION not in batch:
             raise KeyError(f"Missing required key: {ACTION}")
@@ -541,6 +701,21 @@ class SmolVLALatentPolicy(nn.Module):
             loss_action_mixed_conditioned = loss_action.new_zeros(())
 
         loss_dynamics = F.mse_loss(predicted_latent, teacher_shared)
+        if is_correction_mask is None:
+            corr_mask = torch.zeros(int(batch[ACTION].shape[0]), device=batch[ACTION].device, dtype=torch.bool)
+        else:
+            corr_mask = is_correction_mask.to(device=batch[ACTION].device, dtype=torch.bool)
+        clean_mask = ~corr_mask
+        (
+            loss_residual_correct,
+            loss_residual_retain,
+            loss_residual_gate_clean,
+            loss_residual_gate_corr,
+            residual_gate_clean_mean,
+            residual_gate_corr_mean,
+            residual_delta_clean_abs,
+            residual_delta_corr_abs,
+        ) = self._residual_losses(batch, predicted_latent, clean_mask=clean_mask, corr_mask=corr_mask)
         loss = (
             loss_action
             + (beta_condition * loss_action_conditioned)
@@ -548,6 +723,10 @@ class SmolVLALatentPolicy(nn.Module):
             + (beta_mixed_action * loss_action_mixed_conditioned)
             + (beta_dynamics * loss_dynamics)
             + (beta_token * loss_condition_token)
+            + (float(self.loss_weights.residual_correct_weight) * loss_residual_correct)
+            + (float(self.loss_weights.residual_retain_weight) * loss_residual_retain)
+            + (float(self.loss_weights.residual_gate_clean_weight) * loss_residual_gate_clean)
+            + (float(self.loss_weights.residual_gate_corr_weight) * loss_residual_gate_corr)
         )
         return SmolVLAStage1LossOutput(
             loss=loss,
@@ -557,6 +736,14 @@ class SmolVLALatentPolicy(nn.Module):
             loss_action_mixed_conditioned=loss_action_mixed_conditioned,
             loss_dynamics=loss_dynamics,
             loss_condition_token=loss_condition_token,
+            loss_residual_correct=loss_residual_correct,
+            loss_residual_retain=loss_residual_retain,
+            loss_residual_gate_clean=loss_residual_gate_clean,
+            loss_residual_gate_corr=loss_residual_gate_corr,
+            residual_gate_clean_mean=residual_gate_clean_mean,
+            residual_gate_corr_mean=residual_gate_corr_mean,
+            residual_delta_clean_abs=residual_delta_clean_abs,
+            residual_delta_corr_abs=residual_delta_corr_abs,
             beta_condition=beta_condition,
             beta_dynamics=beta_dynamics,
             beta_token=beta_token,
@@ -620,6 +807,19 @@ class SmolVLALatentPolicy(nn.Module):
             loss_dynamics=loss_dynamics,
             beta_dynamics=beta_dynamics,
         )
+
+    def initialize_residual_head_for_checkpoint(self) -> None:
+        if self.projector is None:
+            raise RuntimeError("Bridge modules must be initialized before initializing residual head.")
+        if self.residual_action_head is not None:
+            return
+        latent_dim = int(self.bridge_cfg.latent_dim)
+        self.residual_action_head = GatedResidualActionHead(
+            latent_channels=latent_dim,
+            action_dim=int(self.bridge_cfg.action_dim),
+            chunk_size=int(self.base_policy.config.chunk_size),
+            hidden_dim=int(self.bridge_cfg.adapter_hidden_dim),
+        ).to(self.device)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict) -> torch.Tensor:
