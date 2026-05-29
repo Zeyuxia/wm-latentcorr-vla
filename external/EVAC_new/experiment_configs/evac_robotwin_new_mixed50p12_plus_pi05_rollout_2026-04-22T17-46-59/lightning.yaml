@@ -1,0 +1,35 @@
+lightning:
+  precision: 16
+  trainer:
+    benchmark: true
+    accumulate_grad_batches: 1
+    max_steps: 40000
+    log_every_n_steps: 1
+    gradient_clip_algorithm: norm
+    gradient_clip_val: 0.5
+    num_nodes: 1
+  callbacks:
+    model_checkpoint:
+      target: pytorch_lightning.callbacks.ModelCheckpoint
+      params:
+        every_n_train_steps: 1000
+        every_n_epochs: 0
+        filename: '{epoch}-{step}'
+        save_weights_only: true
+        save_top_k: -1
+        save_last: true
+    batch_logger:
+      target: callbacks.ImageLogger
+      params:
+        batch_frequency: -1
+        to_local: true
+        cat_all_to_save: true
+        save_dir: runtime_vis_results/
+        max_images: 6400
+        log_images_kwargs:
+          ddim_steps: 27
+          unconditional_guidance_scale: 7.5
+          timestep_spacing: uniform_trailing
+          guidance_rescale: 0.7
+          save_fps: 30
+  strategy: ddp
